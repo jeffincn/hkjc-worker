@@ -1,0 +1,110 @@
+
+  query resultMeetings($date: String, $venueCode: String, $foOddsTypes: [OddsType], $foFilter: [String], $resultOddsType: [OddsType]) {
+      raceMeetings(date: $date, venueCode: $venueCode)
+      {
+        id
+        resPools: pmPools(oddsTypes: $resultOddsType) {
+          leg {
+            number
+            races
+          }
+          status
+          oddsType
+          name_en
+          name_ch
+          lastUpdateTime
+          dividends (officialOnly: true) {
+            winComb
+            type
+            div
+            seq
+            status
+            guarantee
+            partial
+            partialUnit
+          }
+          cWinSelections {
+            composite
+            name_ch
+            name_en
+            starters
+          }
+        }
+        foPools(oddsTypes: $foOddsTypes, filters: $foFilter) {
+          ...racingFoPoolFragment
+        }
+      }
+  }
+fragment racingFoPoolFragment on RacingFoPool {
+    instNo
+    poolId
+    oddsType
+    status
+    sellStatus
+    otherSelNo
+    inplayUpTo
+    expStartDateTime
+    expStopDateTime
+    raceStopSellNo
+    raceStopSellStatus
+    includeRaces
+    excludeRaces
+    lastUpdateTime
+    selections {
+      order
+      number
+      code
+      name_en
+      name_ch
+      scheduleRides
+      remainingRides
+      points
+      lineId
+      combId
+      combStatus
+      openOdds
+      prevOdds
+      currentOdds
+      results {
+        raceNo
+        points
+        point1st
+        point2nd
+        point3rd
+        dhRmk1st
+        dhRmk2nd
+        dhRmk3rd
+        count1st
+        count2nd
+        count3rd
+        count4th
+        numerator4th
+        denominator4th
+      }
+    }
+    otherSelections {
+      order
+      code
+      name_en
+      name_ch
+      scheduleRides
+      remainingRides
+      points
+      results {
+        raceNo
+        points
+        point1st
+        point2nd
+        point3rd
+        dhRmk1st
+        dhRmk2nd
+        dhRmk3rd
+        count1st
+        count2nd
+        count3rd
+        count4th
+        numerator4th
+        denominator4th
+      }
+    }
+  }

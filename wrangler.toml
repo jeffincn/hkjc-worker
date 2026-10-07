@@ -1,0 +1,40 @@
+name = "hkjc-data-worker"
+main = "src/index.ts"
+compatibility_date = "2025-04-17"
+compatibility_flags = ["nodejs_compat"]
+
+# workers.dev fallback remains enabled (default). Custom domain on Buzzbus zone:
+routes = [
+  { pattern = "hkjc.cf-connect.top", custom_domain = true }
+]
+
+# Local / default vars (secrets must be set via `wrangler secret put` or .dev.vars)
+[vars]
+POLL_INTERVAL_SEC = "10"
+BACKFILL_DAYS = "60"
+TIMEZONE = "Asia/Hong_Kong"
+LIVE_PUSH_ENABLED = "false"
+BACKFILL_SOURCE = "graphql"
+HORSE_REFRESH_BATCH = "15"
+# PUSH_TARGET_URL / API_TOKEN / PUSH_SECRET are secrets — never hardcode here
+
+[[d1_databases]]
+binding = "DB"
+database_name = "hkjc"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
+
+[durable_objects]
+bindings = [
+  { name = "MEETING_DO", class_name = "MeetingPoller" }
+]
+
+[[migrations]]
+tag = "v1"
+new_classes = ["MeetingPoller"]
+
+[triggers]
+crons = ["0 * * * *"]
+
+[dev]
+port = 8787

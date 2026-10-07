@@ -1,0 +1,25 @@
+{
+  "name": "hkjc-data-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare Worker: HKJC GraphQL crawler, D1 store, push + query API",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "dev": "wrangler dev --local --persist-to .wrangler/state",
+    "db:migrate:local": "wrangler d1 migrations apply hkjc --local",
+    "db:migrate:remote": "wrangler d1 migrations apply hkjc --remote",
+    "ingest:local": "tsx scripts/local-ingest.ts",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "0.8.19",
+    "@cloudflare/workers-types": "^4.20250417.0",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.3",
+    "vitest": "~3.0.9",
+    "wrangler": "4.35.0"
+  }
+}

@@ -1,0 +1,9 @@
+
+    query rbcList($startDate: String, $endDate: String) {
+      raceMeetings(startDate: $startDate, endDate: $endDate, all: true)
+      {
+          date
+          venueCode
+      }
+    }
+  

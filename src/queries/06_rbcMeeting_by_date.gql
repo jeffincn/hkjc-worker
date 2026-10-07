@@ -1,0 +1,47 @@
+
+    query rbcMeeting($date: String, $venueCode: String) {
+      raceMeetings(all: false, date: $date, venueCode: $venueCode, rebateCalOnly: true)
+      {
+        date
+        venueCode
+        totalNumberOfRace
+        status
+        races {
+            no
+            status
+            runners {
+                no
+                status
+            }
+        }
+        pmPools(oddsTypes: [WIN, PLA, QIN, QPL, IWN, FCT, TCE, TRI, QTT, FF, DBL, TBL, DT, TT, SixUP,CWA, CWB, CWC]) {
+            oddsType
+            status
+            rebateRate
+            leg {
+                number
+                races
+            }
+            cWinSelections {
+                composite
+                starters
+            }
+            dividends {
+                winComb
+                div
+                partialUnit
+            }
+        }
+        cwInfo: pmPools(oddsTypes: [CWA, CWB, CWC]) {
+          oddsType
+          leg {
+              races
+          }
+          oddsNodes {
+            combString
+            oddsValue
+          }
+        }
+      }
+    }
+  
