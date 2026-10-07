@@ -1,0 +1,10 @@
+API_TOKEN=dev-local-token-change-me
+# Leave PUSH_TARGET_URL unset locally so nothing is sent to a real webhook.
+# PUSH_TARGET_URL=
+# PUSH_SECRET=
+LIVE_PUSH_ENABLED=false
+BACKFILL_DAYS=60
+BACKFILL_SOURCE=graphql
+POLL_INTERVAL_SEC=10
+TIMEZONE=Asia/Hong_Kong
+HORSE_REFRESH_BATCH=5

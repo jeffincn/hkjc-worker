@@ -1,0 +1,25 @@
+
+    query racingChanges {
+      raceMeetings
+      {
+          id
+          venueCode
+          date
+          changeHistories {
+            type
+            time
+            raceNo
+            runnerNo
+            horseName_ch
+            horseName_en
+            jockeyName_ch
+            jockeyName_en
+            scratchHorseName_ch
+            scratchHorseName_en
+            handicapWeight
+            scrResvIndicator
+
+          }
+      }
+    }
+  
