@@ -29,7 +29,7 @@ Cloudflare Worker：从马会官方 GraphQL + 官网马匹页拉取赛马数据 
 | `BACKFILL_YEARS=5` | 改为 **`BACKFILL_DAYS=60`** | `/health` 报告缺口 |
 | 派彩取不到 | 当前会议 query 04 有 dividends；rbc 窗口内也有 | 有则存，无则 `null` |
 | 伤患 / 往绩走 GraphQL | **白名单无此类 query**；runner 仅有 `horse.code` / `horse.id` | 爬 `racing.hkjc.com` 马匹页 + 伤患页（礼貌限速） |
-| 推送 URL 写在规格 | **禁止写死** | 仅 Secret / env；默认 `LIVE_PUSH_ENABLED=false` |
+| 推送 URL 写在规格 | **禁止写死密钥** | 订阅者表 + Admin API；`PUSH_TARGET_URL` 仅在无订阅者行时兜底；默认 `LIVE_PUSH_ENABLED=false` |
 | — | 境外转播 `S1–S5` | **跳过**，只保留 `ST` / `HV` |
 | — | 自定义域名 | **`hkjc.cf-connect.top`**（`workers.dev` fallback） |
 
@@ -376,13 +376,43 @@ curl -s -H "Authorization: Bearer $TOKEN" "$BASE/v1/horses/H087/injuries" | jq .
 |---|---|---|
 | `POST` | `/v1/admin/ingest` | 拉取当前 GraphQL 赛事入库（并触发马匹页按策略刷新） |
 | `POST` | `/v1/admin/backfill` | 回填一步；body 可选 `{"limit":5}` |
-| `POST` | `/v1/admin/test-push` | 推送 `event:"test"`（需已配置 `PUSH_TARGET_URL`） |
+| `POST` | `/v1/admin/test-push` | 推送 `event:"test"`（需有启用中的订阅者，或兜底 `PUSH_TARGET_URL`） |
+| `GET` | `/v1/admin/subscribers` | 列出订阅者（**不返回 secret**，仅 `has_secret`） |
+| `POST` | `/v1/admin/subscribers` | 新增订阅者：`{"url","secret?","enabled?"}` |
+| `PATCH` | `/v1/admin/subscribers/:id` | 更新 `url` / `secret` / `enabled`（`secret: null` 或 `""` 清除） |
+| `DELETE` | `/v1/admin/subscribers/:id` | 删除订阅者 |
 
 ```bash
 curl -s -X POST -H "Authorization: Bearer $TOKEN" "$BASE/v1/admin/ingest" | jq .
 curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"limit":5}' "$BASE/v1/admin/backfill" | jq .
 curl -s -X POST -H "Authorization: Bearer $TOKEN" "$BASE/v1/admin/test-push" | jq .
+
+# 订阅者管理
+curl -s -H "Authorization: Bearer $TOKEN" "$BASE/v1/admin/subscribers" | jq .
+curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"url":"https://example.com/hook","secret":"optional-hmac","enabled":true}' \
+  "$BASE/v1/admin/subscribers" | jq .
+curl -s -X PATCH -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"enabled":false}' "$BASE/v1/admin/subscribers/1" | jq .
+curl -s -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/v1/admin/subscribers/1" | jq .
+```
+
+列表项示例（密钥永不回显）：
+
+```json
+{
+  "subscribers": [
+    {
+      "id": 1,
+      "url": "https://webhook.site/…",
+      "enabled": true,
+      "has_secret": false,
+      "created_at": "2026-10-08T00:00:00.000Z",
+      "updated_at": "2026-10-08T00:00:00.000Z"
+    }
+  ]
+}
 ```
 
 ---
@@ -391,10 +421,15 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" "$BASE/v1/admin/test-push" | j
 
 ### 4.1 传输
 
-- `POST {PUSH_TARGET_URL}`
+- 向**每个启用中的订阅者**独立 `POST` 同一份信封（互不影响：一方失败/重试不阻塞另一方）
 - `Content-Type: application/json`
-- 可选：`X-Signature: hex(HMAC_SHA256(body, PUSH_SECRET))`
+- `User-Agent: hkjc-data-worker/1.0`（Cloudflare 对空 UA 会报 1010，必须带）
+- 若该订阅者配置了 secret：`X-Signature` = 对**原始 JSON body** 的 HMAC-SHA256 **小写 hex**（无 `sha256=` 前缀）
 - 期望响应：`202`（或 2xx），body 建议 `{"received":true}`
+- 迁移会 seed 两个接收方（仅 URL，密钥不进 git）：
+  - `https://webhook.site/902a6166-6336-452d-97c5-e64018d97919`（无 HMAC）
+  - `https://hkjc-agent.cf-connect.top/webhook`（若设置了 `PUSH_SECRET`，运行时写入该行 secret）
+- **兜底**：仅当 `push_subscribers` **没有任何行**时，才使用 `PUSH_TARGET_URL`（+ 可选全局 `PUSH_SECRET`），避免全新部署静默丢事件
 
 ### 4.2 信封 schema：`hkjc-push/1.0`
 
@@ -422,7 +457,7 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" "$BASE/v1/admin/test-push" | j
 
 | 事件 | 默认（`false`） | 说明 |
 |---|---|---|
-| `test` / `schedule` / `backfill_progress` / `whitelist_alert` | 仍可推（需有 `PUSH_TARGET_URL`） | 联调与告警 |
+| `test` / `schedule` / `backfill_progress` / `whitelist_alert` | 仍可推（需有启用订阅者或兜底 URL） | 联调与告警 |
 | `odds_update` / `lock` / `scratch` / `result` / `horse_update` / `injury_update` / `runs_update` / `dividends` / `changes` | **跳过** | 接收方确认 `test` 后再设 `LIVE_PUSH_ENABLED=true` |
 
 ### 4.5 事件类型与示例
@@ -580,8 +615,8 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" "$BASE/v1/admin/test-push" | j
 
 ### 4.6 失败重试
 
-1. 失败写入 `push_log` + `pending_pushes`。  
-2. 指数退避：**1 分钟 → 5 分钟 → 15 分钟** 各重试一次。  
+1. **按订阅者**失败写入 `push_log` + `pending_pushes`（含 `subscriber_id`）。  
+2. 指数退避：**1 分钟 → 5 分钟 → 15 分钟** 各重试一次（只重投失败的那一个订阅者）。  
 3. 仍失败：挂起，**下一次成功推送时 piggy-back 补推**（不丢、不狂刷）。
 
 ### 4.7 可选 HMAC 校验（接收方伪代码）
@@ -618,7 +653,8 @@ app.post("/hook", express.raw({ type: "application/json" }), (req, res) => {
 | `odds_snapshots` | 赔率快照（`raw_json` + `content_hash`）；仅 hash 变才新行 |
 | `results` | 名次、最终赔率、派彩 JSON |
 | `change_events` | 退出/骑师变更等 |
-| `push_log` / `pending_pushes` | 推送审计与重试队列 |
+| `push_subscribers` | Webhook 订阅者（url / secret / enabled）；Admin API 管理 |
+| `push_log` / `pending_pushes` | 推送审计与按订阅者重试队列 |
 | `backfill_progress` / `worker_meta` | 回填断点与运行元数据 |
 | `horses` | 马匹档案（HTML） |
 | `horse_past_runs` | 往绩 |
@@ -645,9 +681,9 @@ app.post("/hook", express.raw({ type: "application/json" }), (req, res) => {
 
 | 变量 | 类型 | 默认 | 说明 |
 |---|---|---|---|
-| `PUSH_TARGET_URL` | Secret | — | Webhook；未设则不发 HTTP |
-| `API_TOKEN` | Secret | — | Bearer |
-| `PUSH_SECRET` | Secret 可选 | — | HMAC `X-Signature` |
+| `PUSH_TARGET_URL` | Secret | — | **仅当订阅者表为空时**兜底 Webhook；有订阅者行则忽略 |
+| `API_TOKEN` | Secret | — | Bearer（查询 + Admin） |
+| `PUSH_SECRET` | Secret 可选 | — | 写入 agent 订阅者 secret（若该行尚无 secret）；兜底 URL 时也用于 HMAC |
 | `POLL_INTERVAL_SEC` | var | `10` | 开跑前 ≤30 分钟轮询秒数 |
 | `BACKFILL_DAYS` | var | `60` | GraphQL 回填窗口 |
 | `BACKFILL_SOURCE` | var | `graphql` | `graphql` / `off` |
@@ -671,8 +707,9 @@ routes = [
 
 ```bash
 npm ci
-cp .dev.vars.example .dev.vars   # 设置 API_TOKEN；不要填真实 PUSH_TARGET_URL
+cp .dev.vars.example .dev.vars   # 设置 API_TOKEN；不要填真实 PUSH_TARGET_URL / PUSH_SECRET
 npx wrangler d1 migrations apply hkjc --local
+# 本地若不想打到 seed 的真实 URL：用 Admin API 删掉/禁用订阅者，或清空 push_subscribers
 npx wrangler dev --local --persist-to .wrangler/state
 
 # 另一终端：真实 GraphQL ingest + 打全 API
@@ -682,7 +719,7 @@ npm run typecheck
 npm test
 ```
 
-本地默认 **不会** 打真实 webhook。
+单元测试 **不** seed 生产 URL，且默认 **不会** 打真实 webhook。
 
 ---
 
@@ -695,11 +732,13 @@ npx wrangler d1 create hkjc
 npx wrangler d1 migrations apply hkjc --remote
 
 npx wrangler secret put API_TOKEN
-npx wrangler secret put PUSH_TARGET_URL
-# 可选
+# 可选：agent 订阅者 HMAC（迁移 seed URL 后运行时写入该行）
 npx wrangler secret put PUSH_SECRET
+# 可选：仅在订阅者表为空时的兜底 URL（一般可不设）
+# npx wrangler secret put PUSH_TARGET_URL
 
 npx wrangler deploy
+# 部署后 apply migrations，再用 Admin API 增删订阅者
 ```
 
 GitHub Actions：

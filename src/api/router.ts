@@ -36,6 +36,25 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
     return jsonOk(result);
   }
 
+  // Subscriber admin CRUD
+  if (path === "/v1/admin/subscribers") {
+    const authErr = requireBearer(request, env);
+    if (authErr) return authErr;
+    if (request.method === "GET") return listPushSubscribers(env);
+    if (request.method === "POST") return createPushSubscriber(request, env);
+    return jsonError(405, "Method not allowed");
+  }
+
+  const subscriberMatch = /^\/v1\/admin\/subscribers\/(\d+)$/.exec(path);
+  if (subscriberMatch) {
+    const authErr = requireBearer(request, env);
+    if (authErr) return authErr;
+    const id = Number(subscriberMatch[1]);
+    if (request.method === "PATCH") return updatePushSubscriber(request, env, id);
+    if (request.method === "DELETE") return deletePushSubscriber(env, id);
+    return jsonError(405, "Method not allowed");
+  }
+
   if (request.method !== "GET") {
     return jsonError(405, "Method not allowed");
   }
@@ -275,6 +294,81 @@ async function getHorseInjuries(env: Env, code: string): Promise<Response> {
     .bind(code, code)
     .all();
   return jsonOk({ horse_code: code, injuries: results ?? [] });
+}
+
+async function listPushSubscribers(env: Env): Promise<Response> {
+  const {
+    listSubscribers,
+    toPublicSubscriber,
+  } = await import("../push/subscribers");
+  const rows = await listSubscribers(env);
+  return jsonOk({ subscribers: rows.map(toPublicSubscriber) });
+}
+
+async function createPushSubscriber(request: Request, env: Env): Promise<Response> {
+  const {
+    createSubscriber,
+    toPublicSubscriber,
+  } = await import("../push/subscribers");
+  const body = (await request.json().catch(() => null)) as {
+    url?: string;
+    secret?: string | null;
+    enabled?: boolean;
+  } | null;
+  if (!body || typeof body.url !== "string") {
+    return jsonError(400, "url is required");
+  }
+  try {
+    const row = await createSubscriber(env, {
+      url: body.url,
+      secret: body.secret,
+      enabled: body.enabled,
+    });
+    return jsonOk({ subscriber: toPublicSubscriber(row) }, 201);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("UNIQUE") || msg.toLowerCase().includes("unique")) {
+      return jsonError(409, "subscriber url already exists");
+    }
+    return jsonError(400, msg);
+  }
+}
+
+async function updatePushSubscriber(
+  request: Request,
+  env: Env,
+  id: number,
+): Promise<Response> {
+  const {
+    updateSubscriber,
+    toPublicSubscriber,
+  } = await import("../push/subscribers");
+  const body = (await request.json().catch(() => null)) as {
+    url?: string;
+    secret?: string | null;
+    enabled?: boolean;
+  } | null;
+  if (!body || typeof body !== "object") {
+    return jsonError(400, "JSON body required");
+  }
+  try {
+    const row = await updateSubscriber(env, id, body);
+    if (!row) return jsonError(404, "subscriber not found");
+    return jsonOk({ subscriber: toPublicSubscriber(row) });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("UNIQUE") || msg.toLowerCase().includes("unique")) {
+      return jsonError(409, "subscriber url already exists");
+    }
+    return jsonError(400, msg);
+  }
+}
+
+async function deletePushSubscriber(env: Env, id: number): Promise<Response> {
+  const { deleteSubscriber } = await import("../push/subscribers");
+  const ok = await deleteSubscriber(env, id);
+  if (!ok) return jsonError(404, "subscriber not found");
+  return jsonOk({ deleted: true, id });
 }
 
 async function listChanges(env: Env, url: URL): Promise<Response> {
