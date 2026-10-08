@@ -25,7 +25,8 @@ describe("LIVE_PUSH_ENABLED gate", () => {
     expect(called).toBe(false);
   });
 
-  it("skips when PUSH_TARGET_URL missing even for test", async () => {
+  it("skips when no subscribers and PUSH_TARGET_URL missing even for test", async () => {
+    await env.DB.prepare(`DELETE FROM push_subscribers`).run();
     let called = false;
     const fetchImpl: typeof fetch = async () => {
       called = true;

@@ -113,7 +113,16 @@ CREATE TABLE IF NOT EXISTS pending_pushes (
   retry_count INTEGER NOT NULL DEFAULT 0,
   next_retry_at TEXT,
   created_at TEXT NOT NULL,
-  last_error TEXT
+  last_error TEXT,
+  subscriber_id INTEGER
+);
+CREATE TABLE IF NOT EXISTS push_subscribers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  url TEXT NOT NULL UNIQUE,
+  secret TEXT,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS horses (
   horse_code TEXT PRIMARY KEY,
