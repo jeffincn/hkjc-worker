@@ -8,7 +8,7 @@ describe("poll interval by post time", () => {
     const ms = computePollIntervalMs({
       nowMs: now,
       postTimeIso: "2026-10-07T22:00:00+08:00",
-      fastIntervalSec: 10,
+      fastIntervalSec: 30,
       slowIntervalSec: 60,
       idleIntervalSec: 300,
     });
@@ -19,7 +19,7 @@ describe("poll interval by post time", () => {
     const ms = computePollIntervalMs({
       nowMs: now,
       postTimeIso: "2026-10-07T20:00:00+08:00",
-      fastIntervalSec: 10,
+      fastIntervalSec: 30,
       slowIntervalSec: 60,
       idleIntervalSec: 300,
     });
@@ -30,20 +30,20 @@ describe("poll interval by post time", () => {
     const ms = computePollIntervalMs({
       nowMs: now,
       postTimeIso: "2026-10-07T19:20:00+08:00",
-      fastIntervalSec: 10,
+      fastIntervalSec: 30,
       slowIntervalSec: 60,
       idleIntervalSec: 300,
     });
-    expect(ms).toBe(10_000);
+    expect(ms).toBe(30_000);
   });
 
   it("uses fast interval at/after post time", () => {
     const ms = computePollIntervalMs({
       nowMs: now,
       postTimeIso: "2026-10-07T18:35:00+08:00",
-      fastIntervalSec: 10,
+      fastIntervalSec: 30,
     });
-    expect(ms).toBe(10_000);
+    expect(ms).toBe(30_000);
   });
 
   it("uses idle interval when post time missing", () => {

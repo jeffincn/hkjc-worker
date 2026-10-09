@@ -2,7 +2,7 @@
  * Poll interval scheduling by race post time (Asia/Hong_Kong wall clock).
  * - > 2 h before post: 5 min (idle)
  * - 30 min–2 h before post: 60s (slow)
- * - <= 30 min before post: POLL_INTERVAL_SEC (default 10s, fast)
+ * - <= 30 min before post: POLL_INTERVAL_SEC (default 30s, fast)
  * - after post / locked: still use fast interval until result, or caller stops
  */
 
@@ -16,7 +16,7 @@ export function computePollIntervalMs(args: {
   slowIntervalSec?: number;
   idleIntervalSec?: number;
 }): number {
-  const fast = (args.fastIntervalSec ?? 10) * 1000;
+  const fast = (args.fastIntervalSec ?? 30) * 1000;
   const slow = (args.slowIntervalSec ?? 60) * 1000;
   const idle = (args.idleIntervalSec ?? 300) * 1000;
   if (!args.postTimeIso) return idle;

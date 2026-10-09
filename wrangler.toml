@@ -10,7 +10,7 @@ routes = [
 
 # Local / default vars (secrets must be set via `wrangler secret put` or .dev.vars)
 [vars]
-POLL_INTERVAL_SEC = "10"
+POLL_INTERVAL_SEC = "30"
 BACKFILL_DAYS = "60"
 TIMEZONE = "Asia/Hong_Kong"
 LIVE_PUSH_ENABLED = "false"
