@@ -29,7 +29,7 @@ export interface HorseRefreshResult {
 
 /**
  * Refresh horse profile + past runs for codes entered in a meeting.
- * Once when racecard first seen; again on race day (not every 10s).
+ * Once when racecard first seen; again on race day (not every 30s).
  */
 export async function refreshMeetingHorses(
   env: Env,

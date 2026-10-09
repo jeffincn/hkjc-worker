@@ -367,7 +367,7 @@ curl -s -H "Authorization: Bearer $TOKEN" "$BASE/v1/horses/H087/injuries" | jq .
 }
 ```
 
-马匹刷新策略：当前/下一档出赛马，**首次见到排位时拉一次**，**赛日再拉一次**；不在 10 秒赔率轮询里刷。
+马匹刷新策略：当前/下一档出赛马，**首次见到排位时拉一次**，**赛日再拉一次**；不在 30 秒赔率轮询里刷。
 
 ---
 
@@ -685,7 +685,7 @@ app.post("/hook", express.raw({ type: "application/json" }), (req, res) => {
 | `PUSH_TARGET_URL` | Secret | — | **仅当订阅者表为空时**兜底 Webhook；有订阅者行则忽略 |
 | `API_TOKEN` | Secret | — | Bearer（查询 + Admin） |
 | `PUSH_SECRET` | Secret 可选 | — | 写入 agent 订阅者 secret（若该行尚无 secret）；兜底 URL 时也用于 HMAC |
-| `POLL_INTERVAL_SEC` | var | `10` | 开跑前 ≤30 分钟轮询秒数（更远见 §11） |
+| `POLL_INTERVAL_SEC` | var | `30` | 开跑前 ≤30 分钟轮询秒数（更远见 §11） |
 | `BACKFILL_DAYS` | var | `60` | GraphQL 回填窗口 |
 | `BACKFILL_SOURCE` | var | `graphql` | `graphql` / `off` |
 | `TIMEZONE` | var | `Asia/Hong_Kong` | |
@@ -800,7 +800,7 @@ npx wrangler secret put LIVE_PUSH_ENABLED   # 设为 true
 |---|---|
 | > 2 小时 | **5 分钟** |
 | 30 分钟 – 2 小时 | **60 秒** |
-| ≤ 30 分钟 | **`POLL_INTERVAL_SEC`（默认 10s）** |
+| ≤ 30 分钟 | **`POLL_INTERVAL_SEC`（默认 30s）** |
 | 会议结束 / 全部有成绩 | **停止** alarm（cron 日后再启） |
 
 ### D1 写入门闩

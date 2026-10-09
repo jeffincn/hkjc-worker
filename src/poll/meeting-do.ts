@@ -26,7 +26,7 @@ const LAST_FETCH_D1_FLUSH_MS = 5 * 60 * 1000;
 
 /**
  * One Durable Object per meeting. Alarm self-loop:
- * 5 min when >2h before post, 60s when 30min–2h, 10s inside 30min.
+ * 5 min when >2h before post, 60s when 30min–2h, 30s inside 30min.
  */
 export class MeetingPoller implements DurableObject {
   private state: DurableObjectState;
@@ -67,7 +67,7 @@ export class MeetingPoller implements DurableObject {
     const cfg = await this.state.storage.get<DoState>("cfg");
     if (!cfg) return;
 
-    const fastSec = envNum(this.env, "POLL_INTERVAL_SEC", 10);
+    const fastSec = envNum(this.env, "POLL_INTERVAL_SEC", 30);
 
     try {
       const full = await fetchGraphQL<RaceMeetingsFullData>({
