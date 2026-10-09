@@ -1,26 +1,31 @@
 /**
  * Poll interval scheduling by race post time (Asia/Hong_Kong wall clock).
- * - > 30 min before post: 60s
- * - <= 30 min before post: POLL_INTERVAL_SEC (default 10s)
+ * - > 2 h before post: 5 min (idle)
+ * - 30 min–2 h before post: 60s (slow)
+ * - <= 30 min before post: POLL_INTERVAL_SEC (default 10s, fast)
  * - after post / locked: still use fast interval until result, or caller stops
  */
 
 const THIRTY_MIN_MS = 30 * 60 * 1000;
+const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
 
 export function computePollIntervalMs(args: {
   nowMs: number;
   postTimeIso: string | null | undefined;
   fastIntervalSec?: number;
   slowIntervalSec?: number;
+  idleIntervalSec?: number;
 }): number {
   const fast = (args.fastIntervalSec ?? 10) * 1000;
   const slow = (args.slowIntervalSec ?? 60) * 1000;
-  if (!args.postTimeIso) return slow;
+  const idle = (args.idleIntervalSec ?? 300) * 1000;
+  if (!args.postTimeIso) return idle;
   const postMs = Date.parse(args.postTimeIso);
-  if (!Number.isFinite(postMs)) return slow;
+  if (!Number.isFinite(postMs)) return idle;
   const delta = postMs - args.nowMs;
   if (delta <= THIRTY_MIN_MS) return fast;
-  return slow;
+  if (delta <= TWO_HOURS_MS) return slow;
+  return idle;
 }
 
 /** Earliest upcoming (or in-progress) race post time for interval decisions. */
@@ -39,7 +44,6 @@ export function selectRelevantPostTime(
     if (!r.post_time) continue;
     const t = Date.parse(r.post_time);
     if (!Number.isFinite(t)) continue;
-    const delta = Math.abs(t - nowMs);
     // Prefer soonest future, else most recent past
     const score = t >= nowMs ? t - nowMs : 1e15 + (nowMs - t);
     if (score < bestDelta) {
@@ -50,4 +54,4 @@ export function selectRelevantPostTime(
   return best;
 }
 
-export { THIRTY_MIN_MS };
+export { THIRTY_MIN_MS, TWO_HOURS_MS };
