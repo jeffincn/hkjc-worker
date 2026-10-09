@@ -4,12 +4,24 @@ import { computePollIntervalMs, selectRelevantPostTime } from "../src/poll/inter
 describe("poll interval by post time", () => {
   const now = Date.parse("2026-10-07T19:00:00+08:00");
 
-  it("uses 60s when more than 30 min before post", () => {
+  it("uses 5 min when more than 2 h before post", () => {
+    const ms = computePollIntervalMs({
+      nowMs: now,
+      postTimeIso: "2026-10-07T22:00:00+08:00",
+      fastIntervalSec: 10,
+      slowIntervalSec: 60,
+      idleIntervalSec: 300,
+    });
+    expect(ms).toBe(300_000);
+  });
+
+  it("uses 60s when 30 min–2 h before post", () => {
     const ms = computePollIntervalMs({
       nowMs: now,
       postTimeIso: "2026-10-07T20:00:00+08:00",
       fastIntervalSec: 10,
       slowIntervalSec: 60,
+      idleIntervalSec: 300,
     });
     expect(ms).toBe(60_000);
   });
@@ -20,6 +32,7 @@ describe("poll interval by post time", () => {
       postTimeIso: "2026-10-07T19:20:00+08:00",
       fastIntervalSec: 10,
       slowIntervalSec: 60,
+      idleIntervalSec: 300,
     });
     expect(ms).toBe(10_000);
   });
@@ -31,6 +44,15 @@ describe("poll interval by post time", () => {
       fastIntervalSec: 10,
     });
     expect(ms).toBe(10_000);
+  });
+
+  it("uses idle interval when post time missing", () => {
+    const ms = computePollIntervalMs({
+      nowMs: now,
+      postTimeIso: null,
+      idleIntervalSec: 300,
+    });
+    expect(ms).toBe(300_000);
   });
 
   it("selects soonest upcoming race", () => {

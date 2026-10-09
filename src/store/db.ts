@@ -3,6 +3,22 @@ import type { RaceOddsSnapshot } from "../parse/odds";
 import { contentHash } from "../parse/hash";
 import type { ChangeHistoryRaw, PmPoolRaw } from "../graphql/types";
 
+/** Payload used to detect meeting-tree changes (excludes change_histories). */
+export function meetingTreeHashPayload(meeting: NormalizedMeeting): unknown {
+  return {
+    meeting_date: meeting.meeting_date,
+    venue: meeting.venue,
+    total_races: meeting.total_races,
+    status: meeting.status,
+    data_source: meeting.data_source,
+    races: meeting.races,
+  };
+}
+
+export async function meetingTreeContentHash(meeting: NormalizedMeeting): Promise<string> {
+  return contentHash(meetingTreeHashPayload(meeting));
+}
+
 export async function upsertMeeting(
   db: D1Database,
   meeting: NormalizedMeeting,
@@ -17,7 +33,11 @@ export async function upsertMeeting(
          status=excluded.status,
          data_source=excluded.data_source,
          raw_json=excluded.raw_json,
-         updated_at=excluded.updated_at`,
+         updated_at=excluded.updated_at
+       WHERE meetings.total_races IS DISTINCT FROM excluded.total_races
+          OR meetings.status IS DISTINCT FROM excluded.status
+          OR meetings.data_source IS DISTINCT FROM excluded.data_source
+          OR meetings.raw_json IS DISTINCT FROM excluded.raw_json`,
     )
     .bind(
       meeting.meeting_date,
@@ -53,7 +73,16 @@ export async function upsertRace(
          race_class=COALESCE(excluded.race_class, races.race_class),
          data_source=excluded.data_source,
          raw_json=COALESCE(excluded.raw_json, races.raw_json),
-         updated_at=excluded.updated_at`,
+         updated_at=excluded.updated_at
+       WHERE races.post_time IS DISTINCT FROM excluded.post_time
+          OR races.status IS DISTINCT FROM excluded.status
+          OR races.distance IS DISTINCT FROM COALESCE(excluded.distance, races.distance)
+          OR races.going IS DISTINCT FROM COALESCE(excluded.going, races.going)
+          OR races.course_desc IS DISTINCT FROM COALESCE(excluded.course_desc, races.course_desc)
+          OR races.course_code IS DISTINCT FROM COALESCE(excluded.course_code, races.course_code)
+          OR races.race_class IS DISTINCT FROM COALESCE(excluded.race_class, races.race_class)
+          OR races.data_source IS DISTINCT FROM excluded.data_source
+          OR races.raw_json IS DISTINCT FROM COALESCE(excluded.raw_json, races.raw_json)`,
     )
     .bind(
       meetingDate,
@@ -95,7 +124,16 @@ export async function upsertRunner(
          trainer_en=COALESCE(excluded.trainer_en, runners.trainer_en),
          last6run=COALESCE(excluded.last6run, runners.last6run),
          data_source=excluded.data_source,
-         updated_at=excluded.updated_at`,
+         updated_at=excluded.updated_at
+       WHERE runners.name_en IS DISTINCT FROM COALESCE(excluded.name_en, runners.name_en)
+          OR runners.name_ch IS DISTINCT FROM COALESCE(excluded.name_ch, runners.name_ch)
+          OR runners.status IS DISTINCT FROM COALESCE(excluded.status, runners.status)
+          OR runners.barrier IS DISTINCT FROM COALESCE(excluded.barrier, runners.barrier)
+          OR runners.handicap_weight IS DISTINCT FROM COALESCE(excluded.handicap_weight, runners.handicap_weight)
+          OR runners.jockey_en IS DISTINCT FROM COALESCE(excluded.jockey_en, runners.jockey_en)
+          OR runners.trainer_en IS DISTINCT FROM COALESCE(excluded.trainer_en, runners.trainer_en)
+          OR runners.last6run IS DISTINCT FROM COALESCE(excluded.last6run, runners.last6run)
+          OR runners.data_source IS DISTINCT FROM excluded.data_source`,
     )
     .bind(
       meetingDate,
@@ -137,7 +175,13 @@ export async function upsertResult(
          place_odds=COALESCE(excluded.place_odds, results.place_odds),
          dividends_json=COALESCE(excluded.dividends_json, results.dividends_json),
          data_source=excluded.data_source,
-         updated_at=excluded.updated_at`,
+         updated_at=excluded.updated_at
+       WHERE results.final_position IS DISTINCT FROM COALESCE(excluded.final_position, results.final_position)
+          OR results.dead_heat IS DISTINCT FROM COALESCE(excluded.dead_heat, results.dead_heat)
+          OR results.win_odds IS DISTINCT FROM COALESCE(excluded.win_odds, results.win_odds)
+          OR results.place_odds IS DISTINCT FROM COALESCE(excluded.place_odds, results.place_odds)
+          OR results.dividends_json IS DISTINCT FROM COALESCE(excluded.dividends_json, results.dividends_json)
+          OR results.data_source IS DISTINCT FROM excluded.data_source`,
     )
     .bind(
       meetingDate,
@@ -292,7 +336,9 @@ export async function storeDividendsAsResults(
          ON CONFLICT(meeting_date, venue, race_no, horse_no) DO UPDATE SET
            dividends_json=excluded.dividends_json,
            data_source=excluded.data_source,
-           updated_at=excluded.updated_at`,
+           updated_at=excluded.updated_at
+         WHERE results.dividends_json IS DISTINCT FROM excluded.dividends_json
+            OR results.data_source IS DISTINCT FROM excluded.data_source`,
       )
       .bind(meetingDate, venue, raceNo, horseNo, json, dataSource, new Date().toISOString())
       .run();
@@ -300,9 +346,11 @@ export async function storeDividendsAsResults(
   // Also attach dividends_json onto existing result rows for this race
   await db
     .prepare(
-      `UPDATE results SET dividends_json=?, updated_at=? WHERE meeting_date=? AND venue=? AND race_no=?`,
+      `UPDATE results SET dividends_json=?, updated_at=?
+       WHERE meeting_date=? AND venue=? AND race_no=?
+         AND dividends_json IS DISTINCT FROM ?`,
     )
-    .bind(json, new Date().toISOString(), meetingDate, venue, raceNo)
+    .bind(json, new Date().toISOString(), meetingDate, venue, raceNo, json)
     .run();
 }
 
@@ -310,7 +358,8 @@ export async function setMeta(db: D1Database, key: string, value: string): Promi
   await db
     .prepare(
       `INSERT INTO worker_meta (key, value, updated_at) VALUES (?, ?, ?)
-       ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`,
+       ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+       WHERE worker_meta.value IS DISTINCT FROM excluded.value`,
     )
     .bind(key, value, new Date().toISOString())
     .run();

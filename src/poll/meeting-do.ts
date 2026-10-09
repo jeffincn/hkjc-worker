@@ -9,6 +9,7 @@ import { buildEnvelope, type PushRace } from "../push/envelope";
 import { sendPush } from "../push/pusher";
 import {
   insertOddsSnapshotIfChanged,
+  meetingTreeContentHash,
   persistMeetingTree,
   setMeta,
 } from "../store/db";
@@ -21,9 +22,11 @@ interface DoState {
   result_races: number[];
 }
 
+const LAST_FETCH_D1_FLUSH_MS = 5 * 60 * 1000;
+
 /**
  * One Durable Object per meeting. Alarm self-loop:
- * 60s when >30min before post, 10s inside 30min.
+ * 5 min when >2h before post, 60s when 30min–2h, 10s inside 30min.
  */
 export class MeetingPoller implements DurableObject {
   private state: DurableObjectState;
@@ -52,7 +55,8 @@ export class MeetingPoller implements DurableObject {
     if (url.pathname.endsWith("/status")) {
       const cfg = await this.state.storage.get<DoState>("cfg");
       const alarm = await this.state.storage.getAlarm();
-      return new Response(JSON.stringify({ cfg, alarm }), {
+      const lastFetchAt = await this.state.storage.get<string>("last_fetch_at");
+      return new Response(JSON.stringify({ cfg, alarm, last_fetch_at: lastFetchAt ?? null }), {
         headers: { "Content-Type": "application/json" },
       });
     }
@@ -88,8 +92,14 @@ export class MeetingPoller implements DurableObject {
       }
 
       const meeting = normalizeMeeting(raw, "graphql");
-      await persistMeetingTree(this.env.DB, meeting, raw);
-      await setMeta(this.env.DB, "last_fetch_at", new Date().toISOString());
+      const treeHash = await meetingTreeContentHash(meeting);
+      const prevHash = await this.state.storage.get<string>("meeting_tree_hash");
+      if (treeHash !== prevHash) {
+        await persistMeetingTree(this.env.DB, meeting, raw);
+        await this.state.storage.put("meeting_tree_hash", treeHash);
+      }
+
+      await this.touchLastFetchAt();
 
       const oddsRes = await fetchGraphQL<PmPoolsOddsData>({
         query: QUERY_PM_POOLS_ODDS,
@@ -189,6 +199,7 @@ export class MeetingPoller implements DurableObject {
         postTimeIso: post,
         fastIntervalSec: fastSec,
         slowIntervalSec: 60,
+        idleIntervalSec: 300,
       });
       await this.state.storage.setAlarm(Date.now() + interval);
     } catch (err) {
@@ -196,5 +207,19 @@ export class MeetingPoller implements DurableObject {
       console.error("MeetingPoller alarm error", err);
       await this.state.storage.setAlarm(Date.now() + 60_000);
     }
+  }
+
+  /** Always keep last_fetch_at in DO storage; flush to D1 at most every 5 minutes. */
+  private async touchLastFetchAt(): Promise<void> {
+    const nowIso = new Date().toISOString();
+    const nowMs = Date.now();
+    await this.state.storage.put("last_fetch_at", nowIso);
+
+    const lastFlush = await this.state.storage.get<number>("last_fetch_at_d1_ms");
+    if (lastFlush != null && nowMs - lastFlush < LAST_FETCH_D1_FLUSH_MS) {
+      return;
+    }
+    await setMeta(this.env.DB, "last_fetch_at", nowIso);
+    await this.state.storage.put("last_fetch_at_d1_ms", nowMs);
   }
 }

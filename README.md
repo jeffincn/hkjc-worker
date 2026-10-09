@@ -18,6 +18,7 @@ Cloudflare Worker：从马会官方 GraphQL + 官网马匹页拉取赛马数据 
 8. [D1 与部署](#8-d1-与部署)
 9. [回填 / 测试推送 / 实时开关](#9-回填--测试推送--实时开关)
 10. [GraphQL 与马匹页说明](#10-graphql-与马匹页说明)
+11. [Polling & write budget](#11-polling--write-budget)
 
 ---
 
@@ -684,7 +685,7 @@ app.post("/hook", express.raw({ type: "application/json" }), (req, res) => {
 | `PUSH_TARGET_URL` | Secret | — | **仅当订阅者表为空时**兜底 Webhook；有订阅者行则忽略 |
 | `API_TOKEN` | Secret | — | Bearer（查询 + Admin） |
 | `PUSH_SECRET` | Secret 可选 | — | 写入 agent 订阅者 secret（若该行尚无 secret）；兜底 URL 时也用于 HMAC |
-| `POLL_INTERVAL_SEC` | var | `10` | 开跑前 ≤30 分钟轮询秒数 |
+| `POLL_INTERVAL_SEC` | var | `10` | 开跑前 ≤30 分钟轮询秒数（更远见 §11） |
 | `BACKFILL_DAYS` | var | `60` | GraphQL 回填窗口 |
 | `BACKFILL_SOURCE` | var | `graphql` | `graphql` / `off` |
 | `TIMEZONE` | var | `Asia/Hong_Kong` | |
@@ -778,7 +779,7 @@ npx wrangler secret put LIVE_PUSH_ENABLED   # 设为 true
 ### 实时轮询
 
 - Cron（每小时）：赛程 + 少量回填 + 推送重试。  
-- 有本地赛日：每 meeting 一个 Durable Object，alarm 自循环（>30min→60s，≤30min→`POLL_INTERVAL_SEC`）。  
+- 有本地赛日：每 meeting 一个 Durable Object，alarm 自循环（档位见 §11）。  
 - 无赛日：不高频空转。
 
 ### 马匹 HTML
@@ -786,6 +787,37 @@ npx wrangler secret put LIVE_PUSH_ENABLED   # 设为 true
 - 档案+往绩：`https://racing.hkjc.com/en-us/local/information/horse?HorseNo={code}&Option=1`
 - 伤患（赛日页）：`https://racing.hkjc.com/en-us/local/information/veterinaryrecord?RaceDate=YYYY/MM/DD&Racecourse=ST|HV`
 - 礼貌间隔约 500ms；只对出赛马；首见 + 赛日各刷新一次。
+
+---
+
+## 11. Polling & write budget
+
+生产曾出现约 **~114k D1 rows written/day**、每 15 分钟约 **~2.5k queries**（约 07:45 HKT 起）。根因：MeetingPoller 每次 alarm 无条件 `persistMeetingTree`（会议/场次/马匹/成绩约 100+ 行）+ 每次写 `last_fetch_at`，而赔率本身很少变。
+
+### 轮询档位（相对下一场 `post_time`）
+
+| 距开跑 | 间隔 |
+|---|---|
+| > 2 小时 | **5 分钟** |
+| 30 分钟 – 2 小时 | **60 秒** |
+| ≤ 30 分钟 | **`POLL_INTERVAL_SEC`（默认 10s）** |
+| 会议结束 / 全部有成绩 | **停止** alarm（cron 日后再启） |
+
+### D1 写入门闩
+
+1. **Meeting tree hash 门控**（DO storage）：对规范化会议树算 content hash；仅 hash 变化时调用 `persistMeetingTree`。  
+2. **Upsert 同值 no-op**：`ON CONFLICT DO UPDATE … WHERE … IS DISTINCT FROM …`，cron/回填路径也不会重写相同行。  
+3. **`last_fetch_at`**：每次 poll 写入 DO storage；**最多每 5 分钟**刷到 D1（`/health` 仍读 D1）。  
+4. **赔率快照**：仍用 `insertOddsSnapshotIfChanged`（hash 去重）；推送语义不变（`odds_update` 仅变赔率；`lock`/`result` 每场一次）。
+
+### 预期写入量（量级）
+
+| | Before | After（平稳日、赔率少变） |
+|---|---|---|
+| Meeting tree 行/日 | ~100+ 行 × 每次 poll ≈ **~10万级** | 仅内容变化时写（赛程/状态/成绩变动，通常 **数十～数百行/日**） |
+| `last_fetch_at` | 每次 poll | ≤ **~288 次/日**（5 min） |
+| Odds snapshots | 已 hash 去重 | 不变 |
+| Queries / 15 min（07:45+） | ~2.5k（含大量无意义 upsert） | 随 poll 档位下降 + 跳过 tree persist 显著降低 |
 
 ---
 
