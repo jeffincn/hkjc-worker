@@ -15,6 +15,17 @@ describe("poll interval by post time", () => {
     expect(ms).toBe(300_000);
   });
 
+  it("uses 60 min when more than 24 h before post", () => {
+    const ms = computePollIntervalMs({
+      nowMs: now,
+      postTimeIso: "2026-10-09T12:30:00+08:00",
+      fastIntervalSec: 30,
+      slowIntervalSec: 60,
+      idleIntervalSec: 300,
+    });
+    expect(ms).toBe(3_600_000);
+  });
+
   it("uses 60s when 30 min–2 h before post", () => {
     const ms = computePollIntervalMs({
       nowMs: now,
