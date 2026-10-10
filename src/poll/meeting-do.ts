@@ -26,7 +26,8 @@ const LAST_FETCH_D1_FLUSH_MS = 5 * 60 * 1000;
 
 /**
  * One Durable Object per meeting. Alarm self-loop:
- * 5 min when >2h before post, 60s when 30min–2h, 30s inside 30min.
+ * 60 min when >24h before post, 5 min when 2–24h, 60s when 30min–2h,
+ * 30s inside 30min.
  */
 export class MeetingPoller implements DurableObject {
   private state: DurableObjectState;
@@ -41,11 +42,17 @@ export class MeetingPoller implements DurableObject {
     const url = new URL(request.url);
     if (request.method === "POST" && url.pathname.endsWith("/start")) {
       const body = (await request.json()) as { meeting_date: string; venue: string };
+      // Hourly cron re-starts pollers for live meetings. Preserve the
+      // locked/result memory for the same meeting so restarts do not
+      // re-push lock/result events that were already delivered.
+      const existing = await this.state.storage.get<DoState>("cfg");
+      const sameMeeting =
+        existing?.meeting_date === body.meeting_date && existing?.venue === body.venue;
       await this.state.storage.put<DoState>("cfg", {
         meeting_date: body.meeting_date,
         venue: body.venue,
-        locked_races: [],
-        result_races: [],
+        locked_races: sameMeeting ? (existing?.locked_races ?? []) : [],
+        result_races: sameMeeting ? (existing?.result_races ?? []) : [],
       });
       await this.state.storage.setAlarm(Date.now() + 1000);
       return new Response(JSON.stringify({ ok: true }), {
