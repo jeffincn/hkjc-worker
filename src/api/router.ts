@@ -100,13 +100,10 @@ async function handleHealth(env: Env): Promise<Response> {
      FROM backfill_progress WHERE status='done'`,
   ).first<{ min_date: string | null; max_date: string | null; n: number }>();
 
-  const meetingCount = await env.DB.prepare(`SELECT COUNT(*) AS n FROM meetings`).first<{
-    n: number;
-  }>();
-  const snapshotCount = await env.DB.prepare(`SELECT COUNT(*) AS n FROM odds_snapshots`).first<{
-    n: number;
-  }>();
-
+  // NOTE: /health must stay read-cheap. COUNT(*) over meetings / odds_snapshots
+  // is a full table scan on every call and burns the D1 free-tier daily
+  // row-read quota on race days (2026-10-11 outage). Totals are intentionally
+  // omitted here; use the query endpoints with bounded filters instead.
   const lastPushRow = await env.DB.prepare(
     `SELECT event_type, http_status, success, error_message, sent_at FROM push_log ORDER BY id DESC LIMIT 1`,
   ).first();
@@ -122,8 +119,6 @@ async function handleHealth(env: Env): Promise<Response> {
     last_push_at: lastPush,
     last_push_status: lastPushStatus,
     last_push: lastPushRow ?? null,
-    meetings_stored: meetingCount?.n ?? 0,
-    odds_snapshots: snapshotCount?.n ?? 0,
     backfill: {
       completed_meetings: backfillRange?.n ?? 0,
       from: backfillRange?.min_date ?? null,

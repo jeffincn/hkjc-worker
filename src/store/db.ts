@@ -213,11 +213,15 @@ export async function insertOddsSnapshotIfChanged(
   dataSource = "graphql",
 ): Promise<SnapshotInsertResult> {
   const hash = await contentHash(snapshot.payload);
+  // ORDER BY snapshot_time (not id) so idx_odds_lookup
+  // (meeting_date, venue, race_no, snapshot_time) serves filter+order as an
+  // index seek: touches 1 row instead of scanning every snapshot of the race.
+  // This runs on every poll tick (30s) x every race on race days.
   const existing = await db
     .prepare(
       `SELECT content_hash FROM odds_snapshots
        WHERE meeting_date=? AND venue=? AND race_no=?
-       ORDER BY id DESC LIMIT 1`,
+       ORDER BY snapshot_time DESC, id DESC LIMIT 1`,
     )
     .bind(meetingDate, venue, snapshot.race_no)
     .first<{ content_hash: string }>();

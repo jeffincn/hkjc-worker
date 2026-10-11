@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS odds_snapshots (
   data_source TEXT NOT NULL DEFAULT 'graphql',
   created_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_odds_created_at ON odds_snapshots (created_at);
 CREATE TABLE IF NOT EXISTS results (
   meeting_date TEXT NOT NULL,
   venue TEXT NOT NULL,
