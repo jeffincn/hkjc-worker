@@ -18,8 +18,8 @@ export async function insertPushEvent(
       envelope.meeting_date,
       envelope.venue,
       envelope.event,
-      envelope.captured_at,
-      envelope.source.last_updated_at,
+      envelope.captured_at ?? null,
+      envelope.source?.last_updated_at ?? null,
       JSON.stringify(envelope),
       formatHkNow(),
     )

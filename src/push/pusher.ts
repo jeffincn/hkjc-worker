@@ -2,7 +2,7 @@ import type { Env } from "../env";
 import { envBool } from "../env";
 import { contentHash } from "../parse/hash";
 import type { PushEnvelope, PushEvent } from "./envelope";
-import { isLivePushEvent } from "./envelope";
+import { formatHkNow, isLivePushEvent } from "./envelope";
 import { getPushEventById } from "./ledger";
 import {
   countSubscribers,
@@ -284,12 +284,14 @@ async function logPush(
     .bind(
       envelope.event,
       info.target ?? null,
-      info.http_status,
-      info.retry_count,
+      info.http_status ?? null,
+      info.retry_count ?? 0,
       info.success ? 1 : 0,
       hash,
       info.error_message ?? null,
-      envelope.sent_at,
+      // Actual attempt time (not the envelope's original sent_at, which is
+      // stale for retries/piggybacks and made /health show old rows).
+      formatHkNow(),
     )
     .run();
 }
@@ -312,10 +314,10 @@ export async function enqueueRetry(
         envelope.event,
         JSON.stringify(envelope),
         retryCount,
-        envelope.sent_at,
-        lastError,
-        subscriberId,
-        envelope.event_id,
+        envelope.sent_at ?? new Date().toISOString(),
+        lastError ?? null,
+        subscriberId ?? null,
+        envelope.event_id ?? null,
       )
       .run();
     return;
@@ -331,10 +333,10 @@ export async function enqueueRetry(
       JSON.stringify(envelope),
       retryCount,
       next,
-      envelope.sent_at,
-      lastError,
-      subscriberId,
-      envelope.event_id,
+      envelope.sent_at ?? new Date().toISOString(),
+      lastError ?? null,
+      subscriberId ?? null,
+      envelope.event_id ?? null,
     )
     .run();
 }
@@ -428,11 +430,11 @@ export async function piggybackPending(
         .bind(
           envelope.event,
           JSON.stringify(envelope),
-          row.retry_count,
+          row.retry_count ?? 0,
           new Date().toISOString(),
           result.error_message ?? "piggyback failed",
           row.subscriber_id ?? null,
-          envelope.event_id,
+          envelope.event_id ?? null,
         )
         .run();
     }
