@@ -2,7 +2,6 @@ import { handleApi } from "./api/router";
 import type { Env } from "./env";
 import { runBackfillStep } from "./backfill/runner";
 import { ingestActiveMeeting } from "./services/ingest";
-import { flushDueRetries } from "./push/pusher";
 
 export { MeetingPoller } from "./poll/meeting-do";
 
@@ -20,11 +19,11 @@ export default {
   },
 
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    // Hourly cron (wrangler): daily schedule check + polite backfill step + retry flush.
+    // Hourly cron (wrangler): daily schedule check + polite backfill step.
+    // Retry flush runs at the end of ingestActiveMeeting (after new event pushes).
     // High-frequency odds polling is handled by MeetingPoller Durable Object alarms.
     ctx.waitUntil(
       (async () => {
-        await flushDueRetries(env);
         await ingestActiveMeeting(env);
         // Small backfill step each cron tick (resumable)
         if ((env.BACKFILL_SOURCE ?? "graphql") !== "off") {
