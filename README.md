@@ -516,9 +516,9 @@ curl -s -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/v1/admin/subscribers/
 
 与规格相同：`races[]` 内含 `race_no`、`post_time`、`snapshot_time`、`pool_status`、`runners[]`（`horse_no`、`horse_name`、`win_odds`、`place_odds`、`status`、`final_position`）。
 
-- `lock`：池状态变为 `STOP_SELL` 时最终快照  
+- `lock`：池真正停售后的最终快照。需同时满足：`pool_status=STOP_SELL`、该场 `post_time` 已过或距现在 ≤15 分钟，且此前有过开售（`START_SELL`/`SELLING`）或当前快照含赔率。未开售的空壳（`lastUpdateTime` 空且无赔率）不入库、不推送。  
 - `scratch`：检测到退出/划走  
-- `result`：参赛马 `finalPosition` 齐全  
+- `result`：参赛马 `finalPosition` 齐全（赛前无名次，不会误推）  
 
 #### `dividends`
 
@@ -534,7 +534,7 @@ curl -s -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/v1/admin/subscribers/
 }
 ```
 
-完整派彩 JSON 已入库，接收方用 API `/v1/results` 拉取。
+完整派彩 JSON 已入库，接收方用 API `/v1/results` 拉取。仅当至少一个池的 `dividends` 非空且该有意义内容相对上次变化时才推送；hash 只针对派彩条目（忽略 `status`/`lastUpdateTime` 空池抖动）。空派彩不写 `results`。
 
 #### `changes`
 

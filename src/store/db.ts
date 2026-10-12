@@ -251,6 +251,51 @@ export async function insertOddsSnapshotIfChanged(
   return { inserted: true, content_hash: hash, snapshot_time: snapshot.snapshot_time };
 }
 
+/**
+ * True if this race previously had an open/selling pool or non-empty odds.
+ * Used to distinguish genuine STOP_SELL (lock) from pre-sale STOP_SELL shells.
+ */
+export async function raceHadOpenOddsSnapshot(
+  db: D1Database,
+  meetingDate: string,
+  venue: string,
+  raceNo: number,
+): Promise<boolean> {
+  const rows = await db
+    .prepare(
+      `SELECT pool_status, raw_json FROM odds_snapshots
+       WHERE meeting_date=? AND venue=? AND race_no=?
+       ORDER BY snapshot_time DESC, id DESC
+       LIMIT 20`,
+    )
+    .bind(meetingDate, venue, raceNo)
+    .all<{ pool_status: string | null; raw_json: string }>();
+
+  for (const row of rows.results ?? []) {
+    const status = (row.pool_status ?? "").toUpperCase();
+    if (status === "START_SELL" || status === "SELLING" || status === "SELL_STARTED") {
+      return true;
+    }
+    try {
+      const parsed = JSON.parse(row.raw_json) as {
+        payload?: { win?: Record<string, unknown>; pla?: Record<string, unknown> };
+        runners?: Array<{ win_odds?: number | null; place_odds?: number | null }>;
+      };
+      const win = parsed.payload?.win ?? {};
+      const pla = parsed.payload?.pla ?? {};
+      if (Object.keys(win).length > 0 || Object.keys(pla).length > 0) return true;
+      if (
+        (parsed.runners ?? []).some((r) => r.win_odds != null || r.place_odds != null)
+      ) {
+        return true;
+      }
+    } catch {
+      // ignore malformed rows
+    }
+  }
+  return false;
+}
+
 export async function persistMeetingTree(
   db: D1Database,
   meeting: NormalizedMeeting,
@@ -327,6 +372,10 @@ export async function storeDividendsAsResults(
   pools: PmPoolRaw[],
   dataSource: string,
 ): Promise<void> {
+  // Skip status-only / empty dividend shells (pre-race DEFINED pools).
+  const hasDiv = pools.some((p) => Array.isArray(p.dividends) && p.dividends.length > 0);
+  if (!hasDiv) return;
+
   const json = JSON.stringify(pools);
   // Ensure at least a placeholder result row keyed by horse from WIN dividends if no runners
   const winPool = pools.find((p) => p.oddsType === "WIN");

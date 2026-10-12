@@ -14,6 +14,16 @@ import type {
   ResultMeetingsData,
 } from "../graphql/types";
 import {
+  dividendsHashPayload,
+  dividendsPoolCount,
+  hasAnyDividends,
+} from "../parse/dividends";
+import {
+  isStorableOddsSnapshot,
+  shouldEmitLock,
+  snapshotHasOdds,
+} from "../parse/lock";
+import {
   isScratchedStatus,
   normalizeMeeting,
   pickHkActiveMeetings,
@@ -25,6 +35,7 @@ import { flushDueRetries, piggybackPending, sendPush } from "../push/pusher";
 import {
   insertOddsSnapshotIfChanged,
   persistMeetingTree,
+  raceHadOpenOddsSnapshot,
   setMeta,
   storeChangeHistories,
   storeDividendsAsResults,
@@ -167,6 +178,8 @@ export async function ingestOneMeeting(
   const resultRaces: PushRace[] = [];
   let scratched = false;
 
+  const nowMs = Date.now();
+
   for (const race of meeting.races) {
     const pair = byRace.get(race.race_no);
     const snap = buildRaceOddsSnapshot({
@@ -185,23 +198,43 @@ export async function ingestOneMeeting(
       plaPool: pair?.pla,
     });
 
-    const ins = await insertOddsSnapshotIfChanged(
-      env.DB,
-      meeting.meeting_date,
-      meeting.venue,
-      snap,
-    );
-    if (ins.inserted) {
-      changed++;
-      const pushRace: PushRace = {
-        race_no: snap.race_no,
-        post_time: snap.post_time,
-        snapshot_time: snap.snapshot_time,
-        pool_status: snap.pool_status,
-        runners: snap.runners,
-      };
-      pushRaces.push(pushRace);
-      if (snap.pool_status === "STOP_SELL") lockRaces.push(pushRace);
+    // Skip un-opened pool shells (empty lastUpdate + no odds) — they must
+    // not be stored or trigger odds_update / lock.
+    if (isStorableOddsSnapshot(snap)) {
+      const hadPriorOpen = await raceHadOpenOddsSnapshot(
+        env.DB,
+        meeting.meeting_date,
+        meeting.venue,
+        race.race_no,
+      );
+
+      const ins = await insertOddsSnapshotIfChanged(
+        env.DB,
+        meeting.meeting_date,
+        meeting.venue,
+        snap,
+      );
+      if (ins.inserted) {
+        changed++;
+        const pushRace: PushRace = {
+          race_no: snap.race_no,
+          post_time: snap.post_time,
+          snapshot_time: snap.snapshot_time,
+          pool_status: snap.pool_status,
+          runners: snap.runners,
+        };
+        pushRaces.push(pushRace);
+        if (
+          shouldEmitLock({
+            poolStatus: snap.pool_status,
+            postTime: snap.post_time,
+            nowMs,
+            wasOpenOrHasOdds: snapshotHasOdds(snap) || hadPriorOpen,
+          })
+        ) {
+          lockRaces.push(pushRace);
+        }
+      }
     }
 
     for (const r of race.runners) {
@@ -232,12 +265,15 @@ export async function ingestOneMeeting(
       },
     });
     const resPools = divRes.data?.raceMeetings?.[0]?.resPools ?? [];
+    // Hash only pools with non-empty dividends so INITIAL→DEFINED status
+    // churn on empty pre-race pools does not look like a dividends update.
     const divDoc = await storeRawDocument(
       env.DB,
       "graphql_dividends",
       `${meeting.meeting_date}_${meeting.venue}`,
       resPools,
       null,
+      { hashOf: dividendsHashPayload(resPools) },
     );
     const divByRace = new Map<number, typeof resPools>();
     for (const p of resPools) {
@@ -248,6 +284,7 @@ export async function ingestOneMeeting(
       divByRace.set(n, list);
     }
     for (const [raceNo, racePools] of divByRace) {
+      // storeDividendsAsResults skips races with empty dividends arrays
       await storeDividendsAsResults(
         env.DB,
         meeting.meeting_date,
@@ -257,14 +294,17 @@ export async function ingestOneMeeting(
         "graphql",
       );
     }
-    if (divDoc.changed && resPools.length > 0) {
+    if (divDoc.changed && hasAnyDividends(resPools)) {
       await sendPush(
         env,
         buildEnvelope({
           event: "dividends",
           meeting_date: meeting.meeting_date,
           venue: meeting.venue,
-          meta: { content_hash: divDoc.content_hash, pools: resPools.length },
+          meta: {
+            content_hash: divDoc.content_hash,
+            pools: dividendsPoolCount(resPools),
+          },
         }),
       );
     }

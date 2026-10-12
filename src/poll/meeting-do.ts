@@ -3,6 +3,11 @@ import { envNum } from "../env";
 import { fetchGraphQL } from "../graphql/client";
 import { QUERY_PM_POOLS_ODDS, QUERY_RACE_MEETINGS_FULL } from "../graphql/queries";
 import type { PmPoolsOddsData, RaceMeetingsFullData } from "../graphql/types";
+import {
+  isStorableOddsSnapshot,
+  shouldEmitLock,
+  snapshotHasOdds,
+} from "../parse/lock";
 import { normalizeMeeting, resultsComplete } from "../parse/meeting";
 import { buildRaceOddsSnapshot, poolsByRace } from "../parse/odds";
 import { buildEnvelope, type PushRace } from "../push/envelope";
@@ -11,6 +16,7 @@ import {
   insertOddsSnapshotIfChanged,
   meetingTreeContentHash,
   persistMeetingTree,
+  raceHadOpenOddsSnapshot,
   setMeta,
 } from "../store/db";
 import { computePollIntervalMs, selectRelevantPostTime } from "./interval";
@@ -120,6 +126,7 @@ export class MeetingPoller implements DurableObject {
       const byRace = poolsByRace(oddsRes.data?.raceMeetings?.[0]?.pmPools ?? []);
 
       const changed: PushRace[] = [];
+      const nowMs = Date.now();
       for (const race of meeting.races) {
         const pair = byRace.get(race.race_no);
         const snap = buildRaceOddsSnapshot({
@@ -131,12 +138,6 @@ export class MeetingPoller implements DurableObject {
           winPool: pair?.win,
           plaPool: pair?.pla,
         });
-        const ins = await insertOddsSnapshotIfChanged(
-          this.env.DB,
-          meeting.meeting_date,
-          meeting.venue,
-          snap,
-        );
         const pushRace: PushRace = {
           race_no: snap.race_no,
           post_time: snap.post_time,
@@ -145,19 +146,41 @@ export class MeetingPoller implements DurableObject {
           runners: snap.runners,
         };
 
-        if (ins.inserted) changed.push(pushRace);
-
-        if (snap.pool_status === "STOP_SELL" && !cfg.locked_races.includes(race.race_no)) {
-          cfg.locked_races.push(race.race_no);
-          await sendPush(
-            this.env,
-            buildEnvelope({
-              event: "lock",
-              meeting_date: meeting.meeting_date,
-              venue: meeting.venue,
-              races: [pushRace],
-            }),
+        if (isStorableOddsSnapshot(snap)) {
+          const hadPriorOpen = await raceHadOpenOddsSnapshot(
+            this.env.DB,
+            meeting.meeting_date,
+            meeting.venue,
+            race.race_no,
           );
+          const ins = await insertOddsSnapshotIfChanged(
+            this.env.DB,
+            meeting.meeting_date,
+            meeting.venue,
+            snap,
+          );
+          if (ins.inserted) changed.push(pushRace);
+
+          if (
+            !cfg.locked_races.includes(race.race_no) &&
+            shouldEmitLock({
+              poolStatus: snap.pool_status,
+              postTime: snap.post_time,
+              nowMs,
+              wasOpenOrHasOdds: snapshotHasOdds(snap) || hadPriorOpen,
+            })
+          ) {
+            cfg.locked_races.push(race.race_no);
+            await sendPush(
+              this.env,
+              buildEnvelope({
+                event: "lock",
+                meeting_date: meeting.meeting_date,
+                venue: meeting.venue,
+                races: [pushRace],
+              }),
+            );
+          }
         }
 
         if (resultsComplete(race) && !cfg.result_races.includes(race.race_no)) {
