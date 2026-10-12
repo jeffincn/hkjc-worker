@@ -115,7 +115,8 @@ CREATE TABLE IF NOT EXISTS pending_pushes (
   next_retry_at TEXT,
   created_at TEXT NOT NULL,
   last_error TEXT,
-  subscriber_id INTEGER
+  subscriber_id INTEGER,
+  event_id TEXT
 );
 CREATE TABLE IF NOT EXISTS push_subscribers (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -215,6 +216,27 @@ CREATE TABLE IF NOT EXISTS horse_fetch_state (
   last_fetched_at TEXT,
   race_day_refreshed INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS push_seq (
+  meeting_date TEXT NOT NULL,
+  venue TEXT NOT NULL,
+  next_seq INTEGER NOT NULL DEFAULT 0,
+  last_change_seq INTEGER,
+  last_change_at TEXT,
+  PRIMARY KEY (meeting_date, venue)
+);
+CREATE TABLE IF NOT EXISTS push_events (
+  event_id TEXT PRIMARY KEY,
+  seq INTEGER NOT NULL,
+  meeting_date TEXT,
+  venue TEXT,
+  event_type TEXT NOT NULL,
+  captured_at TEXT NOT NULL,
+  source_last_updated_at TEXT,
+  payload_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_push_events_meeting_seq
+  ON push_events (meeting_date, venue, seq);
 `;
 
 beforeAll(async () => {

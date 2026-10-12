@@ -1,7 +1,11 @@
+import { GRAPHQL_ENDPOINT } from "../graphql/queries";
+
 export type PushEvent =
   | "test"
   | "schedule"
   | "odds_update"
+  | "odds_delta"
+  | "no_update"
   | "lock"
   | "scratch"
   | "result"
@@ -13,9 +17,15 @@ export type PushEvent =
   | "dividends"
   | "changes";
 
+/** HKJC GraphQL WIN/PLA oddsValue is decimal: total return per $1 incl. stake. */
+export const ODDS_BASIS =
+  "HKD total return per $1 unit incl. stake" as const;
+
 export interface PushRunner {
   horse_no: number;
   horse_name: string | null;
+  /** Additive 1.1 field; omitted by older producers. */
+  horse_name_ch?: string | null;
   win_odds: number | null;
   place_odds: number | null;
   status: string | null;
@@ -27,36 +37,70 @@ export interface PushRace {
   post_time: string | null;
   snapshot_time: string;
   pool_status: string | null;
+  /** Per-race pmPools lastUpdateTime (or null when unknown). */
+  source_last_updated_at?: string | null;
   runners: PushRunner[];
 }
 
+export interface PushSource {
+  name: "HKJC GraphQL";
+  url: string;
+  /** Explicit null when unknown — never omit. */
+  last_updated_at: string | null;
+}
+
+export interface PushQuality {
+  missing_source_time: boolean;
+  /** True when at least one race's post_time was already past at capture. */
+  post_start: boolean;
+  /** sent_at - captured_at in milliseconds. */
+  late_ms: number;
+}
+
+export type OddsBetType = "WIN" | "PLA";
+
+export interface OddsDeltaChange {
+  race_no: number;
+  runner_no: number;
+  horse_name_ch: string | null;
+  horse_name_en: string | null;
+  bet_type: OddsBetType;
+  odds_basis: typeof ODDS_BASIS;
+  prev_odds: number | null;
+  new_odds: number | null;
+  source_last_updated_at: string | null;
+  race_post_time: string | null;
+  pool_status: string | null;
+}
+
+export interface OddsPoolInvestment {
+  race_no: number;
+  bet_type: OddsBetType;
+  /** Pool total turnover from raceMeetings poolInvs.investment; null if unavailable. */
+  investment: number | null;
+}
+
 export interface PushEnvelope {
-  schema: "hkjc-push/1.0";
+  schema: "hkjc-push/1.1";
   event: PushEvent;
+  event_id: string;
+  /** Monotonic per meeting_date+venue (global key when meeting is null). */
+  seq: number;
+  captured_at: string;
   sent_at: string;
   meeting_date: string | null;
   venue: string | null;
+  source: PushSource;
+  quality: PushQuality;
   races: PushRace[];
+  /** odds_delta payload */
+  changes?: OddsDeltaChange[];
+  /** Per-race WIN/PLA pool turnover (never per-horse). */
+  pools?: OddsPoolInvestment[];
+  /** no_update: last odds-changing event for this meeting */
+  last_change_seq?: number | null;
+  last_change_at?: string | null;
   meta?: Record<string, unknown>;
-}
-
-export function buildEnvelope(args: {
-  event: PushEvent;
-  meeting_date?: string | null;
-  venue?: string | null;
-  races?: PushRace[];
-  sent_at?: string;
-  meta?: Record<string, unknown>;
-}): PushEnvelope {
-  return {
-    schema: "hkjc-push/1.0",
-    event: args.event,
-    sent_at: args.sent_at ?? formatHkNow(),
-    meeting_date: args.meeting_date ?? null,
-    venue: args.venue ?? null,
-    races: args.races ?? [],
-    ...(args.meta ? { meta: args.meta } : {}),
-  };
 }
 
 export function formatHkNow(date = new Date()): string {
@@ -75,10 +119,139 @@ export function formatHkNow(date = new Date()): string {
   return `${get("year")}-${get("month")}-${get("day")}T${get("hour")}:${get("minute")}:${get("second")}+08:00`;
 }
 
+export function parseHkMs(iso: string): number {
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? ms : NaN;
+}
+
+export function computeLateMs(capturedAt: string, sentAt: string): number {
+  const a = parseHkMs(capturedAt);
+  const b = parseHkMs(sentAt);
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return 0;
+  return Math.max(0, b - a);
+}
+
+export function anyRacePastPost(
+  races: Array<{ post_time?: string | null }>,
+  capturedAtMs: number,
+): boolean {
+  for (const r of races) {
+    if (!r.post_time) continue;
+    const t = Date.parse(r.post_time);
+    if (Number.isFinite(t) && t < capturedAtMs) return true;
+  }
+  return false;
+}
+
+export function buildSource(args?: {
+  url?: string;
+  last_updated_at?: string | null;
+}): PushSource {
+  return {
+    name: "HKJC GraphQL",
+    url: args?.url ?? GRAPHQL_ENDPOINT,
+    last_updated_at:
+      args?.last_updated_at === undefined ? null : args.last_updated_at,
+  };
+}
+
+export function buildQuality(args: {
+  source_last_updated_at: string | null;
+  races: Array<{ post_time?: string | null }>;
+  captured_at: string;
+  sent_at: string;
+  post_start?: boolean;
+}): PushQuality {
+  const capturedMs = parseHkMs(args.captured_at);
+  const post_start =
+    args.post_start ??
+    (Number.isFinite(capturedMs)
+      ? anyRacePastPost(args.races, capturedMs)
+      : false);
+  return {
+    missing_source_time: args.source_last_updated_at == null,
+    post_start,
+    late_ms: computeLateMs(args.captured_at, args.sent_at),
+  };
+}
+
+export interface BuildEnvelopeArgs {
+  event: PushEvent;
+  meeting_date?: string | null;
+  venue?: string | null;
+  races?: PushRace[];
+  captured_at?: string;
+  sent_at?: string;
+  event_id?: string;
+  seq?: number;
+  source_last_updated_at?: string | null;
+  source_url?: string;
+  post_start?: boolean;
+  changes?: OddsDeltaChange[];
+  pools?: OddsPoolInvestment[];
+  last_change_seq?: number | null;
+  last_change_at?: string | null;
+  meta?: Record<string, unknown>;
+}
+
+/**
+ * Assemble a hkjc-push/1.1 envelope.
+ * Production callers should use preparePushEvent (allocates seq + ledger).
+ * Unit tests may pass event_id/seq explicitly.
+ */
+export function buildEnvelope(args: BuildEnvelopeArgs): PushEnvelope {
+  const captured_at = args.captured_at ?? formatHkNow();
+  const sent_at = args.sent_at ?? formatHkNow();
+  const races = args.races ?? [];
+  const source_last_updated_at =
+    args.source_last_updated_at === undefined
+      ? null
+      : args.source_last_updated_at;
+  const source = buildSource({
+    url: args.source_url,
+    last_updated_at: source_last_updated_at,
+  });
+  const quality = buildQuality({
+    source_last_updated_at,
+    races,
+    captured_at,
+    sent_at,
+    post_start: args.post_start,
+  });
+
+  const envelope: PushEnvelope = {
+    schema: "hkjc-push/1.1",
+    event: args.event,
+    event_id: args.event_id ?? crypto.randomUUID(),
+    seq: args.seq ?? 0,
+    captured_at,
+    sent_at,
+    meeting_date: args.meeting_date ?? null,
+    venue: args.venue ?? null,
+    source,
+    quality,
+    races,
+  };
+
+  if (args.changes) envelope.changes = args.changes;
+  if (args.pools) envelope.pools = args.pools;
+  if (args.last_change_seq !== undefined) {
+    envelope.last_change_seq = args.last_change_seq;
+  }
+  if (args.last_change_at !== undefined) {
+    envelope.last_change_at = args.last_change_at;
+  }
+  if (args.meta) envelope.meta = args.meta;
+
+  return envelope;
+}
+
 /** Live events gated by LIVE_PUSH_ENABLED (test / schedule / backfill_progress / whitelist_alert always allowed). */
 export function isLivePushEvent(event: PushEvent): boolean {
   return (
     event === "odds_update" ||
+    event === "odds_delta" ||
+    event === "no_update" ||
     event === "lock" ||
     event === "scratch" ||
     event === "result" ||

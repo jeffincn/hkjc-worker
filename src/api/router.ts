@@ -72,6 +72,12 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
     if (sub === "injuries") return getHorseInjuries(env, code);
   }
 
+  // /v1/events/:event_id
+  const eventMatch = /^\/v1\/events\/([^/]+)$/.exec(path);
+  if (eventMatch) {
+    return getPushEvent(env, decodeURIComponent(eventMatch[1]));
+  }
+
   switch (path) {
     case "/v1/meetings":
       return listMeetings(env, url);
@@ -85,6 +91,8 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
       return listResults(env, url);
     case "/v1/changes":
       return listChanges(env, url);
+    case "/v1/events":
+      return listPushEventsApi(env, url);
     default:
       return jsonError(404, "Not found");
   }
@@ -364,6 +372,45 @@ async function deletePushSubscriber(env: Env, id: number): Promise<Response> {
   const ok = await deleteSubscriber(env, id);
   if (!ok) return jsonError(404, "subscriber not found");
   return jsonOk({ deleted: true, id });
+}
+
+async function listPushEventsApi(env: Env, url: URL): Promise<Response> {
+  const meeting_date = url.searchParams.get("meeting_date");
+  const venue = url.searchParams.get("venue");
+  if (!meeting_date || !venue) {
+    return jsonError(400, "meeting_date and venue required");
+  }
+  const sinceRaw = url.searchParams.get("since_seq");
+  const limitRaw = url.searchParams.get("limit");
+  const since_seq = sinceRaw != null && sinceRaw !== "" ? Number(sinceRaw) : 0;
+  const limit = limitRaw != null && limitRaw !== "" ? Number(limitRaw) : 100;
+  if (!Number.isFinite(since_seq) || since_seq < 0) {
+    return jsonError(400, "since_seq must be a non-negative number");
+  }
+  if (!Number.isFinite(limit) || limit < 1) {
+    return jsonError(400, "limit must be a positive number");
+  }
+  const { listPushEvents } = await import("../push/ledger");
+  const events = await listPushEvents(env, {
+    meeting_date,
+    venue,
+    since_seq,
+    limit,
+  });
+  return jsonOk({
+    meeting_date,
+    venue,
+    since_seq,
+    limit: Math.min(Math.max(limit, 1), 500),
+    events,
+  });
+}
+
+async function getPushEvent(env: Env, eventId: string): Promise<Response> {
+  const { getPushEventById } = await import("../push/ledger");
+  const event = await getPushEventById(env, eventId);
+  if (!event) return jsonError(404, "event not found");
+  return jsonOk({ event });
 }
 
 async function listChanges(env: Env, url: URL): Promise<Response> {

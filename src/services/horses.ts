@@ -8,8 +8,7 @@ import {
   parsePastRuns,
   parseVetRecords,
 } from "../html/horse";
-import { buildEnvelope } from "../push/envelope";
-import { sendPush } from "../push/pusher";
+import { emitPush } from "../push/emit";
 import {
   replaceHorseRuns,
   storeRawDocument,
@@ -153,45 +152,36 @@ export async function refreshMeetingHorses(
 
   // Batched pushes per meeting — never per-horse spam
   if (profiles_changed.length > 0) {
-    await sendPush(
-      env,
-      buildEnvelope({
-        event: "horse_update",
-        meeting_date: args.meeting_date,
-        venue: args.venue,
-        meta: {
-          horse_codes: profiles_changed,
-          count: profiles_changed.length,
-          content_hash: await hashPayload(profiles_changed),
-        },
-      }),
-    );
+    await emitPush(env, {
+      event: "horse_update",
+      meeting_date: args.meeting_date,
+      venue: args.venue,
+      meta: {
+        horse_codes: profiles_changed,
+        count: profiles_changed.length,
+        content_hash: await hashPayload(profiles_changed),
+      },
+    });
   }
   if (runs_changed.length > 0) {
-    await sendPush(
-      env,
-      buildEnvelope({
-        event: "runs_update",
-        meeting_date: args.meeting_date,
-        venue: args.venue,
-        meta: {
-          horse_codes: runs_changed,
-          count: runs_changed.length,
-          content_hash: await hashPayload(runs_changed),
-        },
-      }),
-    );
+    await emitPush(env, {
+      event: "runs_update",
+      meeting_date: args.meeting_date,
+      venue: args.venue,
+      meta: {
+        horse_codes: runs_changed,
+        count: runs_changed.length,
+        content_hash: await hashPayload(runs_changed),
+      },
+    });
   }
   if (injuries_changed) {
-    await sendPush(
-      env,
-      buildEnvelope({
-        event: "injury_update",
-        meeting_date: args.meeting_date,
-        venue: args.venue,
-        meta: { source: vetUrl },
-      }),
-    );
+    await emitPush(env, {
+      event: "injury_update",
+      meeting_date: args.meeting_date,
+      venue: args.venue,
+      meta: { source: vetUrl },
+    });
   }
 
   return { profiles_changed, runs_changed, injuries_changed, fetched, skipped };
