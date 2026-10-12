@@ -3,6 +3,7 @@ import { envBool } from "../env";
 import { contentHash } from "../parse/hash";
 import type { PushEnvelope, PushEvent } from "./envelope";
 import { isLivePushEvent } from "./envelope";
+import { getPushEventById } from "./ledger";
 import {
   countSubscribers,
   getSubscriber,
@@ -300,10 +301,12 @@ export async function enqueueRetry(
   lastError: string,
   subscriberId: number | null = null,
 ): Promise<void> {
+  // Store event_id so retries reload the immutable body from push_events.
+  // Keep payload_json as fallback for rows created before ledger existed.
   if (retryCount >= BACKOFF_MINUTES.length) {
     await env.DB.prepare(
-      `INSERT INTO pending_pushes (event_type, payload_json, retry_count, next_retry_at, created_at, last_error, subscriber_id)
-       VALUES (?, ?, ?, NULL, ?, ?, ?)`,
+      `INSERT INTO pending_pushes (event_type, payload_json, retry_count, next_retry_at, created_at, last_error, subscriber_id, event_id)
+       VALUES (?, ?, ?, NULL, ?, ?, ?, ?)`,
     )
       .bind(
         envelope.event,
@@ -312,6 +315,7 @@ export async function enqueueRetry(
         envelope.sent_at,
         lastError,
         subscriberId,
+        envelope.event_id,
       )
       .run();
     return;
@@ -319,8 +323,8 @@ export async function enqueueRetry(
   const delayMin = BACKOFF_MINUTES[retryCount];
   const next = new Date(Date.now() + delayMin * 60_000).toISOString();
   await env.DB.prepare(
-    `INSERT INTO pending_pushes (event_type, payload_json, retry_count, next_retry_at, created_at, last_error, subscriber_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO pending_pushes (event_type, payload_json, retry_count, next_retry_at, created_at, last_error, subscriber_id, event_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       envelope.event,
@@ -330,6 +334,7 @@ export async function enqueueRetry(
       envelope.sent_at,
       lastError,
       subscriberId,
+      envelope.event_id,
     )
     .run();
 }
@@ -338,13 +343,25 @@ export function nextBackoffMinutes(retryCount: number): number | null {
   return BACKOFF_MINUTES[retryCount] ?? null;
 }
 
+/** Reload immutable envelope from push_events when event_id is present. */
+async function resolveRetryEnvelope(
+  env: Env,
+  row: { event_id: string | null; payload_json: string },
+): Promise<PushEnvelope> {
+  if (row.event_id) {
+    const fromLedger = await getPushEventById(env, row.event_id);
+    if (fromLedger) return fromLedger;
+  }
+  return JSON.parse(row.payload_json) as PushEnvelope;
+}
+
 export async function flushDueRetries(
   env: Env,
   opts?: { fetchImpl?: typeof fetch },
 ): Promise<number> {
   const now = new Date().toISOString();
   const { results } = await env.DB.prepare(
-    `SELECT id, event_type, payload_json, retry_count, subscriber_id FROM pending_pushes
+    `SELECT id, event_type, payload_json, retry_count, subscriber_id, event_id FROM pending_pushes
      WHERE next_retry_at IS NOT NULL AND next_retry_at <= ?
      ORDER BY next_retry_at ASC LIMIT 20`,
   )
@@ -355,11 +372,12 @@ export async function flushDueRetries(
       payload_json: string;
       retry_count: number;
       subscriber_id: number | null;
+      event_id: string | null;
     }>();
 
   let sent = 0;
   for (const row of results ?? []) {
-    const envelope = JSON.parse(row.payload_json) as PushEnvelope;
+    const envelope = await resolveRetryEnvelope(env, row);
     await env.DB.prepare(`DELETE FROM pending_pushes WHERE id = ?`).bind(row.id).run();
     const result = await sendPushToSubscriber(env, envelope, row.subscriber_id ?? null, {
       fetchImpl: opts?.fetchImpl,
@@ -384,7 +402,7 @@ export async function piggybackPending(
   opts?: { fetchImpl?: typeof fetch },
 ): Promise<number> {
   const { results } = await env.DB.prepare(
-    `SELECT id, payload_json, retry_count, subscriber_id FROM pending_pushes
+    `SELECT id, payload_json, retry_count, subscriber_id, event_id FROM pending_pushes
      WHERE next_retry_at IS NULL
      ORDER BY id ASC LIMIT 10`,
   ).all<{
@@ -392,19 +410,20 @@ export async function piggybackPending(
     payload_json: string;
     retry_count: number;
     subscriber_id: number | null;
+    event_id: string | null;
   }>();
 
   let sent = 0;
   for (const row of results ?? []) {
-    const envelope = JSON.parse(row.payload_json) as PushEnvelope;
+    const envelope = await resolveRetryEnvelope(env, row);
     await env.DB.prepare(`DELETE FROM pending_pushes WHERE id = ?`).bind(row.id).run();
     const result = await sendPushToSubscriber(env, envelope, row.subscriber_id ?? null, {
       fetchImpl: opts?.fetchImpl,
     });
     if (!result.success && !result.skipped) {
       await env.DB.prepare(
-        `INSERT INTO pending_pushes (event_type, payload_json, retry_count, next_retry_at, created_at, last_error, subscriber_id)
-         VALUES (?, ?, ?, NULL, ?, ?, ?)`,
+        `INSERT INTO pending_pushes (event_type, payload_json, retry_count, next_retry_at, created_at, last_error, subscriber_id, event_id)
+         VALUES (?, ?, ?, NULL, ?, ?, ?, ?)`,
       )
         .bind(
           envelope.event,
@@ -413,6 +432,7 @@ export async function piggybackPending(
           new Date().toISOString(),
           result.error_message ?? "piggyback failed",
           row.subscriber_id ?? null,
+          envelope.event_id,
         )
         .run();
     }

@@ -4,8 +4,7 @@ import { fetchGraphQL } from "../graphql/client";
 import { QUERY_RBC_LIST, QUERY_RBC_MEETING } from "../graphql/queries";
 import type { RbcListData, RbcMeetingData } from "../graphql/types";
 import { filterLocalMeetings, groupDividends, normalizeBackfillMeeting } from "../parse/meeting";
-import { buildEnvelope } from "../push/envelope";
-import { sendPush } from "../push/pusher";
+import { emitPush } from "../push/emit";
 import {
   isBackfillDone,
   markBackfillDone,
@@ -119,16 +118,16 @@ export async function runBackfillStep(
   await setMeta(env.DB, "backfill_last_step_at", new Date().toISOString());
 
   if (processed.length > 0) {
-    await sendPush(
+    await emitPush(
       env,
-      buildEnvelope({
+      {
         event: "backfill_progress",
         meta: {
           processed,
           remaining_estimate: Math.max(0, remaining),
           window: { start, end, backfill_days: days },
         },
-      }),
+      },
       { force: true },
     );
   }

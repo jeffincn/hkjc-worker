@@ -3,14 +3,30 @@ import { envNum } from "../env";
 import { fetchGraphQL } from "../graphql/client";
 import { QUERY_PM_POOLS_ODDS, QUERY_RACE_MEETINGS_FULL } from "../graphql/queries";
 import type { PmPoolsOddsData, RaceMeetingsFullData } from "../graphql/types";
+import {
+  isStorableOddsSnapshot,
+  shouldEmitLock,
+  snapshotHasOdds,
+} from "../parse/lock";
 import { normalizeMeeting, resultsComplete } from "../parse/meeting";
 import { buildRaceOddsSnapshot, poolsByRace } from "../parse/odds";
-import { buildEnvelope, type PushRace } from "../push/envelope";
-import { sendPush } from "../push/pusher";
+import type { RaceOddsSnapshot } from "../parse/odds";
+import {
+  buildPoolInvestments,
+  computeOddsDeltaChanges,
+  maxSourceTime,
+  type HorseNamePair,
+} from "../push/delta";
+import { emitPush } from "../push/emit";
+import type { PushRace } from "../push/envelope";
+import { formatHkNow } from "../push/envelope";
+import { isInFastWindow, shouldEmitNoUpdate } from "../push/heartbeat";
+import { getLastChange } from "../push/seq";
 import {
   insertOddsSnapshotIfChanged,
   meetingTreeContentHash,
   persistMeetingTree,
+  raceHadOpenOddsSnapshot,
   setMeta,
 } from "../store/db";
 import { computePollIntervalMs, selectRelevantPostTime } from "./interval";
@@ -23,6 +39,39 @@ interface DoState {
 }
 
 const LAST_FETCH_D1_FLUSH_MS = 5 * 60 * 1000;
+
+function namesForRace(
+  meeting: ReturnType<typeof normalizeMeeting>,
+  raceNo: number,
+): Map<number, HorseNamePair> {
+  const map = new Map<number, HorseNamePair>();
+  const race = meeting.races.find((r) => r.race_no === raceNo);
+  for (const r of race?.runners ?? []) {
+    map.set(r.horse_no, {
+      horse_name_en: r.name_en ?? null,
+      horse_name_ch: r.name_ch ?? null,
+    });
+  }
+  return map;
+}
+
+function toPushRace(snap: RaceOddsSnapshot): PushRace {
+  return {
+    race_no: snap.race_no,
+    post_time: snap.post_time,
+    snapshot_time: snap.snapshot_time,
+    pool_status: snap.pool_status,
+    source_last_updated_at: snap.payload.last_update,
+    runners: snap.runners.map((r) => ({
+      horse_no: r.horse_no,
+      horse_name: r.horse_name,
+      win_odds: r.win_odds,
+      place_odds: r.place_odds,
+      status: r.status,
+      final_position: r.final_position,
+    })),
+  };
+}
 
 /**
  * One Durable Object per meeting. Alarm self-loop:
@@ -75,6 +124,7 @@ export class MeetingPoller implements DurableObject {
     if (!cfg) return;
 
     const fastSec = envNum(this.env, "POLL_INTERVAL_SEC", 30);
+    const captured_at = formatHkNow();
 
     try {
       const full = await fetchGraphQL<RaceMeetingsFullData>({
@@ -118,8 +168,15 @@ export class MeetingPoller implements DurableObject {
         },
       });
       const byRace = poolsByRace(oddsRes.data?.raceMeetings?.[0]?.pmPools ?? []);
+      // Investment lives on raceMeetings poolInvs (whitelist), not on odds query.
+      const poolInvs = raw.poolInvs ?? [];
 
       const changed: PushRace[] = [];
+      const allDeltaChanges: ReturnType<typeof computeOddsDeltaChanges> = [];
+      const deltaRaceNos: number[] = [];
+      const sourceTimes: Array<string | null> = [];
+      const nowMs = Date.now();
+
       for (const race of meeting.races) {
         const pair = byRace.get(race.race_no);
         const snap = buildRaceOddsSnapshot({
@@ -131,59 +188,120 @@ export class MeetingPoller implements DurableObject {
           winPool: pair?.win,
           plaPool: pair?.pla,
         });
-        const ins = await insertOddsSnapshotIfChanged(
-          this.env.DB,
-          meeting.meeting_date,
-          meeting.venue,
-          snap,
-        );
-        const pushRace: PushRace = {
-          race_no: snap.race_no,
-          post_time: snap.post_time,
-          snapshot_time: snap.snapshot_time,
-          pool_status: snap.pool_status,
-          runners: snap.runners,
-        };
+        sourceTimes.push(snap.payload.last_update);
+        const pushRace = toPushRace(snap);
 
-        if (ins.inserted) changed.push(pushRace);
+        if (isStorableOddsSnapshot(snap)) {
+          const hadPriorOpen = await raceHadOpenOddsSnapshot(
+            this.env.DB,
+            meeting.meeting_date,
+            meeting.venue,
+            race.race_no,
+          );
+          const ins = await insertOddsSnapshotIfChanged(
+            this.env.DB,
+            meeting.meeting_date,
+            meeting.venue,
+            snap,
+          );
+          if (ins.inserted) {
+            changed.push(pushRace);
+            deltaRaceNos.push(race.race_no);
+            const delta = computeOddsDeltaChanges({
+              prev: ins.previous,
+              next: snap,
+              horseNames: namesForRace(meeting, race.race_no),
+            });
+            allDeltaChanges.push(...delta);
+          }
 
-        if (snap.pool_status === "STOP_SELL" && !cfg.locked_races.includes(race.race_no)) {
-          cfg.locked_races.push(race.race_no);
-          await sendPush(
-            this.env,
-            buildEnvelope({
+          if (
+            !cfg.locked_races.includes(race.race_no) &&
+            shouldEmitLock({
+              poolStatus: snap.pool_status,
+              postTime: snap.post_time,
+              nowMs,
+              wasOpenOrHasOdds: snapshotHasOdds(snap) || hadPriorOpen,
+            })
+          ) {
+            cfg.locked_races.push(race.race_no);
+            await emitPush(this.env, {
               event: "lock",
               meeting_date: meeting.meeting_date,
               venue: meeting.venue,
               races: [pushRace],
-            }),
-          );
+              captured_at,
+              source_last_updated_at: snap.payload.last_update,
+            });
+          }
         }
 
         if (resultsComplete(race) && !cfg.result_races.includes(race.race_no)) {
           cfg.result_races.push(race.race_no);
-          await sendPush(
-            this.env,
-            buildEnvelope({
-              event: "result",
-              meeting_date: meeting.meeting_date,
-              venue: meeting.venue,
-              races: [pushRace],
-            }),
-          );
+          await emitPush(this.env, {
+            event: "result",
+            meeting_date: meeting.meeting_date,
+            venue: meeting.venue,
+            races: [pushRace],
+            captured_at,
+            source_last_updated_at: snap.payload.last_update,
+          });
         }
       }
 
+      const meetingSourceTime = maxSourceTime(sourceTimes);
+
       if (changed.length > 0) {
-        await sendPush(
-          this.env,
-          buildEnvelope({
-            event: "odds_update",
+        // Compat snapshot event (unchanged shape + additive envelope fields)
+        await emitPush(this.env, {
+          event: "odds_update",
+          meeting_date: meeting.meeting_date,
+          venue: meeting.venue,
+          races: changed,
+          captured_at,
+          source_last_updated_at: meetingSourceTime,
+        });
+
+        // 1.1 delta alongside snapshot
+        if (allDeltaChanges.length > 0) {
+          await emitPush(this.env, {
+            event: "odds_delta",
             meeting_date: meeting.meeting_date,
             venue: meeting.venue,
             races: changed,
-          }),
+            changes: allDeltaChanges,
+            pools: buildPoolInvestments(poolInvs, deltaRaceNos),
+            captured_at,
+            source_last_updated_at: meetingSourceTime,
+          });
+        }
+      } else {
+        // Heartbeat: no odds change on this live poll
+        const post = selectRelevantPostTime(
+          meeting.races.map((r) => ({ post_time: r.post_time, status: r.status })),
+          nowMs,
         );
+        const fast = isInFastWindow(post, nowMs);
+        const lastNoUpdateAtMs =
+          (await this.state.storage.get<number>("last_no_update_at_ms")) ?? null;
+        if (shouldEmitNoUpdate({ nowMs, lastNoUpdateAtMs, inFastWindow: fast })) {
+          const last = await getLastChange(
+            this.env,
+            meeting.meeting_date,
+            meeting.venue,
+          );
+          await emitPush(this.env, {
+            event: "no_update",
+            meeting_date: meeting.meeting_date,
+            venue: meeting.venue,
+            races: [],
+            captured_at,
+            source_last_updated_at: meetingSourceTime,
+            last_change_seq: last.last_change_seq,
+            last_change_at: last.last_change_at,
+          });
+          await this.state.storage.put("last_no_update_at_ms", nowMs);
+        }
       }
 
       await this.state.storage.put("cfg", cfg);

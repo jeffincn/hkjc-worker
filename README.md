@@ -11,7 +11,7 @@ Cloudflare Worker：从马会官方 GraphQL + 官网马匹页拉取赛马数据 
 1. [与规格的偏差](#1-与规格的偏差已确认)
 2. [基础 URL 与鉴权](#2-基础-url-与鉴权)
 3. [查询 API（接收方）](#3-查询-api接收方)
-4. [Webhook 推送契约](#4-webhook-推送契约)
+4. [Webhook 推送契约（hkjc-push/1.1）](#4-webhook-推送契约hkjc-push11)
 5. [数据表与可空字段](#5-数据表与可空字段)
 6. [配置 / 环境变量](#6-配置--环境变量)
 7. [本地开发](#7-本地开发)
@@ -283,7 +283,36 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 ---
 
-### 3.8 马匹资料
+### 3.8 事件账本回放（`hkjc-push/1.1`）
+
+每个推送事件在 D1 `push_events` 存一份不可变正文（按会议单调 `seq`，非按订阅者）。
+
+#### `GET /v1/events`
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `meeting_date` | 是 | `YYYY-MM-DD` |
+| `venue` | 是 | `ST` / `HV` |
+| `since_seq` | 否 | 只返回 `seq > since_seq`（默认 `0`） |
+| `limit` | 否 | 默认 100，最大 500 |
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "$BASE/v1/events?meeting_date=2026-10-07&venue=HV&since_seq=0&limit=50" | jq .
+```
+
+#### `GET /v1/events/:event_id`
+
+按 UUID 取单条完整信封。
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "$BASE/v1/events/550e8400-e29b-41d4-a716-446655440000" | jq .
+```
+
+---
+
+### 3.9 马匹资料
 
 GraphQL **无**伤患/往绩；来自官网 HTML，`data_source` 为 `html_horse` / `html_vet`。
 
@@ -292,6 +321,7 @@ GraphQL **无**伤患/往绩；来自官网 HTML，`data_source` 为 `html_horse
 ```bash
 curl -s -H "Authorization: Bearer $TOKEN" "$BASE/v1/horses/H087" | jq .
 ```
+
 
 ```json
 {
@@ -371,7 +401,7 @@ curl -s -H "Authorization: Bearer $TOKEN" "$BASE/v1/horses/H087/injuries" | jq .
 
 ---
 
-### 3.9 管理接口（同样 Bearer）
+### 3.10 管理接口（同样 Bearer）
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -418,11 +448,13 @@ curl -s -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/v1/admin/subscribers/
 
 ---
 
-## 4. Webhook 推送契约
+## 4. Webhook 推送契约（`hkjc-push/1.1`）
+
+完整 JSON Schema 见 [`docs/push-schema-1.1.md`](docs/push-schema-1.1.md)。相对 1.0 **加法兼容**：保留 `odds_update` 快照与既有 `races[]` 字段；新增信封字段、`odds_delta`、`no_update`、账本回放 API。
 
 ### 4.1 传输
 
-- 向**每个启用中的订阅者**独立 `POST` 同一份信封（互不影响：一方失败/重试不阻塞另一方）
+- 向**每个启用中的订阅者**独立 `POST` **同一份**信封（同一 `event_id` / `seq` / body；互不影响）
 - `Content-Type: application/json`
 - `User-Agent: hkjc-data-worker/1.0`（Cloudflare 对空 UA 会报 1010，必须带）
 - 若该订阅者配置了 secret：`X-Signature` = 对**原始 JSON body** 的 HMAC-SHA256 **小写 hex**（无 `sha256=` 前缀）
@@ -430,54 +462,337 @@ curl -s -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/v1/admin/subscribers/
 - 迁移会 seed 两个接收方（仅 URL，密钥不进 git）：
   - `https://webhook.site/902a6166-6336-452d-97c5-e64018d97919`（无 HMAC）
   - `https://hkjc-agent.cf-connect.top/webhook`（若设置了 `PUSH_SECRET`，运行时写入该行 secret）
-- **兜底**：仅当 `push_subscribers` **没有任何行**时，才使用 `PUSH_TARGET_URL`（+ 可选全局 `PUSH_SECRET`），避免全新部署静默丢事件
+- **兜底**：仅当 `push_subscribers` **没有任何行**时，才使用 `PUSH_TARGET_URL`（+ 可选全局 `PUSH_SECRET`）
 
-### 4.2 信封 schema：`hkjc-push/1.0`
+### 4.2 公共信封字段
 
-```json
-{
-  "schema": "hkjc-push/1.0",
-  "event": "odds_update",
-  "sent_at": "2026-10-08T19:04:30+08:00",
-  "meeting_date": "2026-10-08",
-  "venue": "HV",
-  "races": [ /* 见下；部分事件可为空数组，细节在 meta */ ],
-  "meta": {}
-}
-```
+| 字段 | 含义 |
+|---|---|
+| `schema` | 固定 `"hkjc-push/1.1"` |
+| `event` | 事件类型 |
+| `event_id` | UUID v4；每事件唯一；跨订阅者与重试相同 |
+| `seq` | 按 `meeting_date`+`venue` 单调递增整数（无会议事件用全局 `*`）；**每事件 +1，非每订阅者** |
+| `captured_at` | Worker 拉取源数据时刻，ISO-8601 `+08:00` |
+| `sent_at` | 首次投递组包时刻（写入账本后不变），ISO `+08:00`；重试重发同一 body |
+| `meeting_date` / `venue` | 会议键；部分事件可为 `null` |
+| `source` | `{ name: "HKJC GraphQL", url, last_updated_at }`；`last_updated_at` **未知时显式 `null`，不可省略** |
+| `quality` | `{ missing_source_time, post_start, late_ms }` |
+| `races` | 既有快照结构（可空）；可含加法字段 `source_last_updated_at` |
+| `meta` | 可选扩展 |
 
-### 4.3 变更才推（hash diff）
+**赔率口径（odds basis）**：HKJC GraphQL `oddsValue` 为 decimal —— **每 $1 含本金总返还（HKD）**。常量：`HKD total return per $1 unit incl. stake`。不要把池总投注额当成单马金额。
+
+**quality 标志**：
+
+| 字段 | 含义 |
+|---|---|
+| `missing_source_time` | `source.last_updated_at === null`（pmPools `lastUpdateTime` 缺失） |
+| `post_start` | 捕获时至少一场的 `post_time` 已过 |
+| `late_ms` | `sent_at - captured_at`（毫秒） |
+
+### 4.3 变更才推（hash diff）+ 心跳
 
 1. 每次拉取都会尝试入库。
 2. 对载荷做稳定 canonical JSON → SHA-256。
-3. **与上一份 hash 相同**：只记 `fetched_at` / 时间戳类元数据，**不推送**。
-4. **hash 不同**：写新快照/原文，并推送对应 `event`。
+3. **与上一份 hash 相同**：不推 `odds_update`/`odds_delta`；MeetingPoller 在会议进行中可发 **`no_update` 心跳**（快窗 ≤30 分钟距开跑：最多 1 次/60s；否则最多 1 次/5min）。
+4. **hash 不同**：写新快照，推 `odds_update`（兼容）+ `odds_delta`（差分）。
 5. 马匹类推送 **按会议批量**（`meta.horse_codes`），**绝不逐马刷屏**。
 
 ### 4.4 `LIVE_PUSH_ENABLED` 门闩
 
 | 事件 | 默认（`false`） | 说明 |
 |---|---|---|
-| `test` / `schedule` / `backfill_progress` / `whitelist_alert` | 仍可推（需有启用订阅者或兜底 URL） | 联调与告警 |
-| `odds_update` / `lock` / `scratch` / `result` / `horse_update` / `injury_update` / `runs_update` / `dividends` / `changes` | **跳过** | 接收方确认 `test` 后再设 `LIVE_PUSH_ENABLED=true` |
+| `test` / `schedule` / `backfill_progress` / `whitelist_alert` | 仍可推 | 联调与告警 |
+| `odds_update` / `odds_delta` / `no_update` / `lock` / `scratch` / `result` / `horse_update` / `injury_update` / `runs_update` / `dividends` / `changes` | **跳过** | 确认 `test` 后再开 |
 
-### 4.5 事件类型与示例
+### 4.5 事件类型与完整 JSON 示例
 
-#### `test`（联调第一条）
+#### `odds_delta`（1.1 新增）
+
+每次检测到赔率变化时与 `odds_update` **一并**发出。`changes[]` 每条 = 一匹马 × 一种彩种（`WIN`/`PLA`）；首次观测 `prev_odds` 为 `null`。`pools[].investment` 为**整池总投注额**（来自 `raceMeetings` 的 `poolInvs.investment`）；赔率白名单 query `QUERY_PM_POOLS_ODDS` **不含** `investment`，取不到时为 `null`（永不把池总额写成单马金额）。
 
 ```json
 {
-  "schema": "hkjc-push/1.0",
+  "schema": "hkjc-push/1.1",
+  "event": "odds_delta",
+  "event_id": "550e8400-e29b-41d4-a716-446655440001",
+  "seq": 12,
+  "captured_at": "2026-10-07T19:04:28+08:00",
+  "sent_at": "2026-10-07T19:04:30+08:00",
+  "meeting_date": "2026-10-07",
+  "venue": "HV",
+  "source": {
+    "name": "HKJC GraphQL",
+    "url": "https://info.cld.hkjc.com/graphql/base/",
+    "last_updated_at": "2026-10-07T19:04:28+08:00"
+  },
+  "quality": {
+    "missing_source_time": false,
+    "post_start": false,
+    "late_ms": 2000
+  },
+  "races": [
+    {
+      "race_no": 3,
+      "post_time": "2026-10-07T19:35:00+08:00",
+      "snapshot_time": "2026-10-07T19:04:28+08:00",
+      "pool_status": "START_SELL",
+      "source_last_updated_at": "2026-10-07T19:04:28+08:00",
+      "runners": [
+        {
+          "horse_no": 1,
+          "horse_name": "EXAMPLE",
+          "win_odds": 3.5,
+          "place_odds": 1.7,
+          "status": "Declared",
+          "final_position": null
+        }
+      ]
+    }
+  ],
+  "changes": [
+    {
+      "race_no": 3,
+      "runner_no": 1,
+      "horse_name_ch": "例子",
+      "horse_name_en": "EXAMPLE",
+      "bet_type": "WIN",
+      "odds_basis": "HKD total return per $1 unit incl. stake",
+      "prev_odds": 4.0,
+      "new_odds": 3.5,
+      "source_last_updated_at": "2026-10-07T19:04:28+08:00",
+      "race_post_time": "2026-10-07T19:35:00+08:00",
+      "pool_status": "START_SELL"
+    },
+    {
+      "race_no": 3,
+      "runner_no": 1,
+      "horse_name_ch": "例子",
+      "horse_name_en": "EXAMPLE",
+      "bet_type": "PLA",
+      "odds_basis": "HKD total return per $1 unit incl. stake",
+      "prev_odds": 1.8,
+      "new_odds": 1.7,
+      "source_last_updated_at": "2026-10-07T19:04:28+08:00",
+      "race_post_time": "2026-10-07T19:35:00+08:00",
+      "pool_status": "START_SELL"
+    }
+  ],
+  "pools": [
+    { "race_no": 3, "bet_type": "WIN", "investment": 1234567 },
+    { "race_no": 3, "bet_type": "PLA", "investment": 890123 }
+  ]
+}
+```
+
+#### `odds_update`（兼容快照）
+
+```json
+{
+  "schema": "hkjc-push/1.1",
+  "event": "odds_update",
+  "event_id": "550e8400-e29b-41d4-a716-446655440002",
+  "seq": 11,
+  "captured_at": "2026-10-07T19:04:28+08:00",
+  "sent_at": "2026-10-07T19:04:30+08:00",
+  "meeting_date": "2026-10-07",
+  "venue": "HV",
+  "source": {
+    "name": "HKJC GraphQL",
+    "url": "https://info.cld.hkjc.com/graphql/base/",
+    "last_updated_at": "2026-10-07T19:04:28+08:00"
+  },
+  "quality": { "missing_source_time": false, "post_start": false, "late_ms": 2000 },
+  "races": [
+    {
+      "race_no": 3,
+      "post_time": "2026-10-07T19:35:00+08:00",
+      "snapshot_time": "2026-10-07T19:04:28+08:00",
+      "pool_status": "START_SELL",
+      "source_last_updated_at": "2026-10-07T19:04:28+08:00",
+      "runners": [
+        {
+          "horse_no": 1,
+          "horse_name": "EXAMPLE",
+          "win_odds": 3.5,
+          "place_odds": 1.7,
+          "status": "Declared",
+          "final_position": null
+        }
+      ]
+    }
+  ]
+}
+```
+
+#### `no_update`（1.1 心跳）
+
+无赔率变化时由 MeetingPoller 发出；`last_change_seq` / `last_change_at` 区分「无变化」与「漏收」。
+
+```json
+{
+  "schema": "hkjc-push/1.1",
+  "event": "no_update",
+  "event_id": "550e8400-e29b-41d4-a716-446655440003",
+  "seq": 13,
+  "captured_at": "2026-10-07T19:05:00+08:00",
+  "sent_at": "2026-10-07T19:05:00+08:00",
+  "meeting_date": "2026-10-07",
+  "venue": "HV",
+  "source": {
+    "name": "HKJC GraphQL",
+    "url": "https://info.cld.hkjc.com/graphql/base/",
+    "last_updated_at": "2026-10-07T19:04:28+08:00"
+  },
+  "quality": { "missing_source_time": false, "post_start": false, "late_ms": 0 },
+  "races": [],
+  "last_change_seq": 12,
+  "last_change_at": "2026-10-07T19:04:28+08:00"
+}
+```
+
+#### `lock` / `scratch` / `result`
+
+`races[]` 同规格。`lock`：需 `STOP_SELL` + `post_time` 已过或 ≤15 分钟内 + 此前开售/当前有赔率；空壳不入库。`result`：参赛马 `finalPosition` 齐全。
+
+```json
+{
+  "schema": "hkjc-push/1.1",
+  "event": "lock",
+  "event_id": "550e8400-e29b-41d4-a716-446655440004",
+  "seq": 20,
+  "captured_at": "2026-10-07T19:34:50+08:00",
+  "sent_at": "2026-10-07T19:34:51+08:00",
+  "meeting_date": "2026-10-07",
+  "venue": "HV",
+  "source": {
+    "name": "HKJC GraphQL",
+    "url": "https://info.cld.hkjc.com/graphql/base/",
+    "last_updated_at": "2026-10-07T19:34:50+08:00"
+  },
+  "quality": { "missing_source_time": false, "post_start": false, "late_ms": 1000 },
+  "races": [
+    {
+      "race_no": 3,
+      "post_time": "2026-10-07T19:35:00+08:00",
+      "snapshot_time": "2026-10-07T19:34:50+08:00",
+      "pool_status": "STOP_SELL",
+      "source_last_updated_at": "2026-10-07T19:34:50+08:00",
+      "runners": [
+        {
+          "horse_no": 1,
+          "horse_name": "EXAMPLE",
+          "win_odds": 3.2,
+          "place_odds": 1.6,
+          "status": "Declared",
+          "final_position": null
+        }
+      ]
+    }
+  ]
+}
+```
+
+#### `dividends`
+
+```json
+{
+  "schema": "hkjc-push/1.1",
+  "event": "dividends",
+  "event_id": "550e8400-e29b-41d4-a716-446655440005",
+  "seq": 30,
+  "captured_at": "2026-10-07T20:00:00+08:00",
+  "sent_at": "2026-10-07T20:00:01+08:00",
+  "meeting_date": "2026-10-07",
+  "venue": "HV",
+  "source": {
+    "name": "HKJC GraphQL",
+    "url": "https://info.cld.hkjc.com/graphql/base/",
+    "last_updated_at": null
+  },
+  "quality": { "missing_source_time": true, "post_start": true, "late_ms": 1000 },
+  "races": [],
+  "meta": { "content_hash": "…", "pools": 18 }
+}
+```
+
+完整派彩用 `/v1/results`；仅当非空派彩有意义内容变化时推送。
+
+#### `changes`
+
+```json
+{
+  "schema": "hkjc-push/1.1",
+  "event": "changes",
+  "event_id": "550e8400-e29b-41d4-a716-446655440006",
+  "seq": 8,
+  "captured_at": "2026-10-07T18:05:00+08:00",
+  "sent_at": "2026-10-07T18:05:00+08:00",
+  "meeting_date": "2026-10-07",
+  "venue": "HV",
+  "source": {
+    "name": "HKJC GraphQL",
+    "url": "https://info.cld.hkjc.com/graphql/base/",
+    "last_updated_at": null
+  },
+  "quality": { "missing_source_time": true, "post_start": false, "late_ms": 0 },
+  "races": [],
+  "meta": { "new_events": 3, "content_hash": "…" }
+}
+```
+
+#### `schedule`
+
+```json
+{
+  "schema": "hkjc-push/1.1",
+  "event": "schedule",
+  "event_id": "550e8400-e29b-41d4-a716-446655440007",
+  "seq": 1,
+  "captured_at": "2026-10-08T10:00:00+08:00",
+  "sent_at": "2026-10-08T10:00:00+08:00",
+  "meeting_date": null,
+  "venue": null,
+  "source": {
+    "name": "HKJC GraphQL",
+    "url": "https://info.cld.hkjc.com/graphql/base/",
+    "last_updated_at": null
+  },
+  "quality": { "missing_source_time": true, "post_start": false, "late_ms": 0 },
+  "races": [],
+  "meta": {
+    "active": [
+      { "date": "2026-10-07", "venue": "HV", "status": "CLOSED", "races": [] }
+    ]
+  }
+}
+```
+
+#### `test`
+
+```json
+{
+  "schema": "hkjc-push/1.1",
   "event": "test",
+  "event_id": "550e8400-e29b-41d4-a716-446655440008",
+  "seq": 1,
+  "captured_at": "2026-10-08T12:00:00+08:00",
   "sent_at": "2026-10-08T12:00:00+08:00",
   "meeting_date": "2026-10-07",
   "venue": "HV",
+  "source": {
+    "name": "HKJC GraphQL",
+    "url": "https://info.cld.hkjc.com/graphql/base/",
+    "last_updated_at": "2026-10-07T18:43:31.223+08:00"
+  },
+  "quality": { "missing_source_time": false, "post_start": true, "late_ms": 0 },
   "races": [
     {
       "race_no": 1,
       "post_time": "2026-10-07T18:35:00+08:00",
       "snapshot_time": "2026-10-07T18:43:31.223+08:00",
       "pool_status": "STOP_SELL",
+      "source_last_updated_at": "2026-10-07T18:43:31.223+08:00",
       "runners": [
         {
           "horse_no": 1,
@@ -494,131 +809,16 @@ curl -s -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/v1/admin/subscribers/
 }
 ```
 
-#### `schedule`
+#### `horse_update` / `runs_update` / `injury_update` / `backfill_progress` / `whitelist_alert`
 
-```json
-{
-  "schema": "hkjc-push/1.0",
-  "event": "schedule",
-  "sent_at": "2026-10-08T10:00:00+08:00",
-  "meeting_date": null,
-  "venue": null,
-  "races": [],
-  "meta": {
-    "active": [
-      { "date": "2026-10-07", "venue": "HV", "status": "CLOSED", "races": [] }
-    ]
-  }
-}
-```
-
-#### `odds_update` / `lock` / `scratch` / `result`
-
-与规格相同：`races[]` 内含 `race_no`、`post_time`、`snapshot_time`、`pool_status`、`runners[]`（`horse_no`、`horse_name`、`win_odds`、`place_odds`、`status`、`final_position`）。
-
-- `lock`：池状态变为 `STOP_SELL` 时最终快照  
-- `scratch`：检测到退出/划走  
-- `result`：参赛马 `finalPosition` 齐全  
-
-#### `dividends`
-
-```json
-{
-  "schema": "hkjc-push/1.0",
-  "event": "dividends",
-  "sent_at": "2026-10-07T20:00:00+08:00",
-  "meeting_date": "2026-10-07",
-  "venue": "HV",
-  "races": [],
-  "meta": { "content_hash": "…", "pools": 18 }
-}
-```
-
-完整派彩 JSON 已入库，接收方用 API `/v1/results` 拉取。
-
-#### `changes`
-
-```json
-{
-  "schema": "hkjc-push/1.0",
-  "event": "changes",
-  "sent_at": "2026-10-07T18:05:00+08:00",
-  "meeting_date": "2026-10-07",
-  "venue": "HV",
-  "races": [],
-  "meta": { "new_events": 3, "content_hash": "…" }
-}
-```
-
-#### `horse_update` / `runs_update` / `injury_update`
-
-```json
-{
-  "schema": "hkjc-push/1.0",
-  "event": "horse_update",
-  "sent_at": "2026-10-07T12:00:00+08:00",
-  "meeting_date": "2026-10-07",
-  "venue": "HV",
-  "races": [],
-  "meta": { "horse_codes": ["H087", "H123"], "count": 2, "content_hash": "…" }
-}
-```
-
-```json
-{
-  "schema": "hkjc-push/1.0",
-  "event": "runs_update",
-  "meeting_date": "2026-10-07",
-  "venue": "HV",
-  "races": [],
-  "meta": { "horse_codes": ["H087"], "count": 1, "content_hash": "…" }
-}
-```
-
-```json
-{
-  "schema": "hkjc-push/1.0",
-  "event": "injury_update",
-  "meeting_date": "2026-10-07",
-  "venue": "HV",
-  "races": [],
-  "meta": {
-    "source": "https://racing.hkjc.com/en-us/local/information/veterinaryrecord?RaceDate=2026/10/07&Racecourse=HV"
-  }
-}
-```
-
-详情用 `/v1/horses/:code`、`/runs`、`/injuries` 查询。
-
-#### `backfill_progress` / `whitelist_alert`
-
-```json
-{
-  "schema": "hkjc-push/1.0",
-  "event": "backfill_progress",
-  "races": [],
-  "meta": {
-    "processed": [{ "date": "2026-10-04", "venue": "ST", "status": "done" }],
-    "remaining_estimate": 8,
-    "window": { "start": "2026-08-09", "end": "2026-10-07", "backfill_days": 60 }
-  }
-}
-```
-
-```json
-{
-  "schema": "hkjc-push/1.0",
-  "event": "whitelist_alert",
-  "races": [],
-  "meta": { "message": "Internal server error - WHITELIST_ERROR" }
-}
-```
+结构同前（现为 1.1 信封字段）；详情用 `/v1/horses/:code` 等查询。
 
 ### 4.6 失败重试
 
-1. **按订阅者**失败写入 `push_log` + `pending_pushes`（含 `subscriber_id`）。  
-2. 指数退避：**1 分钟 → 5 分钟 → 15 分钟** 各重试一次（只重投失败的那一个订阅者）。  
-3. 仍失败：挂起，**下一次成功推送时 piggy-back 补推**（不丢、不狂刷）。
+1. 事件先写入 `push_events`（不可变 body），再扇出。  
+2. **按订阅者**失败写入 `push_log` + `pending_pushes`（含 `subscriber_id` + `event_id`）。  
+3. 指数退避：**1 → 5 → 15 分钟**；重试从 `push_events` **重发同一 `event_id`/`seq`/body**。  
+4. 仍失败：挂起，下次成功推送时 piggy-back。
 
 ### 4.7 可选 HMAC 校验（接收方伪代码）
 
@@ -630,7 +830,6 @@ function verify(reqBodyBuffer, signatureHex, secret) {
   return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signatureHex));
 }
 
-// Express 示例
 app.post("/hook", express.raw({ type: "application/json" }), (req, res) => {
   const sig = req.get("X-Signature");
   if (process.env.PUSH_SECRET) {
@@ -639,7 +838,7 @@ app.post("/hook", express.raw({ type: "application/json" }), (req, res) => {
     }
   }
   const envelope = JSON.parse(req.body.toString("utf8"));
-  // envelope.schema === "hkjc-push/1.0"
+  // envelope.schema === "hkjc-push/1.1"
   res.status(202).json({ received: true });
 });
 ```
@@ -655,7 +854,9 @@ app.post("/hook", express.raw({ type: "application/json" }), (req, res) => {
 | `results` | 名次、最终赔率、派彩 JSON |
 | `change_events` | 退出/骑师变更等 |
 | `push_subscribers` | Webhook 订阅者（url / secret / enabled）；Admin API 管理 |
-| `push_log` / `pending_pushes` | 推送审计与按订阅者重试队列 |
+| `push_seq` | 每会议单调 `seq` + `last_change_seq`/`last_change_at` |
+| `push_events` | 推送事件账本（每事件一份不可变 JSON） |
+| `push_log` / `pending_pushes` | 推送审计与按订阅者重试队列（含 `event_id`） |
 | `backfill_progress` / `worker_meta` | 回填断点与运行元数据 |
 | `horses` | 马匹档案（HTML） |
 | `horse_past_runs` | 往绩 |

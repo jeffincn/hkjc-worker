@@ -112,7 +112,7 @@ describe("multi-subscriber push", () => {
     const expected = await hmacSha256Hex("shared-hmac", signedCall.body);
     expect(signedCall.sig).toBe(expected);
     // Both receive the same raw JSON body (envelope schema unchanged).
-    expect(JSON.parse(unsigned.body).schema).toBe("hkjc-push/1.0");
+    expect(JSON.parse(unsigned.body).schema).toBe("hkjc-push/1.1");
     expect(unsigned.body).toBe(signedCall.body);
   });
 

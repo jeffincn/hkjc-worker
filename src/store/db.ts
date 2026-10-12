@@ -203,6 +203,31 @@ export interface SnapshotInsertResult {
   inserted: boolean;
   content_hash: string;
   snapshot_time: string;
+  /** Prior snapshot before this insert (null on first observation). */
+  previous: RaceOddsSnapshot | null;
+}
+
+/** Latest stored odds snapshot for a race, or null. */
+export async function getLatestOddsSnapshot(
+  db: D1Database,
+  meetingDate: string,
+  venue: string,
+  raceNo: number,
+): Promise<RaceOddsSnapshot | null> {
+  const row = await db
+    .prepare(
+      `SELECT raw_json FROM odds_snapshots
+       WHERE meeting_date=? AND venue=? AND race_no=?
+       ORDER BY snapshot_time DESC, id DESC LIMIT 1`,
+    )
+    .bind(meetingDate, venue, raceNo)
+    .first<{ raw_json: string }>();
+  if (!row) return null;
+  try {
+    return JSON.parse(row.raw_json) as RaceOddsSnapshot;
+  } catch {
+    return null;
+  }
 }
 
 export async function insertOddsSnapshotIfChanged(
@@ -217,17 +242,31 @@ export async function insertOddsSnapshotIfChanged(
   // (meeting_date, venue, race_no, snapshot_time) serves filter+order as an
   // index seek: touches 1 row instead of scanning every snapshot of the race.
   // This runs on every poll tick (30s) x every race on race days.
-  const existing = await db
+  const existingRow = await db
     .prepare(
-      `SELECT content_hash FROM odds_snapshots
+      `SELECT content_hash, raw_json FROM odds_snapshots
        WHERE meeting_date=? AND venue=? AND race_no=?
        ORDER BY snapshot_time DESC, id DESC LIMIT 1`,
     )
     .bind(meetingDate, venue, snapshot.race_no)
-    .first<{ content_hash: string }>();
+    .first<{ content_hash: string; raw_json: string }>();
 
-  if (existing?.content_hash === hash) {
-    return { inserted: false, content_hash: hash, snapshot_time: snapshot.snapshot_time };
+  let previous: RaceOddsSnapshot | null = null;
+  if (existingRow?.raw_json) {
+    try {
+      previous = JSON.parse(existingRow.raw_json) as RaceOddsSnapshot;
+    } catch {
+      previous = null;
+    }
+  }
+
+  if (existingRow?.content_hash === hash) {
+    return {
+      inserted: false,
+      content_hash: hash,
+      snapshot_time: snapshot.snapshot_time,
+      previous,
+    };
   }
 
   await db
@@ -248,7 +287,57 @@ export async function insertOddsSnapshotIfChanged(
     )
     .run();
 
-  return { inserted: true, content_hash: hash, snapshot_time: snapshot.snapshot_time };
+  return {
+    inserted: true,
+    content_hash: hash,
+    snapshot_time: snapshot.snapshot_time,
+    previous,
+  };
+}
+
+/**
+ * True if this race previously had an open/selling pool or non-empty odds.
+ * Used to distinguish genuine STOP_SELL (lock) from pre-sale STOP_SELL shells.
+ */
+export async function raceHadOpenOddsSnapshot(
+  db: D1Database,
+  meetingDate: string,
+  venue: string,
+  raceNo: number,
+): Promise<boolean> {
+  const rows = await db
+    .prepare(
+      `SELECT pool_status, raw_json FROM odds_snapshots
+       WHERE meeting_date=? AND venue=? AND race_no=?
+       ORDER BY snapshot_time DESC, id DESC
+       LIMIT 20`,
+    )
+    .bind(meetingDate, venue, raceNo)
+    .all<{ pool_status: string | null; raw_json: string }>();
+
+  for (const row of rows.results ?? []) {
+    const status = (row.pool_status ?? "").toUpperCase();
+    if (status === "START_SELL" || status === "SELLING" || status === "SELL_STARTED") {
+      return true;
+    }
+    try {
+      const parsed = JSON.parse(row.raw_json) as {
+        payload?: { win?: Record<string, unknown>; pla?: Record<string, unknown> };
+        runners?: Array<{ win_odds?: number | null; place_odds?: number | null }>;
+      };
+      const win = parsed.payload?.win ?? {};
+      const pla = parsed.payload?.pla ?? {};
+      if (Object.keys(win).length > 0 || Object.keys(pla).length > 0) return true;
+      if (
+        (parsed.runners ?? []).some((r) => r.win_odds != null || r.place_odds != null)
+      ) {
+        return true;
+      }
+    } catch {
+      // ignore malformed rows
+    }
+  }
+  return false;
 }
 
 export async function persistMeetingTree(
@@ -327,6 +416,10 @@ export async function storeDividendsAsResults(
   pools: PmPoolRaw[],
   dataSource: string,
 ): Promise<void> {
+  // Skip status-only / empty dividend shells (pre-race DEFINED pools).
+  const hasDiv = pools.some((p) => Array.isArray(p.dividends) && p.dividends.length > 0);
+  if (!hasDiv) return;
+
   const json = JSON.stringify(pools);
   // Ensure at least a placeholder result row keyed by horse from WIN dividends if no runners
   const winPool = pools.find((p) => p.oddsType === "WIN");

@@ -74,6 +74,8 @@ export interface PmPoolRaw {
   sellStatus?: string;
   oddsType?: string;
   lastUpdateTime?: string | null;
+  /** Pool total turnover (HKD). Present on raceMeetings poolInvs; not on odds query. */
+  investment?: number | string | null;
   leg?: { number?: number; races?: number[] };
   oddsNodes?: OddsNode[];
   dividends?: Array<{

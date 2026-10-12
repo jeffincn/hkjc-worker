@@ -12,8 +12,11 @@ export async function storeRawDocument(
   docKey: string,
   raw: unknown,
   sourceUrl: string | null,
+  opts?: { hashOf?: unknown },
 ): Promise<StoreResult> {
-  const hash = await contentHash(raw);
+  // Optional hashOf: hash only the meaningful slice (e.g. dividends arrays)
+  // while still persisting the full raw payload for debugging.
+  const hash = await contentHash(opts?.hashOf !== undefined ? opts.hashOf : raw);
   const last = await db
     .prepare(
       `SELECT content_hash FROM raw_documents WHERE doc_type=? AND doc_key=? ORDER BY id DESC LIMIT 1`,

@@ -59,6 +59,13 @@ function nodesToMap(nodes: OddsNode[] | undefined): Record<string, number | null
   return out;
 }
 
+/** Treat null/undefined/blank as missing (HKJC pre-sale pools use ""). */
+function nonEmptyTime(s: string | null | undefined): string | null {
+  if (s == null) return null;
+  const t = String(s).trim();
+  return t === "" ? null : t;
+}
+
 export function buildRaceOddsSnapshot(args: {
   race: RaceRaw;
   winPool?: PmPoolRaw;
@@ -66,11 +73,10 @@ export function buildRaceOddsSnapshot(args: {
   snapshotTime?: string;
 }): RaceOddsSnapshot {
   const { race, winPool, plaPool } = args;
+  const lastUpdate =
+    nonEmptyTime(winPool?.lastUpdateTime) ?? nonEmptyTime(plaPool?.lastUpdateTime);
   const snapshot_time =
-    args.snapshotTime ??
-    winPool?.lastUpdateTime ??
-    plaPool?.lastUpdateTime ??
-    new Date().toISOString();
+    nonEmptyTime(args.snapshotTime) ?? lastUpdate ?? new Date().toISOString();
 
   const pool_status = winPool?.sellStatus ?? plaPool?.sellStatus ?? null;
   const winMap = nodesToMap(winPool?.oddsNodes);
@@ -131,7 +137,7 @@ export function buildRaceOddsSnapshot(args: {
       pool_status,
       win: winMap,
       pla: plaMap,
-      last_update: winPool?.lastUpdateTime ?? plaPool?.lastUpdateTime ?? null,
+      last_update: lastUpdate,
     },
   };
 }
