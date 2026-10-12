@@ -84,13 +84,13 @@ export TOKEN='your-api-token'
 
 ### 3.1 `GET /health`（无需鉴权）
 
-存活、回填范围、缺口、白名单告警、最后拉取/推送。
+存活、回填范围、缺口、白名单告警、最后拉取/推送，以及推送隔离健康度（熔断、队列积压、poller 心跳、各 stage 最近错误）。
 
 ```bash
 curl -s "$BASE/health" | jq .
 ```
 
-示例响应：
+示例响应（字段摘要）：
 
 ```json
 {
@@ -98,23 +98,55 @@ curl -s "$BASE/health" | jq .
   "service": "hkjc-data-worker",
   "timezone": "Asia/Hong_Kong",
   "live_push_enabled": "false",
-  "backfill_days": "60",
-  "backfill_source": "graphql",
   "last_fetch_at": "2026-10-08T12:00:00.000Z",
-  "last_push_at": null,
-  "meetings_stored": 1,
-  "odds_snapshots": 9,
-  "backfill": { "completed_meetings": 0, "from": null, "to": null },
-  "gaps": {
-    "note": "GraphQL raceMeetings ignores past dates (live only). Backfill uses rbcMeeting (~2 months): has race/runner status + dividends; horse names, finalPosition, win/place odds are null.",
-    "place_odds_in_backfill": null,
-    "final_position_in_backfill": null,
-    "horse_names_in_backfill": null,
-    "history_beyond_rbc_window": "unavailable via GraphQL"
+  "last_push_at": "2026-10-08T12:01:00+08:00",
+  "last_push_status": "202",
+  "last_push": { "event_type": "lock", "http_status": 202, "success": 1, "sent_at": "…" },
+  "push_queue": {
+    "bound": true,
+    "backlog": 0,
+    "pending_pushes": 2,
+    "pending_due": 1,
+    "pending_deferred": 1,
+    "gave_up": 0
   },
+  "subscribers": [
+    {
+      "subscriber_id": 1,
+      "url": "https://…",
+      "circuit_state": "closed",
+      "consecutive_failures": 0,
+      "consecutive_429s": 0,
+      "last_success_at": "…",
+      "last_failure_at": null,
+      "last_http_status": 202,
+      "last_error": null
+    }
+  ],
+  "poller": {
+    "last_fetch_at": "…",
+    "age_ms": 12000,
+    "watchdog_last_run": "…",
+    "watchdog_last_rearm": null
+  },
+  "stage_errors": {
+    "schedule": null,
+    "odds": null,
+    "dividends": null,
+    "horses": null,
+    "runs": null,
+    "injuries": null,
+    "pushes": null
+  },
+  "backfill": { "completed_meetings": 0, "from": null, "to": null },
   "alerts": { "whitelist_error": "" }
 }
 ```
+
+- `last_push_at` / `last_push_status` 取自 **最新一条任意类型** 的 `push_log`（不再只看 odds_update）。
+- `push_queue.gave_up` / `pending_due` / `pending_deferred`：故意放弃的 pre-1.1 行数、到期待重试、延后/ piggyback 等待数（触顶 `PUSH_RETRY_MAX_PER_RUN` 时是 defer 不是 drop）。
+- 熔断打开时不会自动删除订阅者；事件仍在 `push_events`，可用 `/v1/events` 回放。
+- `gave_up` **仅**适用于 pre-1.1 legacy（空 `event_id` + `created_at` 早于 `PUSH_1_1_DEPLOY_CUTOFF` + 非 1.1 schema）；赛日 live 推送永不会被放弃。
 
 若 HKJC 更换白名单 query，`alerts.whitelist_error` 会出现 `WHITELIST_ERROR` 文案。
 
@@ -813,12 +845,14 @@ curl -s -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/v1/admin/subscribers/
 
 结构同前（现为 1.1 信封字段）；详情用 `/v1/horses/:code` 等查询。
 
-### 4.6 失败重试
+### 4.6 失败重试与投递隔离
 
-1. 事件先写入 `push_events`（不可变 body），再扇出。  
-2. **按订阅者**失败写入 `push_log` + `pending_pushes`（含 `subscriber_id` + `event_id`）。  
-3. 指数退避：**1 → 5 → 15 分钟**；重试从 `push_events` **重发同一 `event_id`/`seq`/body**。  
-4. 仍失败：挂起，下次成功推送时 piggy-back。
+1. 事件先写入 `push_events`（不可变 body），再按订阅者扇出。  
+2. **生产路径**：每个 `(event_id, subscriber_id)` 投递进入 Cloudflare Queue（`PUSH_QUEUE` → `hkjc-push-deliveries`），由 **独立 invocation** 消费，自带 subrequest 预算；队列重试退避 1m/5m/15m/30m/60m，body 始终从 `push_events` 重载。  
+3. **无队列绑定**（本地 / 测试）：回退为进程内直推（行为与旧版一致）。  
+4. 直推或队列耗尽后仍失败：写入 `pending_pushes`（含 `subscriber_id` + `event_id`）；legacy 退避 **1 → 5 → 15 分钟**，并可 piggy-back。  
+5. **熔断**：连续失败 ≥ `CIRCUIT_BREAKER_THRESHOLD`（默认 10）或连续 429 ≥ `CIRCUIT_BREAKER_429_THRESHOLD`（默认 3）→ `open`（停发 HTTP，账本保留供 `/v1/events` 回放）；5 分钟后 `half_open` 探测，成功则 `closed`。**从不自动删除订阅者**。  
+6. Ingest / DO poll 各 stage（schedule、odds、dividends、horses、runs、injuries、pushes…）错误隔离；DO alarm 在 `finally` 中 **必定** 重排；小时 cron 兼 watchdog，发现 stale poller 则 `/start` 重武装。
 
 ### 4.7 可选 HMAC 校验（接收方伪代码）
 
@@ -892,6 +926,12 @@ app.post("/hook", express.raw({ type: "application/json" }), (req, res) => {
 | `TIMEZONE` | var | `Asia/Hong_Kong` | |
 | `LIVE_PUSH_ENABLED` | var/secret | `false` | 实时/马匹/派彩等推送门闩 |
 | `HORSE_REFRESH_BATCH` | var | `15` | 每次最多抓取的马匹 HTML 页数（可续跑） |
+| `SUBREQUEST_BUDGET` | var | `45` | 单次 invocation 软 subrequest 上限；赔率/lock/result 优先，马匹页可 defer |
+| `CIRCUIT_BREAKER_THRESHOLD` | var | `10` | 连续失败打开熔断 |
+| `CIRCUIT_BREAKER_429_THRESHOLD` | var | `3` | 连续 429 打开熔断 |
+| `CIRCUIT_HALF_OPEN_MS` | var | `300000` | open → half_open 探测间隔 |
+| `PUSH_QUEUE_MAX_ATTEMPTS` | var | `5` | 队列投递最大尝试次数（之后进 `pending_pushes`） |
+| `POLLER_STALE_MS` | var | `600000` | cron watchdog 判定 MeetingPoller 过期并重武装 |
 
 `wrangler.toml` 已配置自定义域名：
 
@@ -932,6 +972,13 @@ npm test
 npx wrangler d1 create hkjc
 # 把 database_id 写入 wrangler.toml
 npx wrangler d1 migrations apply hkjc --remote
+
+# 推送投递队列（每个 event×subscriber 独立 invocation）
+npx wrangler queues create hkjc-push-deliveries
+# 仓库模板 wrangler.toml 已含：
+#   [[queues.producers]] binding = "PUSH_QUEUE"  queue = "hkjc-push-deliveries"
+#   [[queues.consumers]] queue = "hkjc-push-deliveries"  max_batch_size = 1
+# 生产 wrangler.toml 由部署方单独维护，请把上述 binding / queue 名同步进去。
 
 npx wrangler secret put API_TOKEN
 # 可选：agent 订阅者 HMAC（迁移 seed URL 后运行时写入该行）

@@ -1,9 +1,20 @@
 import type { Env } from "../env";
 import { envBool, envNum } from "../env";
-import { contentHash } from "../parse/hash";
 import type { PushEnvelope, PushEvent } from "./envelope";
-import { formatHkNow, isLivePushEvent } from "./envelope";
+import { isLivePushEvent } from "./envelope";
 import { getPushEventById } from "./ledger";
+import {
+  attemptDelivery,
+  type ResolvedTarget,
+  type SubscriberDelivery,
+} from "./delivery";
+import { enqueueDeliveries, hasPushQueue } from "./queue";
+import {
+  PUSH_1_1_DEPLOY_CUTOFF,
+  ensureEventId,
+  requireEventId,
+} from "./event-id";
+import { enqueueRetry, GAVE_UP, nextBackoffMinutes } from "./pending";
 import {
   countSubscribers,
   getSubscriber,
@@ -11,10 +22,15 @@ import {
   type PushSubscriber,
 } from "./subscribers";
 
-const BACKOFF_MINUTES = [1, 5, 15];
-const USER_AGENT = "hkjc-data-worker/1.0";
-/** last_error marker for permanently abandoned rows (row kept, never deleted). */
-export const GAVE_UP = "gave_up";
+export { hmacSha256Hex, type SubscriberDelivery } from "./delivery";
+export { enqueueRetry, GAVE_UP, nextBackoffMinutes } from "./pending";
+export {
+  PUSH_1_1_DEPLOY_CUTOFF,
+  ensureEventId,
+  requireEventId,
+  isLegacyGiveUpCandidate,
+} from "./event-id";
+
 const LEGACY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_RETRY_MAX_PER_RUN = 5;
 /** Scan window larger than the send cap so 429 skips can still fill the budget. */
@@ -44,19 +60,68 @@ function isGaveUp(lastError: string | null | undefined): boolean {
   return lastError === GAVE_UP;
 }
 
-/** Mark pre-1.1 rows (no event_id) older than 24h as gave_up without sending or deleting. */
+/**
+ * Mark ONLY pre-1.1 legacy rows as gave_up (row kept, never deleted).
+ *
+ * A row must match ALL of:
+ * - empty/null event_id
+ * - created_at older than 24h
+ * - created_at before PUSH_1_1_DEPLOY_CUTOFF (post-deploy rows never abandoned)
+ * - payload_json is not schema hkjc-push/1.1
+ *
+ * Live race-day (post-1.1) pushes can never match — they always carry event_id
+ * (see ensureEventId / requireEventId) and/or were created after the cutoff.
+ */
 export async function giveUpStaleLegacyPending(env: Env): Promise<number> {
-  const cutoff = new Date(Date.now() - LEGACY_MAX_AGE_MS).toISOString();
+  const ageCutoff = new Date(Date.now() - LEGACY_MAX_AGE_MS).toISOString();
   const result = await env.DB.prepare(
     `UPDATE pending_pushes
      SET last_error = ?, next_retry_at = NULL
      WHERE (event_id IS NULL OR event_id = '')
        AND created_at < ?
-       AND IFNULL(last_error, '') != ?`,
+       AND created_at < ?
+       AND IFNULL(last_error, '') != ?
+       AND IFNULL(payload_json, '') NOT LIKE '%"schema":"hkjc-push/1.1"%'
+       AND IFNULL(payload_json, '') NOT LIKE '%"schema": "hkjc-push/1.1"%'`,
   )
-    .bind(GAVE_UP, cutoff, GAVE_UP)
+    .bind(GAVE_UP, ageCutoff, PUSH_1_1_DEPLOY_CUTOFF, GAVE_UP)
     .run();
   return result.meta?.changes ?? 0;
+}
+
+/** Cheap pending_pushes counters for /health. */
+export async function countPendingPushStats(env: Env): Promise<{
+  due: number;
+  deferred: number;
+  gave_up: number;
+  active: number;
+}> {
+  const now = new Date().toISOString();
+  const due = await env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM pending_pushes
+     WHERE next_retry_at IS NOT NULL AND next_retry_at <= ?
+       AND IFNULL(last_error, '') != ?`,
+  )
+    .bind(now, GAVE_UP)
+    .first<{ n: number }>();
+  const deferred = await env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM pending_pushes
+     WHERE (next_retry_at IS NULL OR next_retry_at > ?)
+       AND IFNULL(last_error, '') != ?`,
+  )
+    .bind(now, GAVE_UP)
+    .first<{ n: number }>();
+  const gave_up = await env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM pending_pushes WHERE last_error = ?`,
+  )
+    .bind(GAVE_UP)
+    .first<{ n: number }>();
+  return {
+    due: due?.n ?? 0,
+    deferred: deferred?.n ?? 0,
+    gave_up: gave_up?.n ?? 0,
+    active: (due?.n ?? 0) + (deferred?.n ?? 0),
+  };
 }
 
 export interface PushResult {
@@ -68,33 +133,8 @@ export interface PushResult {
   retry_count: number;
   /** Per-subscriber delivery outcomes when fan-out ran. */
   deliveries?: SubscriberDelivery[];
-}
-
-export interface SubscriberDelivery {
-  subscriber_id: number | null;
-  url: string;
-  http_status: number | null;
-  success: boolean;
-  error_message?: string;
-  signed: boolean;
-}
-
-interface ResolvedTarget {
-  subscriber_id: number | null;
-  url: string;
-  secret: string | null;
-}
-
-export async function hmacSha256Hex(secret: string, body: string): Promise<string> {
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(body));
-  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  /** True when deliveries were enqueued to PUSH_QUEUE. */
+  queued?: boolean;
 }
 
 /**
@@ -123,10 +163,15 @@ export async function resolvePushTargets(env: Env): Promise<ResolvedTarget[]> {
   ];
 }
 
+/**
+ * Fan-out an already-ledgered envelope.
+ * Prefer Cloudflare Queue (one invocation per delivery); fall back to direct
+ * HTTP when PUSH_QUEUE is unbound (tests / local).
+ */
 export async function sendPush(
   env: Env,
   envelope: PushEnvelope,
-  opts?: { fetchImpl?: typeof fetch; force?: boolean },
+  opts?: { fetchImpl?: typeof fetch; force?: boolean; forceDirect?: boolean },
 ): Promise<PushResult> {
   const liveEnabled = envBool(env, "LIVE_PUSH_ENABLED", false);
   if (!opts?.force && isLivePushEvent(envelope.event) && !liveEnabled) {
@@ -141,12 +186,6 @@ export async function sendPush(
 
   const targets = await resolvePushTargets(env);
   if (targets.length === 0) {
-    await logPush(env, envelope, {
-      http_status: null,
-      success: false,
-      retry_count: 0,
-      error_message: "no push subscribers and PUSH_TARGET_URL not set",
-    });
     return {
       skipped: true,
       reason: "no push subscribers and PUSH_TARGET_URL not set",
@@ -156,19 +195,22 @@ export async function sendPush(
     };
   }
 
-  const body = JSON.stringify(envelope);
-  const fetchImpl = opts?.fetchImpl ?? fetch;
+  // Post-1.1: never fan-out / enqueue without a non-empty event_id.
+  requireEventId(ensureEventId(envelope));
 
-  // Deliver independently — one failure must not block or drop the others.
-  const deliveries = await Promise.all(
-    targets.map((target) =>
-      deliverToTarget(env, envelope, body, target, fetchImpl, { enqueueOnFailure: true }),
-    ),
-  );
+  // Custom fetchImpl (unit tests) always uses the direct path so injected
+  // fetch is exercised; production consumers omit fetchImpl and use the queue.
+  const useQueue =
+    !opts?.forceDirect && !opts?.fetchImpl && hasPushQueue(env);
+  const deliveries = await enqueueDeliveries(env, envelope, targets, {
+    fetchImpl: opts?.fetchImpl,
+    forceDirect: !useQueue,
+  });
 
+  const httpDeliveries = deliveries.filter((d) => !d.queued && !d.skipped_circuit);
   const anySuccess = deliveries.some((d) => d.success);
-  const firstSuccess = deliveries.find((d) => d.success);
-  const firstFailure = deliveries.find((d) => !d.success);
+  const firstSuccess = httpDeliveries.find((d) => d.success) ?? deliveries.find((d) => d.success);
+  const firstFailure = deliveries.find((d) => !d.success && !d.skipped_circuit);
 
   return {
     skipped: false,
@@ -179,6 +221,7 @@ export async function sendPush(
       : firstFailure?.error_message ?? "all subscribers failed",
     retry_count: 0,
     deliveries,
+    queued: useQueue,
   };
 }
 
@@ -221,173 +264,17 @@ export async function sendPushToSubscriber(
     };
   }
 
-  const body = JSON.stringify(envelope);
-  // Caller (flush/piggyback) owns retry enqueue so backoff counts stay correct.
-  const delivery = await deliverToTarget(
-    env,
-    envelope,
-    body,
-    target,
-    opts?.fetchImpl ?? fetch,
-    { enqueueOnFailure: false },
-  );
+  const delivery = await attemptDelivery(env, envelope, target, opts?.fetchImpl ?? fetch);
 
   return {
-    skipped: false,
+    skipped: !!delivery.skipped_circuit,
+    reason: delivery.skipped_circuit ? delivery.error_message : undefined,
     http_status: delivery.http_status,
     success: delivery.success,
     error_message: delivery.error_message,
     retry_count: 0,
     deliveries: [delivery],
   };
-}
-
-async function deliverToTarget(
-  env: Env,
-  envelope: PushEnvelope,
-  body: string,
-  target: ResolvedTarget,
-  fetchImpl: typeof fetch,
-  opts: { enqueueOnFailure: boolean },
-): Promise<SubscriberDelivery> {
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    "User-Agent": USER_AGENT,
-  };
-  const signed = !!(target.secret && target.secret.length > 0);
-  if (signed && target.secret) {
-    headers["X-Signature"] = await hmacSha256Hex(target.secret, body);
-  }
-
-  try {
-    const res = await fetchImpl(target.url, { method: "POST", headers, body });
-    const success = res.status === 202 || res.ok;
-    const error_message = success ? undefined : `HTTP ${res.status}`;
-    await logPush(env, envelope, {
-      http_status: res.status,
-      success,
-      retry_count: 0,
-      error_message,
-      target: target.url,
-    });
-    if (!success && opts.enqueueOnFailure) {
-      await enqueueRetry(
-        env,
-        envelope,
-        0,
-        error_message ?? `HTTP ${res.status}`,
-        target.subscriber_id,
-      );
-    }
-    return {
-      subscriber_id: target.subscriber_id,
-      url: target.url,
-      http_status: res.status,
-      success,
-      error_message,
-      signed,
-    };
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    await logPush(env, envelope, {
-      http_status: null,
-      success: false,
-      retry_count: 0,
-      error_message: msg,
-      target: target.url,
-    });
-    if (opts.enqueueOnFailure) {
-      await enqueueRetry(env, envelope, 0, msg, target.subscriber_id);
-    }
-    return {
-      subscriber_id: target.subscriber_id,
-      url: target.url,
-      http_status: null,
-      success: false,
-      error_message: msg,
-      signed,
-    };
-  }
-}
-
-async function logPush(
-  env: Env,
-  envelope: PushEnvelope,
-  info: {
-    http_status: number | null;
-    success: boolean;
-    retry_count: number;
-    error_message?: string;
-    target?: string;
-  },
-): Promise<void> {
-  const hash = await contentHash(envelope);
-  await env.DB.prepare(
-    `INSERT INTO push_log (event_type, target_url, http_status, retry_count, success, payload_hash, error_message, sent_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  )
-    .bind(
-      envelope.event,
-      info.target ?? null,
-      info.http_status ?? null,
-      info.retry_count ?? 0,
-      info.success ? 1 : 0,
-      hash,
-      info.error_message ?? null,
-      // Actual attempt time (not the envelope's original sent_at, which is
-      // stale for retries/piggybacks and made /health show old rows).
-      formatHkNow(),
-    )
-    .run();
-}
-
-export async function enqueueRetry(
-  env: Env,
-  envelope: PushEnvelope,
-  retryCount: number,
-  lastError: string,
-  subscriberId: number | null = null,
-): Promise<void> {
-  // Store event_id so retries reload the immutable body from push_events.
-  // Keep payload_json as fallback for rows created before ledger existed.
-  if (retryCount >= BACKOFF_MINUTES.length) {
-    await env.DB.prepare(
-      `INSERT INTO pending_pushes (event_type, payload_json, retry_count, next_retry_at, created_at, last_error, subscriber_id, event_id)
-       VALUES (?, ?, ?, NULL, ?, ?, ?, ?)`,
-    )
-      .bind(
-        envelope.event,
-        JSON.stringify(envelope),
-        retryCount,
-        envelope.sent_at ?? new Date().toISOString(),
-        lastError ?? null,
-        subscriberId ?? null,
-        envelope.event_id ?? null,
-      )
-      .run();
-    return;
-  }
-  const delayMin = BACKOFF_MINUTES[retryCount];
-  const next = new Date(Date.now() + delayMin * 60_000).toISOString();
-  await env.DB.prepare(
-    `INSERT INTO pending_pushes (event_type, payload_json, retry_count, next_retry_at, created_at, last_error, subscriber_id, event_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  )
-    .bind(
-      envelope.event,
-      JSON.stringify(envelope),
-      retryCount,
-      next,
-      envelope.sent_at ?? new Date().toISOString(),
-      lastError ?? null,
-      subscriberId ?? null,
-      envelope.event_id ?? null,
-    )
-    .run();
-}
-
-export function nextBackoffMinutes(retryCount: number): number | null {
-  return BACKOFF_MINUTES[retryCount] ?? null;
 }
 
 /** Reload immutable envelope from push_events when event_id is present. */
@@ -527,7 +414,7 @@ export async function piggybackPending(
           new Date().toISOString(),
           result.error_message ?? "piggyback failed",
           row.subscriber_id ?? null,
-          envelope.event_id ?? null,
+          ensureEventId(envelope).event_id || null,
         )
         .run();
     }

@@ -124,7 +124,15 @@ CREATE TABLE IF NOT EXISTS push_subscribers (
   secret TEXT,
   enabled INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  consecutive_failures INTEGER NOT NULL DEFAULT 0,
+  consecutive_429s INTEGER NOT NULL DEFAULT 0,
+  circuit_state TEXT NOT NULL DEFAULT 'closed',
+  circuit_opened_at TEXT,
+  last_success_at TEXT,
+  last_failure_at TEXT,
+  last_http_status INTEGER,
+  last_error TEXT
 );
 CREATE TABLE IF NOT EXISTS horses (
   horse_code TEXT PRIMARY KEY,

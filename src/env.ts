@@ -1,6 +1,8 @@
 export interface Env {
   DB: D1Database;
   MEETING_DO: DurableObjectNamespace;
+  /** Optional: Cloudflare Queue for per-subscriber push delivery. */
+  PUSH_QUEUE?: Queue;
   PUSH_TARGET_URL?: string;
   API_TOKEN?: string;
   PUSH_SECRET?: string;
@@ -13,6 +15,18 @@ export interface Env {
   HORSE_REFRESH_BATCH?: string;
   /** Max pending_pushes HTTP sends per ingest/cron invocation (default 5). */
   PUSH_RETRY_MAX_PER_RUN?: string;
+  /** Soft per-invocation subrequest budget (default 45). */
+  SUBREQUEST_BUDGET?: string;
+  /** Consecutive failures before circuit opens (default 10). */
+  CIRCUIT_BREAKER_THRESHOLD?: string;
+  /** Consecutive HTTP 429s before circuit opens (default 3). */
+  CIRCUIT_BREAKER_429_THRESHOLD?: string;
+  /** Ms after open before half-open probe (default 300000). */
+  CIRCUIT_HALF_OPEN_MS?: string;
+  /** Max queue delivery attempts before pending_pushes (default 5). */
+  PUSH_QUEUE_MAX_ATTEMPTS?: string;
+  /** Re-arm MeetingPoller when last tick older than this many ms (default 600000). */
+  POLLER_STALE_MS?: string;
 }
 
 export function envNum(env: Env, key: keyof Env, fallback: number): number {

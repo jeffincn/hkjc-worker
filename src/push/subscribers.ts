@@ -14,6 +14,14 @@ export interface PushSubscriber {
   enabled: boolean;
   created_at: string;
   updated_at: string;
+  consecutive_failures?: number;
+  consecutive_429s?: number;
+  circuit_state?: string;
+  circuit_opened_at?: string | null;
+  last_success_at?: string | null;
+  last_failure_at?: string | null;
+  last_http_status?: number | null;
+  last_error?: string | null;
 }
 
 /** Public list shape — never expose the secret value. */
@@ -24,6 +32,14 @@ export interface PushSubscriberPublic {
   has_secret: boolean;
   created_at: string;
   updated_at: string;
+  circuit_state: string;
+  consecutive_failures: number;
+  consecutive_429s: number;
+  circuit_opened_at: string | null;
+  last_success_at: string | null;
+  last_failure_at: string | null;
+  last_http_status: number | null;
+  last_error: string | null;
 }
 
 export function toPublicSubscriber(row: PushSubscriber): PushSubscriberPublic {
@@ -34,6 +50,14 @@ export function toPublicSubscriber(row: PushSubscriber): PushSubscriberPublic {
     has_secret: !!(row.secret && row.secret.length > 0),
     created_at: row.created_at,
     updated_at: row.updated_at,
+    circuit_state: row.circuit_state ?? "closed",
+    consecutive_failures: row.consecutive_failures ?? 0,
+    consecutive_429s: row.consecutive_429s ?? 0,
+    circuit_opened_at: row.circuit_opened_at ?? null,
+    last_success_at: row.last_success_at ?? null,
+    last_failure_at: row.last_failure_at ?? null,
+    last_http_status: row.last_http_status ?? null,
+    last_error: row.last_error ?? null,
   };
 }
 
@@ -57,11 +81,51 @@ export async function syncAgentSecretFromEnv(env: Env): Promise<void> {
     .run();
 }
 
+function mapSubscriberRow(r: {
+  id: number;
+  url: string;
+  secret: string | null;
+  enabled: number;
+  created_at: string;
+  updated_at: string;
+  consecutive_failures?: number | null;
+  consecutive_429s?: number | null;
+  circuit_state?: string | null;
+  circuit_opened_at?: string | null;
+  last_success_at?: string | null;
+  last_failure_at?: string | null;
+  last_http_status?: number | null;
+  last_error?: string | null;
+}): PushSubscriber {
+  return {
+    id: r.id,
+    url: r.url,
+    secret: r.secret,
+    enabled: r.enabled === 1,
+    created_at: r.created_at,
+    updated_at: r.updated_at,
+    consecutive_failures: r.consecutive_failures ?? 0,
+    consecutive_429s: r.consecutive_429s ?? 0,
+    circuit_state: r.circuit_state ?? "closed",
+    circuit_opened_at: r.circuit_opened_at ?? null,
+    last_success_at: r.last_success_at ?? null,
+    last_failure_at: r.last_failure_at ?? null,
+    last_http_status: r.last_http_status ?? null,
+    last_error: r.last_error ?? null,
+  };
+}
+
+const SUBSCRIBER_SELECT = `SELECT id, url, secret, enabled, created_at, updated_at,
+       IFNULL(consecutive_failures, 0) AS consecutive_failures,
+       IFNULL(consecutive_429s, 0) AS consecutive_429s,
+       IFNULL(circuit_state, 'closed') AS circuit_state,
+       circuit_opened_at, last_success_at, last_failure_at, last_http_status, last_error
+     FROM push_subscribers`;
+
 export async function listSubscribers(env: Env): Promise<PushSubscriber[]> {
   await syncAgentSecretFromEnv(env);
   const { results } = await env.DB.prepare(
-    `SELECT id, url, secret, enabled, created_at, updated_at
-     FROM push_subscribers ORDER BY id ASC`,
+    `${SUBSCRIBER_SELECT} ORDER BY id ASC`,
   ).all<{
     id: number;
     url: string;
@@ -69,16 +133,17 @@ export async function listSubscribers(env: Env): Promise<PushSubscriber[]> {
     enabled: number;
     created_at: string;
     updated_at: string;
+    consecutive_failures: number;
+    consecutive_429s: number;
+    circuit_state: string;
+    circuit_opened_at: string | null;
+    last_success_at: string | null;
+    last_failure_at: string | null;
+    last_http_status: number | null;
+    last_error: string | null;
   }>();
 
-  return (results ?? []).map((r) => ({
-    id: r.id,
-    url: r.url,
-    secret: r.secret,
-    enabled: r.enabled === 1,
-    created_at: r.created_at,
-    updated_at: r.updated_at,
-  }));
+  return (results ?? []).map(mapSubscriberRow);
 }
 
 export async function listEnabledSubscribers(env: Env): Promise<PushSubscriber[]> {
@@ -98,10 +163,7 @@ export async function getSubscriber(
   id: number,
 ): Promise<PushSubscriber | null> {
   await syncAgentSecretFromEnv(env);
-  const r = await env.DB.prepare(
-    `SELECT id, url, secret, enabled, created_at, updated_at
-     FROM push_subscribers WHERE id = ?`,
-  )
+  const r = await env.DB.prepare(`${SUBSCRIBER_SELECT} WHERE id = ?`)
     .bind(id)
     .first<{
       id: number;
@@ -110,16 +172,17 @@ export async function getSubscriber(
       enabled: number;
       created_at: string;
       updated_at: string;
+      consecutive_failures: number;
+      consecutive_429s: number;
+      circuit_state: string;
+      circuit_opened_at: string | null;
+      last_success_at: string | null;
+      last_failure_at: string | null;
+      last_http_status: number | null;
+      last_error: string | null;
     }>();
   if (!r) return null;
-  return {
-    id: r.id,
-    url: r.url,
-    secret: r.secret,
-    enabled: r.enabled === 1,
-    created_at: r.created_at,
-    updated_at: r.updated_at,
-  };
+  return mapSubscriberRow(r);
 }
 
 export async function createSubscriber(
