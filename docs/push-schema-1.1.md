@@ -30,6 +30,7 @@ Pool turnover (when available) is exposed only on `pools[].investment` as the **
 | `quality.late_ms` | `sent_at - captured_at` in milliseconds |
 | `quality.missing_source_time` | `true` iff `source.last_updated_at` is `null` |
 | `quality.post_start` | `true` if any race `post_time` was already past at `captured_at` |
+| `quality.sample_interval_s` | Effective poll interval (seconds) in force when the data was captured (e.g. 3/5/10/60 after throttle/backoff). Always present; `null` for non-polled events (test, backfill, …). |
 
 ## JSON Schema
 
@@ -67,6 +68,8 @@ Pool turnover (when available) is exposed only on `pools[].investment` as the **
         "result",
         "backfill_progress",
         "whitelist_alert",
+        "source_blocked",
+        "source_recovered",
         "horse_update",
         "injury_update",
         "runs_update",
@@ -115,12 +118,13 @@ Pool turnover (when available) is exposed only on `pools[].investment` as the **
     },
     "quality": {
       "type": "object",
-      "required": ["missing_source_time", "post_start", "late_ms"],
+      "required": ["missing_source_time", "post_start", "late_ms", "sample_interval_s"],
       "additionalProperties": false,
       "properties": {
         "missing_source_time": { "type": "boolean" },
         "post_start": { "type": "boolean" },
-        "late_ms": { "type": "integer", "minimum": 0 }
+        "late_ms": { "type": "integer", "minimum": 0 },
+        "sample_interval_s": { "type": ["number", "null"], "exclusiveMinimum": 0 }
       }
     },
     "races": {

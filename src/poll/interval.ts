@@ -3,7 +3,8 @@
  * - > 24 h before post: 60 min (far-future; declared meetings days ahead)
  * - 2–24 h before post: 5 min (idle)
  * - 30 min–2 h before post: 60s (slow)
- * - <= 30 min before post: POLL_INTERVAL_SEC (default 30s, fast)
+ * - <= 30 min before post: fast (POLL_INTERVAL_MS, default 3s)
+ * - betting open on any unfinished race: fast (POLL_INTERVAL_MS), regardless of post time
  * - after post / locked: still use fast interval until result, or caller stops
  */
 
@@ -18,8 +19,13 @@ export function computePollIntervalMs(args: {
   slowIntervalSec?: number;
   idleIntervalSec?: number;
   farFutureIntervalSec?: number;
+  /** Live interval in ms; overrides fastIntervalSec when set. */
+  liveIntervalMs?: number;
+  /** Any unfinished race has an open (selling) WIN/PLA pool. */
+  bettingOpen?: boolean;
 }): number {
-  const fast = (args.fastIntervalSec ?? 30) * 1000;
+  const fast = args.liveIntervalMs ?? (args.fastIntervalSec ?? 30) * 1000;
+  if (args.bettingOpen) return fast;
   const slow = (args.slowIntervalSec ?? 60) * 1000;
   const idle = (args.idleIntervalSec ?? 300) * 1000;
   const farFuture = (args.farFutureIntervalSec ?? 3600) * 1000;

@@ -6,7 +6,12 @@ export interface Env {
   PUSH_TARGET_URL?: string;
   API_TOKEN?: string;
   PUSH_SECRET?: string;
+  /** Live odds poll interval in ms while betting is open / race window (default 3000). */
+  POLL_INTERVAL_MS?: string;
+  /** @deprecated ignored by MeetingPoller; use POLL_INTERVAL_MS. */
   POLL_INTERVAL_SEC?: string;
+  /** Max HKJC GraphQL HTTP requests per HKT day across pollers (default 30000). */
+  DAILY_REQUEST_BUDGET?: string;
   BACKFILL_DAYS?: string;
   TIMEZONE?: string;
   LIVE_PUSH_ENABLED?: string;

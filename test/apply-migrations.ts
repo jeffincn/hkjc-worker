@@ -55,7 +55,8 @@ CREATE TABLE IF NOT EXISTS odds_snapshots (
   pool_status TEXT,
   raw_json TEXT NOT NULL,
   data_source TEXT NOT NULL DEFAULT 'graphql',
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  sample_interval_s REAL
 );
 CREATE INDEX IF NOT EXISTS idx_odds_created_at ON odds_snapshots (created_at);
 CREATE TABLE IF NOT EXISTS results (
@@ -242,6 +243,11 @@ CREATE TABLE IF NOT EXISTS push_events (
   source_last_updated_at TEXT,
   payload_json TEXT NOT NULL,
   created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS graphql_usage (
+  day TEXT PRIMARY KEY,
+  count INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_push_events_meeting_seq
   ON push_events (meeting_date, venue, seq);

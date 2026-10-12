@@ -190,9 +190,37 @@ async function handleHealth(env: Env): Promise<Response> {
   const { countPendingPushStats } = await import("../push/pusher");
   const pendingStats = await countPendingPushStats(env);
 
+  const { hkDay, resolveDailyRequestBudget, resolvePollIntervalMs, HEALTHY_BLOCK_STATE } =
+    await import("../poll/live");
+  const { getGraphqlUsage } = await import("../store/usage");
+  const usageDay = hkDay(Date.now());
+  let graphqlToday = 0;
+  try {
+    graphqlToday = await getGraphqlUsage(env.DB, usageDay);
+  } catch {
+    // table may not exist before migration 0007
+  }
+  let sourceBlock: unknown = HEALTHY_BLOCK_STATE;
+  try {
+    const raw = await getMeta(env.DB, "source_block_state");
+    if (raw) sourceBlock = JSON.parse(raw);
+  } catch {
+    // ignore
+  }
+  const dailyBudget = resolveDailyRequestBudget(env);
+
   return jsonOk({
     ok: true,
     service: "hkjc-data-worker",
+    poll_interval_ms: resolvePollIntervalMs(env),
+    graphql_requests: {
+      day: usageDay,
+      /** D1-flushed count (pollers flush at most every 60s). */
+      today: graphqlToday,
+      daily_budget: dailyBudget,
+      remaining: Math.max(0, dailyBudget - graphqlToday),
+    },
+    source_block: sourceBlock,
     timezone: env.TIMEZONE ?? "Asia/Hong_Kong",
     live_push_enabled: env.LIVE_PUSH_ENABLED ?? "false",
     backfill_days: env.BACKFILL_DAYS ?? "60",
