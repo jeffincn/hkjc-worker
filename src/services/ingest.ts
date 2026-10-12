@@ -38,7 +38,12 @@ import {
 } from "../push/delta";
 import { emitPush } from "../push/emit";
 import { formatHkNow, type PushRace } from "../push/envelope";
-import { flushDueRetries, piggybackPending } from "../push/pusher";
+import {
+  createRetryRunState,
+  flushDueRetries,
+  piggybackPending,
+  type RetryRunState,
+} from "../push/pusher";
 import {
   insertOddsSnapshotIfChanged,
   persistMeetingTree,
@@ -89,97 +94,103 @@ export async function ingestActiveMeeting(env: Env): Promise<{
   meetings: Array<{ date: string; venue: string; races: number; snapshots_changed: number }>;
   whitelist_error?: string;
 }> {
-  await flushDueRetries(env);
+  // Retries share one budget and run AFTER new event pushes so live traffic
+  // is not starved by a large legacy pending_pushes backlog.
+  const retryState = createRetryRunState(env);
 
-  let data: RaceMeetingsFullData | null = null;
   try {
-    // date/venue ignored for past meetings — always returns current/next
-    const res = await fetchGraphQL<RaceMeetingsFullData>({
-      query: QUERY_RACE_MEETINGS_FULL,
-      variables: { date: "2026-10-07", venueCode: "HV" },
-    });
-    data = res.data ?? null;
-  } catch (err) {
-    if (err instanceof WhitelistError) {
-      await setMeta(env.DB, "whitelist_error", err.message);
+    let data: RaceMeetingsFullData | null = null;
+    try {
+      // date/venue ignored for past meetings — always returns current/next
+      const res = await fetchGraphQL<RaceMeetingsFullData>({
+        query: QUERY_RACE_MEETINGS_FULL,
+        variables: { date: "2026-10-07", venueCode: "HV" },
+      });
+      data = res.data ?? null;
+    } catch (err) {
+      if (err instanceof WhitelistError) {
+        await setMeta(env.DB, "whitelist_error", err.message);
+        await emitPush(
+          env,
+          {
+            event: "whitelist_alert",
+            meta: { message: err.message },
+            source_last_updated_at: null,
+          },
+          { force: true },
+        );
+        return { meetings: [], whitelist_error: err.message };
+      }
+      throw err;
+    }
+
+    await setMeta(env.DB, "whitelist_error", "");
+    await setMeta(env.DB, "last_fetch_at", new Date().toISOString());
+
+    if (data) {
+      await storeRawDocument(env.DB, "graphql_raceMeetings_full", "active", data, null);
+    }
+
+    const active = pickHkActiveMeetings(data?.activeMeetings);
+    const raceMeetings = (data?.raceMeetings ?? []).filter((m) =>
+      ["ST", "HV"].includes(m.venueCode),
+    );
+
+    // Prefer detailed raceMeetings payload; fall back to active list dates
+    const targets: MeetingRaw[] =
+      raceMeetings.length > 0
+        ? raceMeetings
+        : active.map((a) => ({
+            date: a.date,
+            venueCode: a.venueCode,
+            status: a.status,
+            races: [],
+          }));
+
+    const out: Array<{ date: string; venue: string; races: number; snapshots_changed: number }> = [];
+
+    for (const rawMeeting of targets) {
+      const result = await ingestOneMeeting(env, rawMeeting, data, retryState);
+      out.push(result);
+
+      // Wake Durable Object for live polling on race days that are not fully closed
+      if (rawMeeting.status !== "CLOSED" || hasOpenRaces(rawMeeting)) {
+        const id = env.MEETING_DO.idFromName(`${rawMeeting.date}_${rawMeeting.venueCode}`);
+        const stub = env.MEETING_DO.get(id);
+        await stub.fetch("https://do/start", {
+          method: "POST",
+          body: JSON.stringify({
+            meeting_date: rawMeeting.date,
+            venue: rawMeeting.venueCode,
+          }),
+        });
+      }
+    }
+
+    // Schedule push for daily schedule
+    if (active.length > 0) {
       await emitPush(
         env,
         {
-          event: "whitelist_alert",
-          meta: { message: err.message },
+          event: "schedule",
+          meta: {
+            active: active.map((a) => ({
+              date: a.date,
+              venue: a.venueCode,
+              status: a.status,
+              races: a.races?.map((r) => ({ no: r.no, postTime: r.postTime, status: r.status })),
+            })),
+          },
           source_last_updated_at: null,
         },
         { force: true },
       );
-      return { meetings: [], whitelist_error: err.message };
     }
-    throw err;
+
+    return { meetings: out };
+  } finally {
+    await flushDueRetries(env, { retryState });
   }
-
-  await setMeta(env.DB, "whitelist_error", "");
-  await setMeta(env.DB, "last_fetch_at", new Date().toISOString());
-
-  if (data) {
-    await storeRawDocument(env.DB, "graphql_raceMeetings_full", "active", data, null);
-  }
-
-  const active = pickHkActiveMeetings(data?.activeMeetings);
-  const raceMeetings = (data?.raceMeetings ?? []).filter((m) =>
-    ["ST", "HV"].includes(m.venueCode),
-  );
-
-  // Prefer detailed raceMeetings payload; fall back to active list dates
-  const targets: MeetingRaw[] =
-    raceMeetings.length > 0
-      ? raceMeetings
-      : active.map((a) => ({
-          date: a.date,
-          venueCode: a.venueCode,
-          status: a.status,
-          races: [],
-        }));
-
-  const out: Array<{ date: string; venue: string; races: number; snapshots_changed: number }> = [];
-
-  for (const rawMeeting of targets) {
-    const result = await ingestOneMeeting(env, rawMeeting, data);
-    out.push(result);
-
-    // Wake Durable Object for live polling on race days that are not fully closed
-    if (rawMeeting.status !== "CLOSED" || hasOpenRaces(rawMeeting)) {
-      const id = env.MEETING_DO.idFromName(`${rawMeeting.date}_${rawMeeting.venueCode}`);
-      const stub = env.MEETING_DO.get(id);
-      await stub.fetch("https://do/start", {
-        method: "POST",
-        body: JSON.stringify({
-          meeting_date: rawMeeting.date,
-          venue: rawMeeting.venueCode,
-        }),
-      });
-    }
-  }
-
-  // Schedule push for daily schedule
-  if (active.length > 0) {
-    await emitPush(
-      env,
-      {
-        event: "schedule",
-        meta: {
-          active: active.map((a) => ({
-            date: a.date,
-            venue: a.venueCode,
-            status: a.status,
-            races: a.races?.map((r) => ({ no: r.no, postTime: r.postTime, status: r.status })),
-          })),
-        },
-        source_last_updated_at: null,
-      },
-      { force: true },
-    );
-  }
-
-  return { meetings: out };
 }
 
 function hasOpenRaces(m: MeetingRaw): boolean {
@@ -193,6 +204,7 @@ export async function ingestOneMeeting(
   env: Env,
   rawMeeting: MeetingRaw,
   fullData?: RaceMeetingsFullData | null,
+  retryState?: RetryRunState,
 ): Promise<{ date: string; venue: string; races: number; snapshots_changed: number }> {
   const meeting = normalizeMeeting(rawMeeting, "graphql");
   await persistMeetingTree(env.DB, meeting, rawMeeting);
@@ -422,7 +434,7 @@ export async function ingestOneMeeting(
     if (r.result.success) {
       await setMeta(env.DB, "last_push_at", new Date().toISOString());
       await setMeta(env.DB, "last_push_status", String(r.result.http_status));
-      await piggybackPending(env);
+      await piggybackPending(env, { retryState });
     }
   }
 

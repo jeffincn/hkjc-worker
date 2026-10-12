@@ -1,8 +1,8 @@
 import type { Env } from "../env";
-import { envBool } from "../env";
+import { envBool, envNum } from "../env";
 import { contentHash } from "../parse/hash";
 import type { PushEnvelope, PushEvent } from "./envelope";
-import { isLivePushEvent } from "./envelope";
+import { formatHkNow, isLivePushEvent } from "./envelope";
 import { getPushEventById } from "./ledger";
 import {
   countSubscribers,
@@ -13,6 +13,51 @@ import {
 
 const BACKOFF_MINUTES = [1, 5, 15];
 const USER_AGENT = "hkjc-data-worker/1.0";
+/** last_error marker for permanently abandoned rows (row kept, never deleted). */
+export const GAVE_UP = "gave_up";
+const LEGACY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_RETRY_MAX_PER_RUN = 5;
+/** Scan window larger than the send cap so 429 skips can still fill the budget. */
+const RETRY_SCAN_MULTIPLIER = 10;
+
+/** Shared per-invocation budget for flushDueRetries + piggybackPending. */
+export interface RetryRunState {
+  sent: number;
+  max: number;
+  /** Subscriber keys that returned HTTP 429 earlier in this run. */
+  rateLimitedSubscribers: Set<string>;
+}
+
+export function createRetryRunState(env: Env): RetryRunState {
+  return {
+    sent: 0,
+    max: Math.max(0, envNum(env, "PUSH_RETRY_MAX_PER_RUN", DEFAULT_RETRY_MAX_PER_RUN)),
+    rateLimitedSubscribers: new Set(),
+  };
+}
+
+function subscriberKey(subscriberId: number | null): string {
+  return subscriberId == null ? "fallback" : String(subscriberId);
+}
+
+function isGaveUp(lastError: string | null | undefined): boolean {
+  return lastError === GAVE_UP;
+}
+
+/** Mark pre-1.1 rows (no event_id) older than 24h as gave_up without sending or deleting. */
+export async function giveUpStaleLegacyPending(env: Env): Promise<number> {
+  const cutoff = new Date(Date.now() - LEGACY_MAX_AGE_MS).toISOString();
+  const result = await env.DB.prepare(
+    `UPDATE pending_pushes
+     SET last_error = ?, next_retry_at = NULL
+     WHERE (event_id IS NULL OR event_id = '')
+       AND created_at < ?
+       AND IFNULL(last_error, '') != ?`,
+  )
+    .bind(GAVE_UP, cutoff, GAVE_UP)
+    .run();
+  return result.meta?.changes ?? 0;
+}
 
 export interface PushResult {
   skipped: boolean;
@@ -284,12 +329,14 @@ async function logPush(
     .bind(
       envelope.event,
       info.target ?? null,
-      info.http_status,
-      info.retry_count,
+      info.http_status ?? null,
+      info.retry_count ?? 0,
       info.success ? 1 : 0,
       hash,
       info.error_message ?? null,
-      envelope.sent_at,
+      // Actual attempt time (not the envelope's original sent_at, which is
+      // stale for retries/piggybacks and made /health show old rows).
+      formatHkNow(),
     )
     .run();
 }
@@ -312,10 +359,10 @@ export async function enqueueRetry(
         envelope.event,
         JSON.stringify(envelope),
         retryCount,
-        envelope.sent_at,
-        lastError,
-        subscriberId,
-        envelope.event_id,
+        envelope.sent_at ?? new Date().toISOString(),
+        lastError ?? null,
+        subscriberId ?? null,
+        envelope.event_id ?? null,
       )
       .run();
     return;
@@ -331,10 +378,10 @@ export async function enqueueRetry(
       JSON.stringify(envelope),
       retryCount,
       next,
-      envelope.sent_at,
-      lastError,
-      subscriberId,
-      envelope.event_id,
+      envelope.sent_at ?? new Date().toISOString(),
+      lastError ?? null,
+      subscriberId ?? null,
+      envelope.event_id ?? null,
     )
     .run();
 }
@@ -357,15 +404,22 @@ async function resolveRetryEnvelope(
 
 export async function flushDueRetries(
   env: Env,
-  opts?: { fetchImpl?: typeof fetch },
+  opts?: { fetchImpl?: typeof fetch; retryState?: RetryRunState },
 ): Promise<number> {
+  const state = opts?.retryState ?? createRetryRunState(env);
+  await giveUpStaleLegacyPending(env);
+
+  if (state.sent >= state.max) return 0;
+
   const now = new Date().toISOString();
+  const scanLimit = Math.max(state.max * RETRY_SCAN_MULTIPLIER, state.max);
   const { results } = await env.DB.prepare(
-    `SELECT id, event_type, payload_json, retry_count, subscriber_id, event_id FROM pending_pushes
+    `SELECT id, event_type, payload_json, retry_count, subscriber_id, event_id, last_error FROM pending_pushes
      WHERE next_retry_at IS NOT NULL AND next_retry_at <= ?
-     ORDER BY next_retry_at ASC LIMIT 20`,
+       AND IFNULL(last_error, '') != ?
+     ORDER BY next_retry_at ASC LIMIT ?`,
   )
-    .bind(now)
+    .bind(now, GAVE_UP, scanLimit)
     .all<{
       id: number;
       event_type: string;
@@ -373,15 +427,32 @@ export async function flushDueRetries(
       retry_count: number;
       subscriber_id: number | null;
       event_id: string | null;
+      last_error: string | null;
     }>();
 
-  let sent = 0;
+  let sentThisCall = 0;
   for (const row of results ?? []) {
+    if (state.sent >= state.max) break;
+    if (isGaveUp(row.last_error)) continue;
+
+    const subKey = subscriberKey(row.subscriber_id ?? null);
+    if (state.rateLimitedSubscribers.has(subKey)) {
+      // Leave the row untouched for a later invocation.
+      continue;
+    }
+
     const envelope = await resolveRetryEnvelope(env, row);
     await env.DB.prepare(`DELETE FROM pending_pushes WHERE id = ?`).bind(row.id).run();
     const result = await sendPushToSubscriber(env, envelope, row.subscriber_id ?? null, {
       fetchImpl: opts?.fetchImpl,
     });
+    state.sent++;
+    sentThisCall++;
+
+    if (result.http_status === 429) {
+      state.rateLimitedSubscribers.add(subKey);
+    }
+
     if (!result.success && !result.skipped) {
       await enqueueRetry(
         env,
@@ -391,35 +462,59 @@ export async function flushDueRetries(
         row.subscriber_id ?? null,
       );
     }
-    sent++;
   }
-  return sent;
+  return sentThisCall;
 }
 
 /** Piggy-back: send any exhausted pending pushes alongside a successful new event. */
 export async function piggybackPending(
   env: Env,
-  opts?: { fetchImpl?: typeof fetch },
+  opts?: { fetchImpl?: typeof fetch; retryState?: RetryRunState },
 ): Promise<number> {
-  const { results } = await env.DB.prepare(
-    `SELECT id, payload_json, retry_count, subscriber_id, event_id FROM pending_pushes
-     WHERE next_retry_at IS NULL
-     ORDER BY id ASC LIMIT 10`,
-  ).all<{
-    id: number;
-    payload_json: string;
-    retry_count: number;
-    subscriber_id: number | null;
-    event_id: string | null;
-  }>();
+  const state = opts?.retryState ?? createRetryRunState(env);
+  await giveUpStaleLegacyPending(env);
 
-  let sent = 0;
+  if (state.sent >= state.max) return 0;
+
+  const scanLimit = Math.max(state.max * RETRY_SCAN_MULTIPLIER, state.max);
+  const { results } = await env.DB.prepare(
+    `SELECT id, payload_json, retry_count, subscriber_id, event_id, last_error FROM pending_pushes
+     WHERE next_retry_at IS NULL
+       AND IFNULL(last_error, '') != ?
+     ORDER BY id ASC LIMIT ?`,
+  )
+    .bind(GAVE_UP, scanLimit)
+    .all<{
+      id: number;
+      payload_json: string;
+      retry_count: number;
+      subscriber_id: number | null;
+      event_id: string | null;
+      last_error: string | null;
+    }>();
+
+  let sentThisCall = 0;
   for (const row of results ?? []) {
+    if (state.sent >= state.max) break;
+    if (isGaveUp(row.last_error)) continue;
+
+    const subKey = subscriberKey(row.subscriber_id ?? null);
+    if (state.rateLimitedSubscribers.has(subKey)) {
+      continue;
+    }
+
     const envelope = await resolveRetryEnvelope(env, row);
     await env.DB.prepare(`DELETE FROM pending_pushes WHERE id = ?`).bind(row.id).run();
     const result = await sendPushToSubscriber(env, envelope, row.subscriber_id ?? null, {
       fetchImpl: opts?.fetchImpl,
     });
+    state.sent++;
+    sentThisCall++;
+
+    if (result.http_status === 429) {
+      state.rateLimitedSubscribers.add(subKey);
+    }
+
     if (!result.success && !result.skipped) {
       await env.DB.prepare(
         `INSERT INTO pending_pushes (event_type, payload_json, retry_count, next_retry_at, created_at, last_error, subscriber_id, event_id)
@@ -428,17 +523,16 @@ export async function piggybackPending(
         .bind(
           envelope.event,
           JSON.stringify(envelope),
-          row.retry_count,
+          row.retry_count ?? 0,
           new Date().toISOString(),
           result.error_message ?? "piggyback failed",
           row.subscriber_id ?? null,
-          envelope.event_id,
+          envelope.event_id ?? null,
         )
         .run();
     }
-    sent++;
   }
-  return sent;
+  return sentThisCall;
 }
 
 export type { PushEvent, PushSubscriber };

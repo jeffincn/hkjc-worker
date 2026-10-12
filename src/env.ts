@@ -11,6 +11,8 @@ export interface Env {
   BACKFILL_SOURCE?: string;
   /** Max horse HTML pages to fetch per refresh call (resumable). */
   HORSE_REFRESH_BATCH?: string;
+  /** Max pending_pushes HTTP sends per ingest/cron invocation (default 5). */
+  PUSH_RETRY_MAX_PER_RUN?: string;
 }
 
 export function envNum(env: Env, key: keyof Env, fallback: number): number {
