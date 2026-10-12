@@ -15,6 +15,8 @@ import {
   upsertHorseProfile,
   upsertInjuries,
 } from "../store/horses";
+import type { SubrequestBudget } from "../util/budget";
+import { runStage } from "../util/stage";
 
 const POLITE_MS = 500;
 
@@ -24,11 +26,13 @@ export interface HorseRefreshResult {
   injuries_changed: boolean;
   fetched: number;
   skipped: number;
+  deferred: number;
 }
 
 /**
  * Refresh horse profile + past runs for codes entered in a meeting.
  * Once when racecard first seen; again on race day (not every 30s).
+ * Heavy fetches respect SubrequestBudget — remaining work resumes next run.
  */
 export async function refreshMeetingHorses(
   env: Env,
@@ -38,6 +42,7 @@ export async function refreshMeetingHorses(
     horse_codes: string[];
     is_race_day: boolean;
     fetchImpl?: typeof fetch;
+    budget?: SubrequestBudget;
   },
 ): Promise<HorseRefreshResult> {
   const fetchImpl = args.fetchImpl ?? fetch;
@@ -46,11 +51,16 @@ export async function refreshMeetingHorses(
   const runs_changed: string[] = [];
   let fetched = 0;
   let skipped = 0;
+  let deferred = 0;
 
   for (const code of args.horse_codes) {
     if (!code) continue;
     if (fetched >= batchLimit) {
       skipped++;
+      continue;
+    }
+    if (args.budget && !args.budget.canAfford(1)) {
+      deferred++;
       continue;
     }
     const state = await env.DB.prepare(
@@ -67,6 +77,7 @@ export async function refreshMeetingHorses(
     }
 
     await sleep(POLITE_MS);
+    args.budget?.charge(1);
     const url = HORSE_PAGE_URL(code, "1");
     const res = await fetchImpl(url, {
       headers: {
@@ -87,9 +98,16 @@ export async function refreshMeetingHorses(
     });
     if (profileResult.changed) profiles_changed.push(code);
 
-    const runs = parsePastRuns(html);
-    const runsResult = await replaceHorseRuns(env.DB, code, runs, url);
-    if (runsResult.changed) runs_changed.push(code);
+    const runsResult = await runStage(env, "runs", async () => {
+      const runs = parsePastRuns(html);
+      return replaceHorseRuns(env.DB, code, runs, url);
+    });
+    const runsHash =
+      runsResult.ok && runsResult.value.changed
+        ? (runs_changed.push(code), runsResult.value.content_hash)
+        : runsResult.ok
+          ? runsResult.value.content_hash
+          : null;
 
     await env.DB.prepare(
       `INSERT INTO horse_fetch_state (horse_code, meeting_date, venue, last_profile_hash, last_runs_hash, first_seen_at, last_fetched_at, race_day_refreshed)
@@ -107,7 +125,7 @@ export async function refreshMeetingHorses(
         args.meeting_date,
         args.venue,
         profileResult.content_hash,
-        runsResult.content_hash,
+        runsHash,
         state?.first_seen_at ?? new Date().toISOString(),
         new Date().toISOString(),
         args.is_race_day ? 1 : 0,
@@ -117,74 +135,78 @@ export async function refreshMeetingHorses(
   }
 
   // Meeting-level veterinary records (official page — GraphQL has no injury fields)
-  await sleep(POLITE_MS);
   const vetUrl = VET_PAGE_URL(args.meeting_date, args.venue);
   let injuries_changed = false;
-  try {
+  const injResult = await runStage(env, "injuries", async () => {
+    if (args.budget && !args.budget.canAfford(1)) {
+      deferred++;
+      return false;
+    }
+    await sleep(POLITE_MS);
+    args.budget?.charge(1);
     const vetRes = await fetchImpl(vetUrl, {
       headers: { "User-Agent": "hkjc-data-worker/1.0", Accept: "text/html" },
     });
-    if (vetRes.ok) {
-      const vetHtml = await vetRes.text();
-      const vetRecords = parseVetRecords(vetHtml).map((r) => ({
-        ...r,
-        horse_code: matchHorseCode(r.horse_name, args.horse_codes, null),
-        meeting_date: args.meeting_date,
-        venue: args.venue,
-      }));
-      // Prefer matching by name from DB
-      for (const rec of vetRecords) {
-        if (!rec.horse_code && rec.horse_name) {
-          const row = await env.DB.prepare(
-            `SELECT horse_code FROM horses WHERE upper(name_en)=upper(?) LIMIT 1`,
-          )
-            .bind(rec.horse_name)
-            .first<{ horse_code: string }>();
-          rec.horse_code = row?.horse_code ?? null;
-        }
+    if (!vetRes.ok) return false;
+    const vetHtml = await vetRes.text();
+    const vetRecords = parseVetRecords(vetHtml).map((r) => ({
+      ...r,
+      horse_code: matchHorseCode(r.horse_name, args.horse_codes, null),
+      meeting_date: args.meeting_date,
+      venue: args.venue,
+    }));
+    for (const rec of vetRecords) {
+      if (!rec.horse_code && rec.horse_name) {
+        const row = await env.DB.prepare(
+          `SELECT horse_code FROM horses WHERE upper(name_en)=upper(?) LIMIT 1`,
+        )
+          .bind(rec.horse_name)
+          .first<{ horse_code: string }>();
+        rec.horse_code = row?.horse_code ?? null;
       }
-      const inj = await upsertInjuries(env.DB, vetRecords, vetUrl);
-      injuries_changed = inj.changed;
     }
-  } catch {
-    // optional
-  }
+    const inj = await upsertInjuries(env.DB, vetRecords, vetUrl);
+    return inj.changed;
+  });
+  if (injResult.ok) injuries_changed = injResult.value;
 
   // Batched pushes per meeting — never per-horse spam
-  if (profiles_changed.length > 0) {
-    await emitPush(env, {
-      event: "horse_update",
-      meeting_date: args.meeting_date,
-      venue: args.venue,
-      meta: {
-        horse_codes: profiles_changed,
-        count: profiles_changed.length,
-        content_hash: await hashPayload(profiles_changed),
-      },
-    });
-  }
-  if (runs_changed.length > 0) {
-    await emitPush(env, {
-      event: "runs_update",
-      meeting_date: args.meeting_date,
-      venue: args.venue,
-      meta: {
-        horse_codes: runs_changed,
-        count: runs_changed.length,
-        content_hash: await hashPayload(runs_changed),
-      },
-    });
-  }
-  if (injuries_changed) {
-    await emitPush(env, {
-      event: "injury_update",
-      meeting_date: args.meeting_date,
-      venue: args.venue,
-      meta: { source: vetUrl },
-    });
-  }
+  await runStage(env, "pushes", async () => {
+    if (profiles_changed.length > 0) {
+      await emitPush(env, {
+        event: "horse_update",
+        meeting_date: args.meeting_date,
+        venue: args.venue,
+        meta: {
+          horse_codes: profiles_changed,
+          count: profiles_changed.length,
+          content_hash: await hashPayload(profiles_changed),
+        },
+      });
+    }
+    if (runs_changed.length > 0) {
+      await emitPush(env, {
+        event: "runs_update",
+        meeting_date: args.meeting_date,
+        venue: args.venue,
+        meta: {
+          horse_codes: runs_changed,
+          count: runs_changed.length,
+          content_hash: await hashPayload(runs_changed),
+        },
+      });
+    }
+    if (injuries_changed) {
+      await emitPush(env, {
+        event: "injury_update",
+        meeting_date: args.meeting_date,
+        venue: args.venue,
+        meta: { source: vetUrl },
+      });
+    }
+  });
 
-  return { profiles_changed, runs_changed, injuries_changed, fetched, skipped };
+  return { profiles_changed, runs_changed, injuries_changed, fetched, skipped, deferred };
 }
 
 function matchHorseCode(

@@ -6,6 +6,8 @@ Additive, backward-compatible evolution of `hkjc-push/1.0`.
 - Adds envelope identity/ordering (`event_id`, `seq`), capture/send times, `source`, `quality`.
 - Adds `odds_delta` and `no_update` events.
 - Full event bodies are stored once in D1 `push_events` and replayable via `GET /v1/events`.
+- Delivery is decoupled: each `(event_id, subscriber)` is enqueued to Cloudflare Queue `hkjc-push-deliveries` (binding `PUSH_QUEUE`) so fan-out/retries never share one Worker's subrequest budget. Without the binding (tests/local), the worker falls back to direct HTTP send.
+- Per-subscriber circuit breaker (`closed` / `open` / `half_open`) stops HTTP to a failing receiver without deleting the subscriber; ledger replay via `/v1/events` remains available.
 
 ## Odds basis
 

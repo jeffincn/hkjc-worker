@@ -5,6 +5,7 @@ import {
   type PushEnvelope,
   type PushEvent,
 } from "./envelope";
+import { requireEventId } from "./event-id";
 import { insertPushEvent } from "./ledger";
 import { allocatePushSeq, markLastChange } from "./seq";
 import { sendPush, type PushResult } from "./pusher";
@@ -36,6 +37,8 @@ export async function preparePushEvent(
     event_id: args.event_id ?? crypto.randomUUID(),
     seq,
   });
+  // Invariant: ledger + downstream queues always see a non-empty event_id.
+  requireEventId(envelope);
   await insertPushEvent(env, envelope);
   if (CHANGE_EVENTS.has(envelope.event)) {
     await markLastChange(

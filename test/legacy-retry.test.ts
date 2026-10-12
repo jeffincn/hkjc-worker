@@ -145,11 +145,12 @@ describe("pending_pushes retry budget + legacy give-up", () => {
 
   it("marks legacy rows older than 24h as gave_up without sending or deleting", async () => {
     const sub = await createSubscriber(env, { url: "https://example.test/hook" });
+    // Must be before PUSH_1_1_DEPLOY_CUTOFF (2026-10-10) AND older than 24h
     await env.DB.prepare(
       `INSERT INTO pending_pushes (event_type, payload_json, retry_count, next_retry_at, created_at, last_error, subscriber_id)
-       VALUES ('odds_update', ?, 0, '2000-01-01T00:00:00Z', ?, 'HTTP 429', ?)`,
+       VALUES ('odds_update', ?, 0, '2000-01-01T00:00:00Z', '2026-09-01T00:00:00.000Z', 'HTTP 429', ?)`,
     )
-      .bind(JSON.stringify(LEGACY), staleIso(30), sub.id)
+      .bind(JSON.stringify(LEGACY), sub.id)
       .run();
 
     let fetches = 0;

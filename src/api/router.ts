@@ -112,9 +112,83 @@ async function handleHealth(env: Env): Promise<Response> {
   // is a full table scan on every call and burns the D1 free-tier daily
   // row-read quota on race days (2026-10-11 outage). Totals are intentionally
   // omitted here; use the query endpoints with bounded filters instead.
+  // Prefer newest push_log row for last_push_* (any event type).
   const lastPushRow = await env.DB.prepare(
     `SELECT event_type, http_status, success, error_message, sent_at FROM push_log ORDER BY id DESC LIMIT 1`,
-  ).first();
+  ).first<{
+    event_type: string;
+    http_status: number | null;
+    success: number;
+    error_message: string | null;
+    sent_at: string;
+  }>();
+
+  const effectiveLastPushAt = lastPushRow?.sent_at ?? lastPush;
+  const effectiveLastPushStatus =
+    lastPushRow != null
+      ? lastPushRow.success
+        ? String(lastPushRow.http_status)
+        : lastPushRow.error_message ?? String(lastPushRow.http_status)
+      : lastPushStatus;
+
+  const { listCircuitSnapshots } = await import("../push/circuit");
+  const { getQueueBacklog, hasPushQueue } = await import("../push/queue");
+  const { readStageErrors } = await import("../util/stage");
+
+  const circuits = await listCircuitSnapshots(env);
+  const queue_backlog = await getQueueBacklog(env);
+  const stage_errors = await readStageErrors(env, [
+    "schedule",
+    "odds",
+    "dividends",
+    "horses",
+    "runs",
+    "injuries",
+    "pushes",
+    "changes",
+    "persist",
+    "wake_do",
+    "retry_flush",
+    "backfill",
+    "watchdog",
+  ]);
+
+  let poller: {
+    last_fetch_at: string | null;
+    age_ms: number | null;
+    watchdog_last_run: string | null;
+    watchdog_last_rearm: string | null;
+  } = {
+    last_fetch_at: lastFetch,
+    age_ms: lastFetch ? Date.now() - Date.parse(lastFetch) : null,
+    watchdog_last_run: await getMeta(env.DB, "poller_watchdog_last_run"),
+    watchdog_last_rearm: await getMeta(env.DB, "poller_watchdog_last_rearm"),
+  };
+  // Prefer DO status when we can cheaply probe a known live meeting from meta.
+  try {
+    const rearmRaw = poller.watchdog_last_rearm;
+    if (rearmRaw) {
+      const parsed = JSON.parse(rearmRaw) as { meeting_date?: string; venue?: string };
+      if (parsed.meeting_date && parsed.venue) {
+        const id = env.MEETING_DO.idFromName(`${parsed.meeting_date}_${parsed.venue}`);
+        const stub = env.MEETING_DO.get(id);
+        const statusRes = await stub.fetch("https://do/status");
+        const status = (await statusRes.json()) as { last_fetch_at?: string | null };
+        if (status.last_fetch_at) {
+          poller = {
+            ...poller,
+            last_fetch_at: status.last_fetch_at,
+            age_ms: Date.now() - Date.parse(status.last_fetch_at),
+          };
+        }
+      }
+    }
+  } catch {
+    // DO probe is best-effort
+  }
+
+  const { countPendingPushStats } = await import("../push/pusher");
+  const pendingStats = await countPendingPushStats(env);
 
   return jsonOk({
     ok: true,
@@ -124,9 +198,20 @@ async function handleHealth(env: Env): Promise<Response> {
     backfill_days: env.BACKFILL_DAYS ?? "60",
     backfill_source: env.BACKFILL_SOURCE ?? "graphql",
     last_fetch_at: lastFetch,
-    last_push_at: lastPush,
-    last_push_status: lastPushStatus,
+    last_push_at: effectiveLastPushAt,
+    last_push_status: effectiveLastPushStatus,
     last_push: lastPushRow ?? null,
+    push_queue: {
+      bound: hasPushQueue(env),
+      backlog: queue_backlog,
+      pending_pushes: pendingStats.active,
+      pending_due: pendingStats.due,
+      pending_deferred: pendingStats.deferred,
+      gave_up: pendingStats.gave_up,
+    },
+    subscribers: circuits,
+    poller,
+    stage_errors,
     backfill: {
       completed_meetings: backfillRange?.n ?? 0,
       from: backfillRange?.min_date ?? null,

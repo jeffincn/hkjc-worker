@@ -53,6 +53,9 @@ import {
   storeDividendsAsResults,
 } from "../store/db";
 import { storeRawDocument } from "../store/horses";
+import { createSubrequestBudget, type SubrequestBudget } from "../util/budget";
+import { runStage } from "../util/stage";
+import { rearmStalePollers } from "../poll/watchdog";
 import { refreshMeetingHorses } from "./horses";
 
 function namesForRace(
@@ -93,50 +96,65 @@ function toPushRace(
 export async function ingestActiveMeeting(env: Env): Promise<{
   meetings: Array<{ date: string; venue: string; races: number; snapshots_changed: number }>;
   whitelist_error?: string;
+  watchdog?: { checked: number; rearmed: number };
 }> {
   // Retries share one budget and run AFTER new event pushes so live traffic
   // is not starved by a large legacy pending_pushes backlog.
   const retryState = createRetryRunState(env);
+  const budget = createSubrequestBudget(env);
+  const out: Array<{ date: string; venue: string; races: number; snapshots_changed: number }> = [];
+  let whitelist_error: string | undefined;
+  const liveMeetings: Array<{ date: string; venue: string }> = [];
 
   try {
-    let data: RaceMeetingsFullData | null = null;
-    try {
-      // date/venue ignored for past meetings — always returns current/next
-      const res = await fetchGraphQL<RaceMeetingsFullData>({
-        query: QUERY_RACE_MEETINGS_FULL,
-        variables: { date: "2026-10-07", venueCode: "HV" },
-      });
-      data = res.data ?? null;
-    } catch (err) {
-      if (err instanceof WhitelistError) {
-        await setMeta(env.DB, "whitelist_error", err.message);
-        await emitPush(
-          env,
-          {
-            event: "whitelist_alert",
-            meta: { message: err.message },
-            source_last_updated_at: null,
-          },
-          { force: true },
-        );
-        return { meetings: [], whitelist_error: err.message };
+    const scheduleResult = await runStage(env, "schedule", async () => {
+      budget.charge(1, { force: true });
+      let data: RaceMeetingsFullData | null = null;
+      try {
+        const res = await fetchGraphQL<RaceMeetingsFullData>({
+          query: QUERY_RACE_MEETINGS_FULL,
+          variables: { date: "2026-10-07", venueCode: "HV" },
+        });
+        data = res.data ?? null;
+      } catch (err) {
+        if (err instanceof WhitelistError) {
+          await setMeta(env.DB, "whitelist_error", err.message);
+          await emitPush(
+            env,
+            {
+              event: "whitelist_alert",
+              meta: { message: err.message },
+              source_last_updated_at: null,
+            },
+            { force: true },
+          );
+          return { data: null as RaceMeetingsFullData | null, whitelist: err.message };
+        }
+        throw err;
       }
-      throw err;
+
+      await setMeta(env.DB, "whitelist_error", "");
+      await setMeta(env.DB, "last_fetch_at", new Date().toISOString());
+
+      if (data) {
+        await storeRawDocument(env.DB, "graphql_raceMeetings_full", "active", data, null);
+      }
+      return { data, whitelist: null as string | null };
+    });
+
+    if (!scheduleResult.ok) {
+      return { meetings: out, whitelist_error: scheduleResult.error };
+    }
+    if (scheduleResult.value.whitelist) {
+      return { meetings: out, whitelist_error: scheduleResult.value.whitelist };
     }
 
-    await setMeta(env.DB, "whitelist_error", "");
-    await setMeta(env.DB, "last_fetch_at", new Date().toISOString());
-
-    if (data) {
-      await storeRawDocument(env.DB, "graphql_raceMeetings_full", "active", data, null);
-    }
-
+    const data = scheduleResult.value.data;
     const active = pickHkActiveMeetings(data?.activeMeetings);
     const raceMeetings = (data?.raceMeetings ?? []).filter((m) =>
       ["ST", "HV"].includes(m.venueCode),
     );
 
-    // Prefer detailed raceMeetings payload; fall back to active list dates
     const targets: MeetingRaw[] =
       raceMeetings.length > 0
         ? raceMeetings
@@ -147,49 +165,65 @@ export async function ingestActiveMeeting(env: Env): Promise<{
             races: [],
           }));
 
-    const out: Array<{ date: string; venue: string; races: number; snapshots_changed: number }> = [];
-
     for (const rawMeeting of targets) {
-      const result = await ingestOneMeeting(env, rawMeeting, data, retryState);
-      out.push(result);
+      const meetingResult = await runStage(env, "odds", async () =>
+        ingestOneMeeting(env, rawMeeting, data, retryState, budget),
+      );
+      if (meetingResult.ok) {
+        out.push(meetingResult.value);
+      }
 
-      // Wake Durable Object for live polling on race days that are not fully closed
       if (rawMeeting.status !== "CLOSED" || hasOpenRaces(rawMeeting)) {
-        const id = env.MEETING_DO.idFromName(`${rawMeeting.date}_${rawMeeting.venueCode}`);
-        const stub = env.MEETING_DO.get(id);
-        await stub.fetch("https://do/start", {
-          method: "POST",
-          body: JSON.stringify({
-            meeting_date: rawMeeting.date,
-            venue: rawMeeting.venueCode,
-          }),
+        liveMeetings.push({ date: rawMeeting.date, venue: rawMeeting.venueCode });
+        await runStage(env, "wake_do", async () => {
+          budget.charge(1, { force: true });
+          const id = env.MEETING_DO.idFromName(`${rawMeeting.date}_${rawMeeting.venueCode}`);
+          const stub = env.MEETING_DO.get(id);
+          await stub.fetch("https://do/start", {
+            method: "POST",
+            body: JSON.stringify({
+              meeting_date: rawMeeting.date,
+              venue: rawMeeting.venueCode,
+            }),
+          });
         });
       }
     }
 
-    // Schedule push for daily schedule
     if (active.length > 0) {
-      await emitPush(
-        env,
-        {
-          event: "schedule",
-          meta: {
-            active: active.map((a) => ({
-              date: a.date,
-              venue: a.venueCode,
-              status: a.status,
-              races: a.races?.map((r) => ({ no: r.no, postTime: r.postTime, status: r.status })),
-            })),
+      await runStage(env, "pushes", async () => {
+        await emitPush(
+          env,
+          {
+            event: "schedule",
+            meta: {
+              active: active.map((a) => ({
+                date: a.date,
+                venue: a.venueCode,
+                status: a.status,
+                races: a.races?.map((r) => ({ no: r.no, postTime: r.postTime, status: r.status })),
+              })),
+            },
+            source_last_updated_at: null,
           },
-          source_last_updated_at: null,
-        },
-        { force: true },
-      );
+          { force: true },
+        );
+      });
     }
 
-    return { meetings: out };
+    const watchdog = await runStage(env, "watchdog", async () =>
+      rearmStalePollers(env, liveMeetings),
+    );
+
+    return {
+      meetings: out,
+      whitelist_error,
+      watchdog: watchdog.ok ? watchdog.value : { checked: 0, rearmed: 0 },
+    };
   } finally {
-    await flushDueRetries(env, { retryState });
+    await runStage(env, "retry_flush", async () => {
+      await flushDueRetries(env, { retryState });
+    });
   }
 }
 
@@ -205,31 +239,22 @@ export async function ingestOneMeeting(
   rawMeeting: MeetingRaw,
   fullData?: RaceMeetingsFullData | null,
   retryState?: RetryRunState,
+  budget?: SubrequestBudget,
 ): Promise<{ date: string; venue: string; races: number; snapshots_changed: number }> {
+  const sub = budget ?? createSubrequestBudget(env);
   const meeting = normalizeMeeting(rawMeeting, "graphql");
-  await persistMeetingTree(env.DB, meeting, rawMeeting);
-  await storeChangeHistories(
-    env.DB,
-    meeting.meeting_date,
-    meeting.venue,
-    rawMeeting.changeHistories ?? [],
-  );
+
+  await runStage(env, "persist", async () => {
+    await persistMeetingTree(env.DB, meeting, rawMeeting);
+    await storeChangeHistories(
+      env.DB,
+      meeting.meeting_date,
+      meeting.venue,
+      rawMeeting.changeHistories ?? [],
+    );
+  });
 
   const captured_at = formatHkNow();
-
-  // Odds for all races in one call
-  const oddsRes = await fetchGraphQL<PmPoolsOddsData>({
-    query: QUERY_PM_POOLS_ODDS,
-    variables: {
-      date: meeting.meeting_date,
-      venueCode: meeting.venue,
-      oddsTypes: ["WIN", "PLA"],
-      raceNo: 0,
-    },
-  });
-  const pools = oddsRes.data?.raceMeetings?.[0]?.pmPools ?? [];
-  const byRace = poolsByRace(pools);
-  const poolInvs = rawMeeting.poolInvs ?? [];
 
   let changed = 0;
   const pushRaces: PushRace[] = [];
@@ -239,83 +264,98 @@ export async function ingestOneMeeting(
   const deltaRaceNos: number[] = [];
   const sourceTimes: Array<string | null> = [];
   let scratched = false;
-
+  const poolInvs = rawMeeting.poolInvs ?? [];
   const nowMs = Date.now();
 
-  for (const race of meeting.races) {
-    const pair = byRace.get(race.race_no);
-    const snap = buildRaceOddsSnapshot({
-      race: rawMeeting.races?.find((r) => r.no === race.race_no) ?? {
-        no: race.race_no,
-        runners: race.runners.map((r) => ({
-          no: r.horse_no,
-          name_en: r.name_en,
-          name_ch: r.name_ch,
-          status: r.status ?? undefined,
-          finalPosition: r.final_position,
-          winOdds: r.win_odds,
-        })),
-        postTime: race.post_time,
+  // Priority: odds fetch + lock/result enqueue
+  await runStage(env, "odds", async () => {
+    sub.charge(1, { force: true });
+    const oddsRes = await fetchGraphQL<PmPoolsOddsData>({
+      query: QUERY_PM_POOLS_ODDS,
+      variables: {
+        date: meeting.meeting_date,
+        venueCode: meeting.venue,
+        oddsTypes: ["WIN", "PLA"],
+        raceNo: 0,
       },
-      winPool: pair?.win,
-      plaPool: pair?.pla,
     });
-    sourceTimes.push(snap.payload.last_update);
+    const pools = oddsRes.data?.raceMeetings?.[0]?.pmPools ?? [];
+    const byRace = poolsByRace(pools);
 
-    // Skip un-opened pool shells (empty lastUpdate + no odds) — they must
-    // not be stored or trigger odds_update / lock.
-    if (isStorableOddsSnapshot(snap)) {
-      const hadPriorOpen = await raceHadOpenOddsSnapshot(
-        env.DB,
-        meeting.meeting_date,
-        meeting.venue,
-        race.race_no,
-      );
+    for (const race of meeting.races) {
+      const pair = byRace.get(race.race_no);
+      const snap = buildRaceOddsSnapshot({
+        race: rawMeeting.races?.find((r) => r.no === race.race_no) ?? {
+          no: race.race_no,
+          runners: race.runners.map((r) => ({
+            no: r.horse_no,
+            name_en: r.name_en,
+            name_ch: r.name_ch,
+            status: r.status ?? undefined,
+            finalPosition: r.final_position,
+            winOdds: r.win_odds,
+          })),
+          postTime: race.post_time,
+        },
+        winPool: pair?.win,
+        plaPool: pair?.pla,
+      });
+      sourceTimes.push(snap.payload.last_update);
 
-      const ins = await insertOddsSnapshotIfChanged(
-        env.DB,
-        meeting.meeting_date,
-        meeting.venue,
-        snap,
-      );
-      if (ins.inserted) {
-        changed++;
-        const pushRace = toPushRace(snap);
-        pushRaces.push(pushRace);
-        deltaRaceNos.push(race.race_no);
-        allDeltaChanges.push(
-          ...computeOddsDeltaChanges({
-            prev: ins.previous,
-            next: snap,
-            horseNames: namesForRace(meeting, race.race_no),
-          }),
+      if (isStorableOddsSnapshot(snap)) {
+        const hadPriorOpen = await raceHadOpenOddsSnapshot(
+          env.DB,
+          meeting.meeting_date,
+          meeting.venue,
+          race.race_no,
         );
-        if (
-          shouldEmitLock({
-            poolStatus: snap.pool_status,
-            postTime: snap.post_time,
-            nowMs,
-            wasOpenOrHasOdds: snapshotHasOdds(snap) || hadPriorOpen,
-          })
-        ) {
-          lockRaces.push(pushRace);
+
+        const ins = await insertOddsSnapshotIfChanged(
+          env.DB,
+          meeting.meeting_date,
+          meeting.venue,
+          snap,
+        );
+        if (ins.inserted) {
+          changed++;
+          const pushRace = toPushRace(snap);
+          pushRaces.push(pushRace);
+          deltaRaceNos.push(race.race_no);
+          allDeltaChanges.push(
+            ...computeOddsDeltaChanges({
+              prev: ins.previous,
+              next: snap,
+              horseNames: namesForRace(meeting, race.race_no),
+            }),
+          );
+          if (
+            shouldEmitLock({
+              poolStatus: snap.pool_status,
+              postTime: snap.post_time,
+              nowMs,
+              wasOpenOrHasOdds: snapshotHasOdds(snap) || hadPriorOpen,
+            })
+          ) {
+            lockRaces.push(pushRace);
+          }
         }
       }
-    }
 
-    for (const r of race.runners) {
-      if (isScratchedStatus(r.status)) scratched = true;
-    }
+      for (const r of race.runners) {
+        if (isScratchedStatus(r.status)) scratched = true;
+      }
 
-    if (resultsComplete(race)) {
-      resultRaces.push(toPushRace(snap));
+      if (resultsComplete(race)) {
+        resultRaces.push(toPushRace(snap));
+      }
     }
-  }
+  });
 
   const meetingSourceTime = maxSourceTime(sourceTimes);
 
-  // Official dividends for current meeting
-  try {
+  await runStage(env, "dividends", async () => {
+    if (!sub.canAfford(1)) return;
+    sub.charge(1);
     const divRes = await fetchGraphQL<ResultMeetingsData>({
       query: QUERY_RESULT_MEETINGS,
       variables: {
@@ -327,8 +367,6 @@ export async function ingestOneMeeting(
       },
     });
     const resPools = divRes.data?.raceMeetings?.[0]?.resPools ?? [];
-    // Hash only pools with non-empty dividends so INITIAL→DEFINED status
-    // churn on empty pre-race pools does not look like a dividends update.
     const divDoc = await storeRawDocument(
       env.DB,
       "graphql_dividends",
@@ -346,7 +384,6 @@ export async function ingestOneMeeting(
       divByRace.set(n, list);
     }
     for (const [raceNo, racePools] of divByRace) {
-      // storeDividendsAsResults skips races with empty dividends arrays
       await storeDividendsAsResults(
         env.DB,
         meeting.meeting_date,
@@ -369,12 +406,11 @@ export async function ingestOneMeeting(
         },
       });
     }
-  } catch {
-    // dividends optional
-  }
+  });
 
-  // Changes (full list)
-  try {
+  await runStage(env, "changes", async () => {
+    if (!sub.canAfford(1)) return;
+    sub.charge(1);
     const chRes = await fetchGraphQL<RacingChangesData>({
       query: QUERY_RACING_CHANGES,
       variables: {},
@@ -406,72 +442,73 @@ export async function ingestOneMeeting(
         }
       }
     }
-  } catch {
-    // optional
-  }
+  });
 
-  if (pushRaces.length > 0) {
-    const r = await emitPush(env, {
-      event: "odds_update",
-      meeting_date: meeting.meeting_date,
-      venue: meeting.venue,
-      races: pushRaces,
-      captured_at,
-      source_last_updated_at: meetingSourceTime,
-    });
-    if (allDeltaChanges.length > 0) {
-      await emitPush(env, {
-        event: "odds_delta",
+  // Priority pushes: odds / lock / result (enqueue is cheap vs HTTP fan-out)
+  await runStage(env, "pushes", async () => {
+    if (pushRaces.length > 0) {
+      const r = await emitPush(env, {
+        event: "odds_update",
         meeting_date: meeting.meeting_date,
         venue: meeting.venue,
         races: pushRaces,
-        changes: allDeltaChanges,
-        pools: buildPoolInvestments(poolInvs, deltaRaceNos),
+        captured_at,
+        source_last_updated_at: meetingSourceTime,
+      });
+      if (allDeltaChanges.length > 0) {
+        await emitPush(env, {
+          event: "odds_delta",
+          meeting_date: meeting.meeting_date,
+          venue: meeting.venue,
+          races: pushRaces,
+          changes: allDeltaChanges,
+          pools: buildPoolInvestments(poolInvs, deltaRaceNos),
+          captured_at,
+          source_last_updated_at: meetingSourceTime,
+        });
+      }
+      // last_push_* is updated inside delivery on any success; piggyback only
+      // when at least one subscriber accepted (direct path) or enqueue succeeded.
+      if (r.result.success) {
+        await piggybackPending(env, { retryState });
+      }
+    }
+
+    if (lockRaces.length > 0) {
+      await emitPush(env, {
+        event: "lock",
+        meeting_date: meeting.meeting_date,
+        venue: meeting.venue,
+        races: lockRaces,
         captured_at,
         source_last_updated_at: meetingSourceTime,
       });
     }
-    if (r.result.success) {
-      await setMeta(env.DB, "last_push_at", new Date().toISOString());
-      await setMeta(env.DB, "last_push_status", String(r.result.http_status));
-      await piggybackPending(env, { retryState });
+
+    if (scratched) {
+      await emitPush(env, {
+        event: "scratch",
+        meeting_date: meeting.meeting_date,
+        venue: meeting.venue,
+        races: pushRaces,
+        captured_at,
+        source_last_updated_at: meetingSourceTime,
+      });
     }
-  }
 
-  if (lockRaces.length > 0) {
-    await emitPush(env, {
-      event: "lock",
-      meeting_date: meeting.meeting_date,
-      venue: meeting.venue,
-      races: lockRaces,
-      captured_at,
-      source_last_updated_at: meetingSourceTime,
-    });
-  }
+    if (resultRaces.length > 0) {
+      await emitPush(env, {
+        event: "result",
+        meeting_date: meeting.meeting_date,
+        venue: meeting.venue,
+        races: resultRaces,
+        captured_at,
+        source_last_updated_at: meetingSourceTime,
+      });
+    }
+  });
 
-  if (scratched) {
-    await emitPush(env, {
-      event: "scratch",
-      meeting_date: meeting.meeting_date,
-      venue: meeting.venue,
-      races: pushRaces,
-      captured_at,
-      source_last_updated_at: meetingSourceTime,
-    });
-  }
-
-  if (resultRaces.length > 0) {
-    await emitPush(env, {
-      event: "result",
-      meeting_date: meeting.meeting_date,
-      venue: meeting.venue,
-      races: resultRaces,
-      captured_at,
-      source_last_updated_at: meetingSourceTime,
-    });
-  }
-
-  // Horse pages: once on first racecard sight + again on race day (not every poll)
+  // Heavy horse/runs/injury — defer when subrequest budget is low
   const todayHk = new Intl.DateTimeFormat("en-CA", {
     timeZone: "Asia/Hong_Kong",
     year: "numeric",
@@ -487,11 +524,22 @@ export async function ingestOneMeeting(
     ),
   ];
   if (horseCodes.length > 0) {
-    await refreshMeetingHorses(env, {
-      meeting_date: meeting.meeting_date,
-      venue: meeting.venue,
-      horse_codes: horseCodes,
-      is_race_day: meeting.meeting_date === todayHk,
+    await runStage(env, "horses", async () => {
+      if (sub.shouldDeferHeavy()) {
+        await setMeta(
+          env.DB,
+          "stage_error_horses",
+          `deferred: subrequest budget remaining=${sub.remaining()}`,
+        );
+        return;
+      }
+      await refreshMeetingHorses(env, {
+        meeting_date: meeting.meeting_date,
+        venue: meeting.venue,
+        horse_codes: horseCodes,
+        is_race_day: meeting.meeting_date === todayHk,
+        budget: sub,
+      });
     });
   }
 
@@ -506,7 +554,6 @@ export async function ingestOneMeeting(
 }
 
 export async function sendTestPush(env: Env): Promise<unknown> {
-  // Use latest stored odds snapshot if available
   const row = await env.DB.prepare(
     `SELECT meeting_date, venue, race_no, snapshot_time, pool_status, raw_json
      FROM odds_snapshots ORDER BY id DESC LIMIT 1`,
@@ -551,7 +598,14 @@ export async function sendTestPush(env: Env): Promise<unknown> {
     },
     { force: true },
   );
-  await setMeta(env.DB, "last_push_at", new Date().toISOString());
-  await setMeta(env.DB, "last_push_status", String(result.http_status));
+  // markLastPush happens inside successful delivery; keep meta for queued path
+  if (result.queued || result.success) {
+    await setMeta(env.DB, "last_push_at", new Date().toISOString());
+    await setMeta(
+      env.DB,
+      "last_push_status",
+      result.queued ? "queued" : String(result.http_status),
+    );
+  }
   return { envelope, result };
 }
