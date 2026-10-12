@@ -236,6 +236,7 @@ export async function insertOddsSnapshotIfChanged(
   venue: string,
   snapshot: RaceOddsSnapshot,
   dataSource = "graphql",
+  sampleIntervalS: number | null = null,
 ): Promise<SnapshotInsertResult> {
   const hash = await contentHash(snapshot.payload);
   // ORDER BY snapshot_time (not id) so idx_odds_lookup
@@ -271,8 +272,8 @@ export async function insertOddsSnapshotIfChanged(
 
   await db
     .prepare(
-      `INSERT INTO odds_snapshots (meeting_date, venue, race_no, snapshot_time, content_hash, pool_status, raw_json, data_source, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO odds_snapshots (meeting_date, venue, race_no, snapshot_time, content_hash, pool_status, raw_json, data_source, created_at, sample_interval_s)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .bind(
       meetingDate,
@@ -284,6 +285,7 @@ export async function insertOddsSnapshotIfChanged(
       JSON.stringify(snapshot),
       dataSource,
       new Date().toISOString(),
+      sampleIntervalS,
     )
     .run();
 

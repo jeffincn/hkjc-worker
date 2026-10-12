@@ -534,7 +534,7 @@ curl -s -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/v1/admin/subscribers/
 
 | 事件 | 默认（`false`） | 说明 |
 |---|---|---|
-| `test` / `schedule` / `backfill_progress` / `whitelist_alert` | 仍可推 | 联调与告警 |
+| `test` / `schedule` / `backfill_progress` / `whitelist_alert` / `source_blocked` / `source_recovered` | 仍可推 | 联调与告警 |
 | `odds_update` / `odds_delta` / `no_update` / `lock` / `scratch` / `result` / `horse_update` / `injury_update` / `runs_update` / `dividends` / `changes` | **跳过** | 确认 `test` 后再开 |
 
 ### 4.5 事件类型与完整 JSON 示例
@@ -920,7 +920,9 @@ app.post("/hook", express.raw({ type: "application/json" }), (req, res) => {
 | `PUSH_TARGET_URL` | Secret | — | **仅当订阅者表为空时**兜底 Webhook；有订阅者行则忽略 |
 | `API_TOKEN` | Secret | — | Bearer（查询 + Admin） |
 | `PUSH_SECRET` | Secret 可选 | — | 写入 agent 订阅者 secret（若该行尚无 secret）；兜底 URL 时也用于 HMAC |
-| `POLL_INTERVAL_SEC` | var | `30` | 开跑前 ≤30 分钟轮询秒数（更远见 §11） |
+| `POLL_INTERVAL_MS` | var | `3000` | 实时赔率轮询间隔（毫秒）：任一未完赛场次 WIN/PLA 开售中、或距开跑 ≤30 分钟时使用（clamp 1000–600000）。见 §11 |
+| `DAILY_REQUEST_BUDGET` | var | `30000` | 每个 HKT 自然日 HKJC GraphQL 请求上限（含重试），接近时自动降频 3s→5s→10s→30s→60s，用尽后 300s |
+| `POLL_INTERVAL_SEC` | var | — | **已废弃**，MeetingPoller 不再读取 |
 | `BACKFILL_DAYS` | var | `60` | GraphQL 回填窗口 |
 | `BACKFILL_SOURCE` | var | `graphql` | `graphql` / `off` |
 | `TIMEZONE` | var | `Asia/Hong_Kong` | |
@@ -1049,8 +1051,19 @@ npx wrangler secret put LIVE_PUSH_ENABLED   # 设为 true
 | > 24 小时 | **60 分钟** |
 | 2 – 24 小时 | **5 分钟** |
 | 30 分钟 – 2 小时 | **60 秒** |
-| ≤ 30 分钟 | **`POLL_INTERVAL_SEC`（默认 30s）** |
+| ≤ 30 分钟 | **`POLL_INTERVAL_MS`（默认 3s）** |
+| 任一未完赛场次开售中（START_SELL/SELLING） | **`POLL_INTERVAL_MS`（默认 3s）**，不论距开跑多久 |
 | 会议结束 / 全部有成绩 | **停止** alarm（cron 日后再启） |
+
+### 实时轮询控制（3s）
+
+有效间隔 = `max(赛程档位, 日预算节流, 封锁退避)`；下一次 alarm 以本次 tick **开始时间**为基准（不因处理耗时漂移），且至少 250ms 后。DO alarm 串行执行，不会重叠。
+
+- **请求计数**：每次 GraphQL HTTP 尝试（含重试）计数，按 HKT 日存 DO storage，最多每 60s 累加刷入 D1 `graphql_usage`（migration 0007）。`/health.graphql_requests` = `{day, today, daily_budget, remaining}`（D1 已刷入值，最多滞后 60s）。仅统计 MeetingPoller；hourly cron / 回填的少量请求不计入。
+- **日预算节流**：预测 `今日已用 + 剩余 tick × 2`（时间窗 = 最后一场 post_time + 30 分钟，封顶 HKT 午夜），取能落在 `DAILY_REQUEST_BUDGET` 内的最快档 3s→5s→10s→30s→60s；已用尽时 300s。
+- **封锁退避**：403 / 429 / HTML challenge 页（`SourceBlockedError`，不重试）立即判为 blocked；普通网络/HTTP 错误连续 3 次也判为 blocked。退避 `base × 2^level`（6s→12s→24s→48s→60s 封顶）；每次健康 tick 降一级逐步恢复，降到 0 时恢复。状态写入 DO storage 与 `worker_meta.source_block_state`，`/health.source_block` 展示。进入/恢复时各推送一次 `source_blocked` / `source_recovered`（`meta.reason/since/backoff_ms`，不受 `LIVE_PUSH_ENABLED` 门控）。
+- **`quality.sample_interval_s`**：每个推送 envelope 带上本次采样实际生效的轮询间隔（秒，=上一 tick 设定的有效间隔，如 3/5/10/60）；非轮询事件为 `null`。同时写入 `odds_snapshots.sample_interval_s`（不参与 content hash，去重语义不变）。
+- **D1 读写削减**：`stage_ok_at_*` 每 stage 每 isolate 最多 60s 写一次；已 lock 的场次不再每 tick 查 `raceHadOpenOddsSnapshot`。
 
 ### D1 写入门闩
 

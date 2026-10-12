@@ -11,6 +11,8 @@ export type PushEvent =
   | "result"
   | "backfill_progress"
   | "whitelist_alert"
+  | "source_blocked"
+  | "source_recovered"
   | "horse_update"
   | "injury_update"
   | "runs_update"
@@ -55,6 +57,11 @@ export interface PushQuality {
   post_start: boolean;
   /** sent_at - captured_at in milliseconds. */
   late_ms: number;
+  /**
+   * Poll interval (seconds) actually in effect when this data was captured
+   * (3/5/10/60…, after throttle/backoff). Explicit null for non-polled events.
+   */
+  sample_interval_s: number | null;
 }
 
 export type OddsBetType = "WIN" | "PLA";
@@ -161,6 +168,7 @@ export function buildQuality(args: {
   captured_at: string;
   sent_at: string;
   post_start?: boolean;
+  sample_interval_s?: number | null;
 }): PushQuality {
   const capturedMs = parseHkMs(args.captured_at);
   const post_start =
@@ -172,10 +180,18 @@ export function buildQuality(args: {
     missing_source_time: args.source_last_updated_at == null,
     post_start,
     late_ms: computeLateMs(args.captured_at, args.sent_at),
+    sample_interval_s: normalizeSampleIntervalS(args.sample_interval_s),
   };
 }
 
+export function normalizeSampleIntervalS(v: number | null | undefined): number | null {
+  if (v == null || !Number.isFinite(v) || v <= 0) return null;
+  return Math.round(v * 1000) / 1000;
+}
+
 export interface BuildEnvelopeArgs {
+  /** Effective poll interval (s) when captured; see PushQuality.sample_interval_s. */
+  sample_interval_s?: number | null;
   event: PushEvent;
   meeting_date?: string | null;
   venue?: string | null;
@@ -217,6 +233,7 @@ export function buildEnvelope(args: BuildEnvelopeArgs): PushEnvelope {
     captured_at,
     sent_at,
     post_start: args.post_start,
+    sample_interval_s: args.sample_interval_s,
   });
 
   const envelope: PushEnvelope = {
@@ -246,7 +263,7 @@ export function buildEnvelope(args: BuildEnvelopeArgs): PushEnvelope {
   return envelope;
 }
 
-/** Live events gated by LIVE_PUSH_ENABLED (test / schedule / backfill_progress / whitelist_alert always allowed). */
+/** Live events gated by LIVE_PUSH_ENABLED (test / schedule / backfill_progress / whitelist_alert / source_blocked / source_recovered always allowed). */
 export function isLivePushEvent(event: PushEvent): boolean {
   return (
     event === "odds_update" ||

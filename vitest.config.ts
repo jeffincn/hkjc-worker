@@ -14,7 +14,8 @@ export default defineWorkersConfig({
             BACKFILL_DAYS: "60",
             BACKFILL_SOURCE: "graphql",
             TIMEZONE: "Asia/Hong_Kong",
-            POLL_INTERVAL_SEC: "30",
+            POLL_INTERVAL_MS: "3000",
+            DAILY_REQUEST_BUDGET: "30000",
             // No PUSH_TARGET_URL — tests must not hit real webhooks
           },
         },

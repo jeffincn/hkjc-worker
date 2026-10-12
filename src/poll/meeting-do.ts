@@ -1,9 +1,9 @@
 import type { Env } from "../env";
-import { envNum } from "../env";
-import { fetchGraphQL } from "../graphql/client";
+import { fetchGraphQL, SourceBlockedError } from "../graphql/client";
 import { QUERY_PM_POOLS_ODDS, QUERY_RACE_MEETINGS_FULL } from "../graphql/queries";
 import type { MeetingRaw, PmPoolsOddsData, RaceMeetingsFullData } from "../graphql/types";
 import {
+  isOpenSellStatus,
   isStorableOddsSnapshot,
   shouldEmitLock,
   snapshotHasOdds,
@@ -29,9 +29,43 @@ import {
   raceHadOpenOddsSnapshot,
   setMeta,
 } from "../store/db";
+import { addGraphqlUsage } from "../store/usage";
 import { createSubrequestBudget } from "../util/budget";
 import { runStage } from "../util/stage";
 import { computePollIntervalMs, selectRelevantPostTime } from "./interval";
+import {
+  backoffIntervalMs,
+  effectiveIntervalMs,
+  HEALTHY_BLOCK_STATE,
+  hkDay,
+  nextBlockState,
+  resolveDailyRequestBudget,
+  resolvePollIntervalMs,
+  throttleIntervalMs,
+  type BlockState,
+  type FetchOutcome,
+} from "./live";
+
+interface UsageState {
+  day: string;
+  /** Requests counted locally but not yet flushed to D1. */
+  pending: number;
+  /** Last known D1 total for `day` (all pollers). */
+  global: number;
+  flushed_at_ms: number;
+}
+
+const USAGE_FLUSH_MS = 60_000;
+/** Minimum gap between alarm end and next tick. */
+const MIN_ALARM_GAP_MS = 250;
+/** Expected meeting end = last post time + this. */
+const MEETING_TAIL_MS = 30 * 60 * 1000;
+
+function classifyFetchError(err: unknown): FetchOutcome {
+  if (err instanceof SourceBlockedError) return { kind: "blocked", reason: err.kind };
+  const message = err instanceof Error ? err.message : String(err);
+  return { kind: "error", reason: message.slice(0, 200) };
+}
 
 interface DoState {
   meeting_date: string;
@@ -80,7 +114,9 @@ function toPushRace(snap: RaceOddsSnapshot): PushRace {
 /**
  * One Durable Object per meeting. Alarm self-loop:
  * 60 min when >24h before post, 5 min when 2–24h, 60s when 30min–2h,
- * 30s inside 30min.
+ * POLL_INTERVAL_MS (default 3s) inside 30min or whenever any unfinished race
+ * has open WIN/PLA betting. Effective interval is stretched by the daily
+ * GraphQL budget throttle and source-block backoff (see ./live.ts).
  *
  * Every alarm invocation ALWAYS reschedules itself (unless meeting is fully
  * done), even when individual stages throw.
@@ -120,12 +156,18 @@ export class MeetingPoller implements DurableObject {
       const alarm = await this.state.storage.getAlarm();
       const lastFetchAt = await this.state.storage.get<string>("last_fetch_at");
       const lastError = await this.state.storage.get<string>("last_alarm_error");
+      const blockState = await this.state.storage.get<BlockState>("block_state");
+      const usage = await this.state.storage.get<UsageState>("gql_usage");
+      const currentIntervalMs = await this.state.storage.get<number>("current_interval_ms");
       return new Response(
         JSON.stringify({
           cfg,
           alarm,
           last_fetch_at: lastFetchAt ?? null,
           last_alarm_error: lastError ?? null,
+          current_interval_ms: currentIntervalMs ?? null,
+          source_block: blockState ?? HEALTHY_BLOCK_STATE,
+          graphql_requests_today: usage ? { day: usage.day, count: usage.global + usage.pending } : null,
         }),
         { headers: { "Content-Type": "application/json" } },
       );
@@ -137,11 +179,29 @@ export class MeetingPoller implements DurableObject {
     const cfg = await this.state.storage.get<DoState>("cfg");
     if (!cfg) return;
 
-    const fastSec = envNum(this.env, "POLL_INTERVAL_SEC", 30);
+    const tickStartMs = Date.now();
+    const liveMs = resolvePollIntervalMs(this.env);
+    const prevIntervalMs =
+      (await this.state.storage.get<number>("current_interval_ms")) ?? liveMs;
+    // Interval actually in effect for this capture (gap since previous tick).
+    const sample_interval_s = prevIntervalMs / 1000;
     const captured_at = formatHkNow();
     const budget = createSubrequestBudget(this.env);
     let stopPolling = false;
     let nextIntervalMs = ERROR_RESCHEDULE_MS;
+    let gqlAttempts = 0;
+    const onAttempt = () => {
+      gqlAttempts++;
+    };
+    let fetchOutcome: FetchOutcome = { kind: "ok" };
+    const onFetchError = (err: unknown) => {
+      fetchOutcome = classifyFetchError(err);
+    };
+    let horizonEndMs: number | null = null;
+    let meetingKey: { meeting_date: string; venue: string } = {
+      meeting_date: cfg.meeting_date,
+      venue: cfg.venue,
+    };
 
     try {
       const schedule = await runStage(this.env, "schedule", async () => {
@@ -149,6 +209,7 @@ export class MeetingPoller implements DurableObject {
         const full = await fetchGraphQL<RaceMeetingsFullData>({
           query: QUERY_RACE_MEETINGS_FULL,
           variables: { date: cfg.meeting_date, venueCode: cfg.venue },
+          onAttempt,
         });
         const found =
           (full.data?.raceMeetings ?? []).find(
@@ -180,10 +241,14 @@ export class MeetingPoller implements DurableObject {
 
         await this.touchLastFetchAt();
         return { meeting, raw: found };
-      });
+      }, { onError: onFetchError });
 
       if (!schedule.ok || !schedule.value) {
-        nextIntervalMs = ERROR_RESCHEDULE_MS;
+        // Fetch failure: keep the previous schedule cadence and let backoff
+        // stretch it; missing meeting (no fetch error) uses the slow fallback.
+        nextIntervalMs = !schedule.ok
+          ? ((await this.state.storage.get<number>("last_schedule_ms")) ?? ERROR_RESCHEDULE_MS)
+          : ERROR_RESCHEDULE_MS;
         return;
       }
 
@@ -194,6 +259,12 @@ export class MeetingPoller implements DurableObject {
       const sourceTimes: Array<string | null> = [];
       const nowMs = Date.now();
       const poolInvs = raw.poolInvs ?? [];
+      let bettingOpen = false;
+      meetingKey = { meeting_date: meeting.meeting_date, venue: meeting.venue };
+      const postMsList = meeting.races
+        .map((r) => (r.post_time ? Date.parse(r.post_time) : NaN))
+        .filter((t) => Number.isFinite(t));
+      horizonEndMs = postMsList.length > 0 ? Math.max(...postMsList) + MEETING_TAIL_MS : null;
 
       await runStage(this.env, "odds", async () => {
         budget.charge(1, { force: true });
@@ -205,6 +276,7 @@ export class MeetingPoller implements DurableObject {
             oddsTypes: ["WIN", "PLA"],
             raceNo: 0,
           },
+          onAttempt,
         });
         const byRace = poolsByRace(oddsRes.data?.raceMeetings?.[0]?.pmPools ?? []);
 
@@ -220,20 +292,29 @@ export class MeetingPoller implements DurableObject {
             plaPool: pair?.pla,
           });
           sourceTimes.push(snap.payload.last_update);
+          if (!resultsComplete(race) && isOpenSellStatus(snap.pool_status)) {
+            bettingOpen = true;
+          }
           const pushRace = toPushRace(snap);
 
           if (isStorableOddsSnapshot(snap)) {
-            const hadPriorOpen = await raceHadOpenOddsSnapshot(
-              this.env.DB,
-              meeting.meeting_date,
-              meeting.venue,
-              race.race_no,
-            );
+            const alreadyLocked = cfg.locked_races.includes(race.race_no);
+            // Only needed for lock detection; skip the D1 read once locked.
+            const hadPriorOpen = alreadyLocked
+              ? true
+              : await raceHadOpenOddsSnapshot(
+                  this.env.DB,
+                  meeting.meeting_date,
+                  meeting.venue,
+                  race.race_no,
+                );
             const ins = await insertOddsSnapshotIfChanged(
               this.env.DB,
               meeting.meeting_date,
               meeting.venue,
               snap,
+              "graphql",
+              sample_interval_s,
             );
             if (ins.inserted) {
               changed.push(pushRace);
@@ -263,6 +344,7 @@ export class MeetingPoller implements DurableObject {
                   venue: meeting.venue,
                   races: [pushRace],
                   captured_at,
+            sample_interval_s,
                   source_last_updated_at: snap.payload.last_update,
                 });
               });
@@ -278,12 +360,13 @@ export class MeetingPoller implements DurableObject {
                 venue: meeting.venue,
                 races: [pushRace],
                 captured_at,
+            sample_interval_s,
                 source_last_updated_at: snap.payload.last_update,
               });
             });
           }
         }
-      });
+      }, { onError: onFetchError });
 
       const meetingSourceTime = maxSourceTime(sourceTimes);
 
@@ -295,6 +378,7 @@ export class MeetingPoller implements DurableObject {
             venue: meeting.venue,
             races: changed,
             captured_at,
+            sample_interval_s,
             source_last_updated_at: meetingSourceTime,
           });
 
@@ -307,6 +391,7 @@ export class MeetingPoller implements DurableObject {
               changes: allDeltaChanges,
               pools: buildPoolInvestments(poolInvs, deltaRaceNos),
               captured_at,
+            sample_interval_s,
               source_last_updated_at: meetingSourceTime,
             });
           }
@@ -330,6 +415,7 @@ export class MeetingPoller implements DurableObject {
               venue: meeting.venue,
               races: [],
               captured_at,
+            sample_interval_s,
               source_last_updated_at: meetingSourceTime,
               last_change_seq: last.last_change_seq,
               last_change_at: last.last_change_at,
@@ -358,10 +444,12 @@ export class MeetingPoller implements DurableObject {
       nextIntervalMs = computePollIntervalMs({
         nowMs: Date.now(),
         postTimeIso: post,
-        fastIntervalSec: fastSec,
+        liveIntervalMs: liveMs,
+        bettingOpen,
         slowIntervalSec: 60,
         idleIntervalSec: 300,
       });
+      await this.state.storage.put("last_schedule_ms", nextIntervalMs);
     } catch (err) {
       console.error("MeetingPoller alarm error", err);
       const message = err instanceof Error ? err.message : String(err);
@@ -373,15 +461,109 @@ export class MeetingPoller implements DurableObject {
       }
       nextIntervalMs = ERROR_RESCHEDULE_MS;
     } finally {
+      let effectiveMs = nextIntervalMs;
+      try {
+        effectiveMs = await this.applyLiveControls({
+          nowMs: Date.now(),
+          liveMs,
+          scheduleMs: nextIntervalMs,
+          gqlAttempts,
+          fetchOutcome,
+          horizonEndMs,
+          meetingKey,
+          captured_at,
+          sample_interval_s,
+        });
+      } catch (ctlErr) {
+        console.error("MeetingPoller live control error", ctlErr);
+      }
       // ALWAYS reschedule unless the meeting is fully done.
       if (!stopPolling) {
         try {
-          await this.state.storage.setAlarm(Date.now() + nextIntervalMs);
+          // Fixed cadence from tick start (no drift by work duration).
+          const at = Math.max(tickStartMs + effectiveMs, Date.now() + MIN_ALARM_GAP_MS);
+          await this.state.storage.put("current_interval_ms", effectiveMs);
+          await this.state.storage.setAlarm(at);
         } catch (alarmErr) {
           console.error("MeetingPoller failed to reschedule alarm", alarmErr);
         }
       }
     }
+  }
+
+  /**
+   * Request accounting (per HKT day), daily-budget throttle and source-block
+   * backoff. Returns the effective interval for the next tick.
+   */
+  private async applyLiveControls(args: {
+    nowMs: number;
+    liveMs: number;
+    scheduleMs: number;
+    gqlAttempts: number;
+    fetchOutcome: FetchOutcome;
+    horizonEndMs: number | null;
+    meetingKey: { meeting_date: string; venue: string };
+    captured_at: string;
+    sample_interval_s: number;
+  }): Promise<number> {
+    const { nowMs } = args;
+    const day = hkDay(nowMs);
+    let usage = await this.state.storage.get<UsageState>("gql_usage");
+    if (!usage || usage.day !== day) {
+      if (usage && usage.pending > 0) {
+        try {
+          await addGraphqlUsage(this.env.DB, usage.day, usage.pending);
+        } catch (e) {
+          console.error("graphql_usage flush (rollover) failed", e);
+        }
+      }
+      usage = { day, pending: 0, global: 0, flushed_at_ms: 0 };
+    }
+    usage.pending += args.gqlAttempts;
+    if (usage.pending > 0 && nowMs - usage.flushed_at_ms >= USAGE_FLUSH_MS) {
+      try {
+        usage.global = await addGraphqlUsage(this.env.DB, day, usage.pending);
+        usage.pending = 0;
+        usage.flushed_at_ms = nowMs;
+      } catch (e) {
+        console.error("graphql_usage flush failed", e);
+      }
+    }
+    await this.state.storage.put("gql_usage", usage);
+    const usedToday = usage.global + usage.pending;
+
+    const throttleMs = throttleIntervalMs({
+      baseMs: args.liveMs,
+      usedToday,
+      budget: resolveDailyRequestBudget(this.env),
+      nowMs,
+      horizonEndMs: args.horizonEndMs,
+    });
+
+    const prevBlock =
+      (await this.state.storage.get<BlockState>("block_state")) ?? { ...HEALTHY_BLOCK_STATE };
+    const t = nextBlockState(prevBlock, args.fetchOutcome, new Date(nowMs).toISOString());
+    await this.state.storage.put("block_state", t.state);
+    const backoffMs = backoffIntervalMs(args.liveMs, t.state);
+    if (t.becameBlocked || t.recovered) {
+      await setMeta(this.env.DB, "source_block_state", JSON.stringify(t.state));
+      await runStage(this.env, "pushes", async () => {
+        await emitPush(this.env, {
+          event: t.becameBlocked ? "source_blocked" : "source_recovered",
+          meeting_date: args.meetingKey.meeting_date,
+          venue: args.meetingKey.venue,
+          races: [],
+          captured_at: args.captured_at,
+          sample_interval_s: args.sample_interval_s,
+          meta: {
+            reason: t.becameBlocked ? t.state.reason : prevBlock.reason,
+            since: t.becameBlocked ? t.state.since : prevBlock.since,
+            backoff_ms: backoffMs,
+          },
+        });
+      });
+    }
+    return effectiveIntervalMs({ scheduleMs: args.scheduleMs, throttleMs, backoffMs });
   }
 
   /** Always keep last_fetch_at in DO storage; flush to D1 at most every 5 minutes. */
