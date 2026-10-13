@@ -33,10 +33,15 @@ describe("/health hardening fields", () => {
       `INSERT INTO pending_pushes (event_type, payload_json, retry_count, next_retry_at, created_at, last_error, subscriber_id, event_id)
        VALUES
          ('odds_update', '{}', 0, '2000-01-01T00:00:00Z', '2026-09-01T00:00:00.000Z', 'gave_up', NULL, NULL),
-         ('odds_update', '{}', 0, '2000-01-01T00:00:00Z', ?, NULL, NULL, 'due-1'),
-         ('odds_update', '{}', 5, NULL, ?, NULL, NULL, 'def-1')`,
+         ('odds_update', '{}', 0, '2000-01-01T00:00:00Z', ?, NULL, ?, 'due-1'),
+         ('odds_update', '{}', 5, NULL, ?, NULL, ?, 'def-1')`,
     )
-      .bind(new Date().toISOString(), new Date().toISOString())
+      .bind(new Date().toISOString(), sub.id, new Date().toISOString(), sub.id)
+      .run();
+    await env.DB.prepare(
+      `INSERT INTO worker_meta (key, value, updated_at) VALUES (?, ?, ?)`,
+    )
+      .bind(`push_rate_delay_count_${sub.id}`, "7", new Date().toISOString())
       .run();
 
     const ctx = createExecutionContext();
@@ -53,8 +58,15 @@ describe("/health hardening fields", () => {
         pending_deferred: number;
         gave_up: number;
         pending_pushes: number;
+        rate_limit_delays: number;
       };
-      subscribers: Array<{ subscriber_id: number; circuit_state: string; last_failure_at: string | null }>;
+      subscribers: Array<{
+        subscriber_id: number;
+        circuit_state: string;
+        last_failure_at: string | null;
+        backlog_size?: number;
+        rate_limit_delays?: number;
+      }>;
       stage_errors: Record<string, string | null>;
       poller: { last_fetch_at: string | null; age_ms: number | null };
     };
@@ -68,7 +80,11 @@ describe("/health hardening fields", () => {
     expect(body.push_queue.pending_due).toBe(1);
     expect(body.push_queue.pending_deferred).toBe(1);
     expect(body.push_queue.pending_pushes).toBe(2);
-    expect(body.subscribers.some((s) => s.subscriber_id === sub.id)).toBe(true);
+    expect(body.push_queue.rate_limit_delays).toBe(7);
+    const subHealth = body.subscribers.find((s) => s.subscriber_id === sub.id);
+    expect(subHealth).toBeTruthy();
+    expect(subHealth!.backlog_size).toBe(2);
+    expect(subHealth!.rate_limit_delays).toBe(7);
     expect(body.stage_errors.odds).toContain("odds blew up");
     expect(body.poller.last_fetch_at).toBeTruthy();
     expect(body.poller.age_ms).toBeGreaterThan(0);

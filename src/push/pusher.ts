@@ -16,6 +16,13 @@ import {
 } from "./event-id";
 import { enqueueRetry, GAVE_UP, nextBackoffMinutes } from "./pending";
 import {
+  backlogCoalesceMin,
+  buildCoalescedDeliveries,
+  shouldCoalesceBacklog,
+  type PendingPushRow,
+} from "./coalesce";
+import { reserveDeliverySlot } from "./rate-limit";
+import {
   countSubscribers,
   getSubscriber,
   listEnabledSubscribers,
@@ -289,6 +296,243 @@ async function resolveRetryEnvelope(
   return JSON.parse(row.payload_json) as PushEnvelope;
 }
 
+async function deletePendingRows(env: Env, ids: number[]): Promise<void> {
+  for (const id of ids) {
+    await env.DB.prepare(`DELETE FROM pending_pushes WHERE id = ?`).bind(id).run();
+  }
+}
+
+/** Rate-limited send used by flush/piggyback after rows are deleted. */
+async function sendOrDeferPending(
+  env: Env,
+  envelope: PushEnvelope,
+  subscriberId: number | null,
+  retryCount: number,
+  opts: {
+    fetchImpl?: typeof fetch;
+    /** When true, failed re-insert uses next_retry_at NULL (piggyback). */
+    exhausted?: boolean;
+  },
+): Promise<{
+  counted: boolean;
+  http_status: number | null;
+  success: boolean;
+  skipped: boolean;
+  error_message?: string;
+  deferred_rate_limit: boolean;
+}> {
+  const slot = await reserveDeliverySlot(env, subscriberId);
+  if (slot.delaySeconds > 0) {
+    const next = new Date(Date.now() + slot.delaySeconds * 1000).toISOString();
+    await env.DB.prepare(
+      `INSERT INTO pending_pushes (event_type, payload_json, retry_count, next_retry_at, created_at, last_error, subscriber_id, event_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+      .bind(
+        envelope.event,
+        JSON.stringify(ensureEventId(envelope)),
+        retryCount,
+        next,
+        new Date().toISOString(),
+        `rate_limit_delay_${slot.delaySeconds}s`,
+        subscriberId,
+        ensureEventId(envelope).event_id || null,
+      )
+      .run();
+    return {
+      counted: false,
+      http_status: null,
+      success: false,
+      skipped: true,
+      deferred_rate_limit: true,
+    };
+  }
+
+  const result = await sendPushToSubscriber(env, envelope, subscriberId, {
+    fetchImpl: opts.fetchImpl,
+  });
+  return {
+    counted: true,
+    http_status: result.http_status,
+    success: result.success,
+    skipped: !!result.skipped,
+    error_message: result.error_message,
+    deferred_rate_limit: false,
+  };
+}
+
+function groupRowsBySubscriber(
+  rows: PendingPushRow[],
+): Map<string, PendingPushRow[]> {
+  const map = new Map<string, PendingPushRow[]>();
+  for (const row of rows) {
+    if (isGaveUp(row.last_error)) continue;
+    const key = subscriberKey(row.subscriber_id ?? null);
+    const list = map.get(key) ?? [];
+    list.push(row);
+    map.set(key, list);
+  }
+  return map;
+}
+
+/**
+ * Flush due pending rows for one subscriber: coalesce when backlog is large,
+ * otherwise replay one-by-one. Rate-limit delays defer (never drop).
+ */
+async function flushSubscriberPending(
+  env: Env,
+  rows: PendingPushRow[],
+  state: RetryRunState,
+  opts: { fetchImpl?: typeof fetch; exhausted?: boolean },
+): Promise<number> {
+  if (rows.length === 0) return 0;
+  const subscriberId = rows[0]!.subscriber_id ?? null;
+  const subKey = subscriberKey(subscriberId);
+  let sentThisCall = 0;
+
+  const coalesce = shouldCoalesceBacklog(rows.length, backlogCoalesceMin(env));
+
+  if (coalesce) {
+    const deliveries = await buildCoalescedDeliveries(env, rows);
+    const allIds = [...new Set(deliveries.flatMap((d) => d.source_row_ids))];
+    await deletePendingRows(env, allIds);
+
+    for (const delivery of deliveries) {
+      if (state.sent >= state.max) {
+        // Budget exhausted: park remaining coalesced envelopes as pending.
+        await env.DB.prepare(
+          `INSERT INTO pending_pushes (event_type, payload_json, retry_count, next_retry_at, created_at, last_error, subscriber_id, event_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+          .bind(
+            delivery.envelope.event,
+            JSON.stringify(delivery.envelope),
+            delivery.retry_count,
+            opts.exhausted ? null : new Date().toISOString(),
+            new Date().toISOString(),
+            "deferred_budget",
+            subscriberId,
+            delivery.envelope.event_id,
+          )
+          .run();
+        continue;
+      }
+      if (state.rateLimitedSubscribers.has(subKey)) {
+        await env.DB.prepare(
+          `INSERT INTO pending_pushes (event_type, payload_json, retry_count, next_retry_at, created_at, last_error, subscriber_id, event_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+          .bind(
+            delivery.envelope.event,
+            JSON.stringify(delivery.envelope),
+            delivery.retry_count,
+            opts.exhausted ? null : new Date().toISOString(),
+            new Date().toISOString(),
+            "deferred_429_sibling",
+            subscriberId,
+            delivery.envelope.event_id,
+          )
+          .run();
+        continue;
+      }
+
+      const outcome = await sendOrDeferPending(
+        env,
+        delivery.envelope,
+        subscriberId,
+        delivery.retry_count,
+        opts,
+      );
+      if (outcome.deferred_rate_limit) continue;
+      if (!outcome.counted) continue;
+
+      state.sent++;
+      sentThisCall++;
+      if (outcome.http_status === 429) {
+        state.rateLimitedSubscribers.add(subKey);
+      }
+      if (!outcome.success && !outcome.skipped) {
+        if (opts.exhausted) {
+          await env.DB.prepare(
+            `INSERT INTO pending_pushes (event_type, payload_json, retry_count, next_retry_at, created_at, last_error, subscriber_id, event_id)
+             VALUES (?, ?, ?, NULL, ?, ?, ?, ?)`,
+          )
+            .bind(
+              delivery.envelope.event,
+              JSON.stringify(delivery.envelope),
+              delivery.retry_count,
+              new Date().toISOString(),
+              outcome.error_message ?? "piggyback failed",
+              subscriberId,
+              delivery.envelope.event_id,
+            )
+            .run();
+        } else {
+          await enqueueRetry(
+            env,
+            delivery.envelope,
+            delivery.retry_count + 1,
+            outcome.error_message ?? "retry failed",
+            subscriberId,
+          );
+        }
+      }
+    }
+    return sentThisCall;
+  }
+
+  // One-by-one path (small backlog).
+  for (const row of rows) {
+    if (state.sent >= state.max) break;
+    if (state.rateLimitedSubscribers.has(subKey)) break;
+
+    const envelope = await resolveRetryEnvelope(env, row);
+    await deletePendingRows(env, [row.id]);
+    const outcome = await sendOrDeferPending(
+      env,
+      envelope,
+      subscriberId,
+      row.retry_count ?? 0,
+      opts,
+    );
+    if (outcome.deferred_rate_limit) continue;
+    if (!outcome.counted) continue;
+
+    state.sent++;
+    sentThisCall++;
+    if (outcome.http_status === 429) {
+      state.rateLimitedSubscribers.add(subKey);
+    }
+    if (!outcome.success && !outcome.skipped) {
+      if (opts.exhausted) {
+        await env.DB.prepare(
+          `INSERT INTO pending_pushes (event_type, payload_json, retry_count, next_retry_at, created_at, last_error, subscriber_id, event_id)
+           VALUES (?, ?, ?, NULL, ?, ?, ?, ?)`,
+        )
+          .bind(
+            envelope.event,
+            JSON.stringify(envelope),
+            row.retry_count ?? 0,
+            new Date().toISOString(),
+            outcome.error_message ?? "piggyback failed",
+            subscriberId,
+            ensureEventId(envelope).event_id || null,
+          )
+          .run();
+      } else {
+        await enqueueRetry(
+          env,
+          envelope,
+          row.retry_count + 1,
+          outcome.error_message ?? "retry failed",
+          subscriberId,
+        );
+      }
+    }
+  }
+  return sentThisCall;
+}
+
 export async function flushDueRetries(
   env: Env,
   opts?: { fetchImpl?: typeof fetch; retryState?: RetryRunState },
@@ -307,48 +551,18 @@ export async function flushDueRetries(
      ORDER BY next_retry_at ASC LIMIT ?`,
   )
     .bind(now, GAVE_UP, scanLimit)
-    .all<{
-      id: number;
-      event_type: string;
-      payload_json: string;
-      retry_count: number;
-      subscriber_id: number | null;
-      event_id: string | null;
-      last_error: string | null;
-    }>();
+    .all<PendingPushRow>();
 
+  const bySub = groupRowsBySubscriber(results ?? []);
   let sentThisCall = 0;
-  for (const row of results ?? []) {
+  for (const rows of bySub.values()) {
     if (state.sent >= state.max) break;
-    if (isGaveUp(row.last_error)) continue;
-
-    const subKey = subscriberKey(row.subscriber_id ?? null);
-    if (state.rateLimitedSubscribers.has(subKey)) {
-      // Leave the row untouched for a later invocation.
-      continue;
-    }
-
-    const envelope = await resolveRetryEnvelope(env, row);
-    await env.DB.prepare(`DELETE FROM pending_pushes WHERE id = ?`).bind(row.id).run();
-    const result = await sendPushToSubscriber(env, envelope, row.subscriber_id ?? null, {
+    const subKey = subscriberKey(rows[0]!.subscriber_id ?? null);
+    if (state.rateLimitedSubscribers.has(subKey)) continue;
+    sentThisCall += await flushSubscriberPending(env, rows, state, {
       fetchImpl: opts?.fetchImpl,
+      exhausted: false,
     });
-    state.sent++;
-    sentThisCall++;
-
-    if (result.http_status === 429) {
-      state.rateLimitedSubscribers.add(subKey);
-    }
-
-    if (!result.success && !result.skipped) {
-      await enqueueRetry(
-        env,
-        envelope,
-        row.retry_count + 1,
-        result.error_message ?? "retry failed",
-        row.subscriber_id ?? null,
-      );
-    }
   }
   return sentThisCall;
 }
@@ -365,59 +579,24 @@ export async function piggybackPending(
 
   const scanLimit = Math.max(state.max * RETRY_SCAN_MULTIPLIER, state.max);
   const { results } = await env.DB.prepare(
-    `SELECT id, payload_json, retry_count, subscriber_id, event_id, last_error FROM pending_pushes
+    `SELECT id, event_type, payload_json, retry_count, subscriber_id, event_id, last_error FROM pending_pushes
      WHERE next_retry_at IS NULL
        AND IFNULL(last_error, '') != ?
      ORDER BY id ASC LIMIT ?`,
   )
     .bind(GAVE_UP, scanLimit)
-    .all<{
-      id: number;
-      payload_json: string;
-      retry_count: number;
-      subscriber_id: number | null;
-      event_id: string | null;
-      last_error: string | null;
-    }>();
+    .all<PendingPushRow>();
 
+  const bySub = groupRowsBySubscriber(results ?? []);
   let sentThisCall = 0;
-  for (const row of results ?? []) {
+  for (const rows of bySub.values()) {
     if (state.sent >= state.max) break;
-    if (isGaveUp(row.last_error)) continue;
-
-    const subKey = subscriberKey(row.subscriber_id ?? null);
-    if (state.rateLimitedSubscribers.has(subKey)) {
-      continue;
-    }
-
-    const envelope = await resolveRetryEnvelope(env, row);
-    await env.DB.prepare(`DELETE FROM pending_pushes WHERE id = ?`).bind(row.id).run();
-    const result = await sendPushToSubscriber(env, envelope, row.subscriber_id ?? null, {
+    const subKey = subscriberKey(rows[0]!.subscriber_id ?? null);
+    if (state.rateLimitedSubscribers.has(subKey)) continue;
+    sentThisCall += await flushSubscriberPending(env, rows, state, {
       fetchImpl: opts?.fetchImpl,
+      exhausted: true,
     });
-    state.sent++;
-    sentThisCall++;
-
-    if (result.http_status === 429) {
-      state.rateLimitedSubscribers.add(subKey);
-    }
-
-    if (!result.success && !result.skipped) {
-      await env.DB.prepare(
-        `INSERT INTO pending_pushes (event_type, payload_json, retry_count, next_retry_at, created_at, last_error, subscriber_id, event_id)
-         VALUES (?, ?, ?, NULL, ?, ?, ?, ?)`,
-      )
-        .bind(
-          envelope.event,
-          JSON.stringify(envelope),
-          row.retry_count ?? 0,
-          new Date().toISOString(),
-          result.error_message ?? "piggyback failed",
-          row.subscriber_id ?? null,
-          ensureEventId(envelope).event_id || null,
-        )
-        .run();
-    }
   }
   return sentThisCall;
 }

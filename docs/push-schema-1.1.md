@@ -8,6 +8,8 @@ Additive, backward-compatible evolution of `hkjc-push/1.0`.
 - Full event bodies are stored once in D1 `push_events` and replayable via `GET /v1/events`.
 - Delivery is decoupled: each `(event_id, subscriber)` is enqueued to Cloudflare Queue `hkjc-push-deliveries` (binding `PUSH_QUEUE`) so fan-out/retries never share one Worker's subrequest budget. Without the binding (tests/local), the worker falls back to direct HTTP send.
 - Per-subscriber circuit breaker (`closed` / `open` / `half_open`) stops HTTP to a failing receiver without deleting the subscriber; ledger replay via `/v1/events` remains available.
+- Per-subscriber delivery rate limit (`PUSH_RATE_PER_SUB_PER_SEC`, default 2): excess is delayed via queue `delaySeconds` (or short `pending_pushes` deferral on the direct path) — **never dropped**.
+- Backlog coalescing: when a subscriber has a pending/retrying backlog (circuit reopen, outage, legacy rows), `odds_delta` changes are merged per meeting into one or more size-bounded `backlog_replay` pushes; non-odds events of the same type collapse to the latest.
 
 ## Odds basis
 
@@ -74,18 +76,19 @@ Pool turnover (when available) is exposed only on `pools[].investment` as the **
         "injury_update",
         "runs_update",
         "dividends",
-        "changes"
+        "changes",
+        "backlog_replay"
       ]
     },
     "event_id": {
       "type": "string",
       "format": "uuid",
-      "description": "UUID v4; unique per event; identical across subscribers and retries"
+      "description": "UUID v4; unique per event; identical across subscribers and retries. backlog_replay allocates a NEW event_id; originals remain in push_events and are listed in meta.coalesced_event_ids."
     },
     "seq": {
       "type": "integer",
       "minimum": 1,
-      "description": "Monotonic per meeting_date+venue (global * for null meeting)"
+      "description": "Monotonic per meeting_date+venue (global * for null meeting). backlog_replay allocates a NEW seq; each merged change keeps its originating seq on the change row; meta.covered_seq_from/to spans the coalesced range."
     },
     "captured_at": {
       "type": "string",
@@ -133,12 +136,17 @@ Pool turnover (when available) is exposed only on `pools[].investment` as the **
     },
     "changes": {
       "type": "array",
-      "description": "Present on odds_delta",
-      "items": { "$ref": "#/$defs/oddsDeltaChange" }
+      "description": "Present on odds_delta and backlog_replay. On backlog_replay each item is an oddsDeltaChange plus originating seq/captured_at (and optional source_event_id).",
+      "items": {
+        "oneOf": [
+          { "$ref": "#/$defs/oddsDeltaChange" },
+          { "$ref": "#/$defs/backlogOddsChange" }
+        ]
+      }
     },
     "pools": {
       "type": "array",
-      "description": "Present on odds_delta; pool total turnover only",
+      "description": "Present on odds_delta / backlog_replay; pool total turnover only",
       "items": { "$ref": "#/$defs/poolInvestment" }
     },
     "last_change_seq": {
@@ -151,13 +159,18 @@ Pool turnover (when available) is exposed only on `pools[].investment` as the **
     },
     "meta": {
       "type": "object",
-      "additionalProperties": true
+      "additionalProperties": true,
+      "description": "For backlog_replay: covered_seq_from, covered_seq_to, coalesced_count, coalesced_event_ids, optional chunk_index/chunk_total, reason"
     }
   },
   "allOf": [
     {
       "if": { "properties": { "event": { "const": "odds_delta" } } },
       "then": { "required": ["changes", "pools"] }
+    },
+    {
+      "if": { "properties": { "event": { "const": "backlog_replay" } } },
+      "then": { "required": ["changes", "pools", "meta"] }
     },
     {
       "if": { "properties": { "event": { "const": "no_update" } } },
@@ -241,6 +254,31 @@ Pool turnover (when available) is exposed only on `pools[].investment` as the **
         "pool_status": { "type": ["string", "null"] }
       }
     },
+    "backlogOddsChange": {
+      "description": "oddsDeltaChange annotated with the originating event identity/time (backlog_replay only). Intermediate prev→new steps are preserved in order — nothing is collapsed away.",
+      "allOf": [
+        { "$ref": "#/$defs/oddsDeltaChange" },
+        {
+          "type": "object",
+          "required": ["seq", "captured_at"],
+          "properties": {
+            "seq": {
+              "type": "integer",
+              "description": "seq of the original odds_delta that produced this change"
+            },
+            "captured_at": {
+              "type": "string",
+              "description": "captured_at of the original odds_delta"
+            },
+            "source_event_id": {
+              "type": "string",
+              "format": "uuid",
+              "description": "event_id of the original odds_delta when known"
+            }
+          }
+        }
+      ]
+    },
     "poolInvestment": {
       "type": "object",
       "required": ["race_no", "bet_type", "investment"],
@@ -257,6 +295,30 @@ Pool turnover (when available) is exposed only on `pools[].investment` as the **
   }
 }
 ```
+
+## `backlog_replay` semantics
+
+When a subscriber accumulates a pending/retrying backlog (e.g. after circuit reopen/reset or outage), the worker **does not** HTTP-replay each stored event one-by-one. Instead, per `meeting_date`+`venue`:
+
+| Source events | Coalesce rule |
+|---|---|
+| `odds_delta` | Concatenate every `changes[]` row **in seq order**. Each row keeps its own `prev_odds` / `new_odds` and is annotated with originating `seq` + `captured_at` (+ `source_event_id`). Chunked by `PUSH_BACKLOG_MAX_CHANGES` (default 200). |
+| Any other type | Same `event` → keep **latest** only (highest seq). |
+
+The coalesced push uses:
+
+- `event`: `"backlog_replay"`
+- **new** `event_id` (UUID) and **new** monotonic `seq` (ledgered like any other event)
+- `meta.covered_seq_from` / `meta.covered_seq_to`: inclusive seq range of coalesced sources
+- `meta.coalesced_event_ids`: original `event_id`s (still queryable via `/v1/events/:id`)
+- `meta.chunk_index` / `meta.chunk_total`: when size-bounded into multiple pushes
+- `meta.reason`: e.g. `"pending_backlog"`
+
+Receivers that need exact per-tick history can still walk `/v1/events?since_seq=` over the covered range; `backlog_replay` is a delivery optimization so webhook endpoints are not flooded after an outage.
+
+## Rate limit
+
+`PUSH_RATE_PER_SUB_PER_SEC` (default **2**) caps HTTP POSTs per subscriber per second. Excess deliveries are **delayed** (Cloudflare Queue `delaySeconds`, or a short `pending_pushes` deferral on the direct path) and never dropped. `/health` exposes `push_queue.rate_limit_delays` and per-subscriber `backlog_size` / `rate_limit_delays`.
 
 ## Replay API
 

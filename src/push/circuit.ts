@@ -21,6 +21,10 @@ export interface CircuitSnapshot {
   last_failure_at: string | null;
   last_http_status: number | null;
   last_error: string | null;
+  /** Active pending_pushes rows for this subscriber (non-gave_up). */
+  backlog_size?: number;
+  /** Cumulative deliveries delayed by per-subscriber rate limit. */
+  rate_limit_delays?: number;
 }
 
 export function circuitFailureThreshold(env: Env): number {
@@ -272,22 +276,33 @@ export async function listCircuitSnapshots(env: Env): Promise<CircuitSnapshot[]>
     last_error: string | null;
   }>();
 
-  const rows: CircuitSnapshot[] = (results ?? []).map((row) => ({
-    subscriber_id: row.id,
-    url: row.url,
-    circuit_state: parseState(row.circuit_state),
-    consecutive_failures: row.consecutive_failures ?? 0,
-    consecutive_429s: row.consecutive_429s ?? 0,
-    circuit_opened_at: row.circuit_opened_at,
-    last_success_at: row.last_success_at,
-    last_failure_at: row.last_failure_at,
-    last_http_status: row.last_http_status,
-    last_error: row.last_error,
-  }));
+  const { getSubscriberBacklogSize } = await import("./coalesce");
+  const { getRateLimitDelayCount } = await import("./rate-limit");
+
+  const rows: CircuitSnapshot[] = [];
+  for (const row of results ?? []) {
+    rows.push({
+      subscriber_id: row.id,
+      url: row.url,
+      circuit_state: parseState(row.circuit_state),
+      consecutive_failures: row.consecutive_failures ?? 0,
+      consecutive_429s: row.consecutive_429s ?? 0,
+      circuit_opened_at: row.circuit_opened_at,
+      last_success_at: row.last_success_at,
+      last_failure_at: row.last_failure_at,
+      last_http_status: row.last_http_status,
+      last_error: row.last_error,
+      backlog_size: await getSubscriberBacklogSize(env, row.id),
+      rate_limit_delays: await getRateLimitDelayCount(env, row.id),
+    });
+  }
 
   // Include fallback target health when no subscriber rows exist.
   if (rows.length === 0 && env.PUSH_TARGET_URL?.trim()) {
-    rows.push(await getCircuitSnapshot(env, null));
+    const snap = await getCircuitSnapshot(env, null);
+    snap.backlog_size = await getSubscriberBacklogSize(env, null);
+    snap.rate_limit_delays = await getRateLimitDelayCount(env, null);
+    rows.push(snap);
   }
   return rows;
 }

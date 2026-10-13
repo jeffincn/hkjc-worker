@@ -17,7 +17,9 @@ export type PushEvent =
   | "injury_update"
   | "runs_update"
   | "dividends"
-  | "changes";
+  | "changes"
+  /** Coalesced replay of a subscriber backlog (see docs/push-schema-1.1.md). */
+  | "backlog_replay";
 
 /** HKJC GraphQL WIN/PLA oddsValue is decimal: total return per $1 incl. stake. */
 export const ODDS_BASIS =
@@ -100,13 +102,22 @@ export interface PushEnvelope {
   source: PushSource;
   quality: PushQuality;
   races: PushRace[];
-  /** odds_delta payload */
+  /**
+   * odds_delta / backlog_replay payload.
+   * On backlog_replay each change keeps its own prev/new odds and is annotated
+   * with the originating event's `seq` + `captured_at` (see BacklogOddsChange).
+   */
   changes?: OddsDeltaChange[];
   /** Per-race WIN/PLA pool turnover (never per-horse). */
   pools?: OddsPoolInvestment[];
   /** no_update: last odds-changing event for this meeting */
   last_change_seq?: number | null;
   last_change_at?: string | null;
+  /**
+   * Free-form metadata. For `backlog_replay`:
+   * `covered_seq_from`, `covered_seq_to`, `coalesced_count`,
+   * `coalesced_event_ids`, optional `chunk_index` / `chunk_total`, `reason`.
+   */
   meta?: Record<string, unknown>;
 }
 
@@ -276,6 +287,7 @@ export function isLivePushEvent(event: PushEvent): boolean {
     event === "injury_update" ||
     event === "runs_update" ||
     event === "dividends" ||
-    event === "changes"
+    event === "changes" ||
+    event === "backlog_replay"
   );
 }
