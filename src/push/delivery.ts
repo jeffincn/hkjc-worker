@@ -36,6 +36,8 @@ export interface SubscriberDelivery {
   rate_limit_delay_seconds?: number;
   /** True when skipped: identical stable body already delivered to this sub. */
   skipped_dedupe?: boolean;
+  /** True when skipped: subscriber raceday window closed / not applicable. */
+  skipped_window?: boolean;
 }
 
 export interface ResolvedTarget {

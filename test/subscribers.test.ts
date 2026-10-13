@@ -282,6 +282,8 @@ describe("admin subscribers API", () => {
       url: "https://x",
       secret: "hidden",
       enabled: true,
+      active_window: "always",
+      window_before_sec: 10800,
       created_at: "",
       updated_at: "",
     }).has_secret).toBe(true);

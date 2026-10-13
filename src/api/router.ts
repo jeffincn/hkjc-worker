@@ -462,6 +462,8 @@ async function createPushSubscriber(request: Request, env: Env): Promise<Respons
     url?: string;
     secret?: string | null;
     enabled?: boolean;
+    active_window?: string;
+    window_before_sec?: number;
   } | null;
   if (!body || typeof body.url !== "string") {
     return jsonError(400, "url is required");
@@ -471,6 +473,8 @@ async function createPushSubscriber(request: Request, env: Env): Promise<Respons
       url: body.url,
       secret: body.secret,
       enabled: body.enabled,
+      active_window: body.active_window,
+      window_before_sec: body.window_before_sec,
     });
     return jsonOk({ subscriber: toPublicSubscriber(row) }, 201);
   } catch (err) {
@@ -495,6 +499,8 @@ async function updatePushSubscriber(
     url?: string;
     secret?: string | null;
     enabled?: boolean;
+    active_window?: string;
+    window_before_sec?: number;
   } | null;
   if (!body || typeof body !== "object") {
     return jsonError(400, "JSON body required");

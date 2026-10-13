@@ -7,11 +7,31 @@ export const AGENT_WEBHOOK_URL = "https://hkjc-agent.cf-connect.top/webhook";
 export const WEBHOOK_SITE_URL =
   "https://webhook.site/902a6166-6336-452d-97c5-e64018d97919";
 
+/** Default: 3 hours before first race post. */
+export const DEFAULT_SUBSCRIBER_WINDOW_BEFORE_SEC = 10_800;
+
+export type ActiveWindowMode = "always" | "raceday";
+
+export function parseActiveWindow(raw: unknown): ActiveWindowMode {
+  if (raw === "raceday") return "raceday";
+  return "always";
+}
+
+export function parseWindowBeforeSec(raw: unknown): number {
+  const n = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(n) || n < 0) return DEFAULT_SUBSCRIBER_WINDOW_BEFORE_SEC;
+  return Math.floor(n);
+}
+
 export interface PushSubscriber {
   id: number;
   url: string;
   secret: string | null;
   enabled: boolean;
+  /** always = all events; raceday = only meeting window. */
+  active_window: ActiveWindowMode;
+  /** Seconds before first race post when raceday window opens (default 10800). */
+  window_before_sec: number;
   created_at: string;
   updated_at: string;
   consecutive_failures?: number;
@@ -30,6 +50,8 @@ export interface PushSubscriberPublic {
   url: string;
   enabled: boolean;
   has_secret: boolean;
+  active_window: ActiveWindowMode;
+  window_before_sec: number;
   created_at: string;
   updated_at: string;
   circuit_state: string;
@@ -48,6 +70,8 @@ export function toPublicSubscriber(row: PushSubscriber): PushSubscriberPublic {
     url: row.url,
     enabled: row.enabled,
     has_secret: !!(row.secret && row.secret.length > 0),
+    active_window: row.active_window,
+    window_before_sec: row.window_before_sec,
     created_at: row.created_at,
     updated_at: row.updated_at,
     circuit_state: row.circuit_state ?? "closed",
@@ -86,6 +110,8 @@ function mapSubscriberRow(r: {
   url: string;
   secret: string | null;
   enabled: number;
+  active_window?: string | null;
+  window_before_sec?: number | null;
   created_at: string;
   updated_at: string;
   consecutive_failures?: number | null;
@@ -102,6 +128,10 @@ function mapSubscriberRow(r: {
     url: r.url,
     secret: r.secret,
     enabled: r.enabled === 1,
+    active_window: parseActiveWindow(r.active_window),
+    window_before_sec: parseWindowBeforeSec(
+      r.window_before_sec ?? DEFAULT_SUBSCRIBER_WINDOW_BEFORE_SEC,
+    ),
     created_at: r.created_at,
     updated_at: r.updated_at,
     consecutive_failures: r.consecutive_failures ?? 0,
@@ -116,6 +146,8 @@ function mapSubscriberRow(r: {
 }
 
 const SUBSCRIBER_SELECT = `SELECT id, url, secret, enabled, created_at, updated_at,
+       IFNULL(active_window, 'always') AS active_window,
+       IFNULL(window_before_sec, ${DEFAULT_SUBSCRIBER_WINDOW_BEFORE_SEC}) AS window_before_sec,
        IFNULL(consecutive_failures, 0) AS consecutive_failures,
        IFNULL(consecutive_429s, 0) AS consecutive_429s,
        IFNULL(circuit_state, 'closed') AS circuit_state,
@@ -131,6 +163,8 @@ export async function listSubscribers(env: Env): Promise<PushSubscriber[]> {
     url: string;
     secret: string | null;
     enabled: number;
+    active_window: string;
+    window_before_sec: number;
     created_at: string;
     updated_at: string;
     consecutive_failures: number;
@@ -170,6 +204,8 @@ export async function getSubscriber(
       url: string;
       secret: string | null;
       enabled: number;
+      active_window: string;
+      window_before_sec: number;
       created_at: string;
       updated_at: string;
       consecutive_failures: number;
@@ -185,9 +221,51 @@ export async function getSubscriber(
   return mapSubscriberRow(r);
 }
 
+export interface SubscriberWriteInput {
+  url: string;
+  secret?: string | null;
+  enabled?: boolean;
+  active_window?: ActiveWindowMode | string;
+  window_before_sec?: number;
+}
+
+export interface SubscriberPatch {
+  url?: string;
+  secret?: string | null;
+  enabled?: boolean;
+  active_window?: ActiveWindowMode | string;
+  window_before_sec?: number;
+}
+
+function normalizeWindowFields(input: {
+  active_window?: ActiveWindowMode | string;
+  window_before_sec?: number;
+}): { active_window: ActiveWindowMode; window_before_sec: number } {
+  if (
+    input.active_window !== undefined &&
+    input.active_window !== "always" &&
+    input.active_window !== "raceday"
+  ) {
+    throw new Error("active_window must be 'always' or 'raceday'");
+  }
+  const active_window =
+    input.active_window !== undefined
+      ? parseActiveWindow(input.active_window)
+      : "always";
+  let window_before_sec = DEFAULT_SUBSCRIBER_WINDOW_BEFORE_SEC;
+  if (input.window_before_sec !== undefined) {
+    const n = Number(input.window_before_sec);
+    if (!Number.isFinite(n) || n < 0) {
+      throw new Error("window_before_sec must be a non-negative number");
+    }
+    window_before_sec = Math.floor(n);
+  }
+  return { active_window, window_before_sec };
+}
+
 export async function createSubscriber(
   env: Env,
-  input: { url: string; secret?: string | null; enabled?: boolean },
+  input: SubscriberWriteInput,
 ): Promise<PushSubscriber> {
   const url = input.url.trim();
   if (!url) throw new Error("url is required");
@@ -202,12 +280,16 @@ export async function createSubscriber(
     typeof input.secret === "string" && input.secret.trim() !== ""
       ? input.secret.trim()
       : null;
+  const { active_window, window_before_sec } = normalizeWindowFields({
+    active_window: input.active_window ?? "always",
+    window_before_sec: input.window_before_sec,
+  });
 
   const result = await env.DB.prepare(
-    `INSERT INTO push_subscribers (url, secret, enabled, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?)`,
+    `INSERT INTO push_subscribers (url, secret, enabled, active_window, window_before_sec, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
   )
-    .bind(url, secret, enabled, ts, ts)
+    .bind(url, secret, enabled, active_window, window_before_sec, ts, ts)
     .run();
 
   const id = result.meta.last_row_id;
@@ -220,7 +302,7 @@ export async function createSubscriber(
 export async function updateSubscriber(
   env: Env,
   id: number,
-  patch: { url?: string; secret?: string | null; enabled?: boolean },
+  patch: SubscriberPatch,
 ): Promise<PushSubscriber | null> {
   const existing = await getSubscriber(env, id);
   if (!existing) return null;
@@ -247,13 +329,29 @@ export async function updateSubscriber(
 
   const enabled =
     patch.enabled === undefined ? (existing.enabled ? 1 : 0) : patch.enabled ? 1 : 0;
+
+  let active_window = existing.active_window;
+  let window_before_sec = existing.window_before_sec;
+  if (patch.active_window !== undefined || patch.window_before_sec !== undefined) {
+    const normalized = normalizeWindowFields({
+      active_window: patch.active_window ?? existing.active_window,
+      window_before_sec:
+        patch.window_before_sec !== undefined
+          ? patch.window_before_sec
+          : existing.window_before_sec,
+    });
+    active_window = normalized.active_window;
+    window_before_sec = normalized.window_before_sec;
+  }
+
   const ts = nowIso();
 
   await env.DB.prepare(
-    `UPDATE push_subscribers SET url = ?, secret = ?, enabled = ?, updated_at = ?
+    `UPDATE push_subscribers
+     SET url = ?, secret = ?, enabled = ?, active_window = ?, window_before_sec = ?, updated_at = ?
      WHERE id = ?`,
   )
-    .bind(url, secret, enabled, ts, id)
+    .bind(url, secret, enabled, active_window, window_before_sec, ts, id)
     .run();
 
   return getSubscriber(env, id);

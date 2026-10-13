@@ -124,6 +124,8 @@ CREATE TABLE IF NOT EXISTS push_subscribers (
   url TEXT NOT NULL UNIQUE,
   secret TEXT,
   enabled INTEGER NOT NULL DEFAULT 1,
+  active_window TEXT NOT NULL DEFAULT 'always',
+  window_before_sec INTEGER NOT NULL DEFAULT 10800,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   consecutive_failures INTEGER NOT NULL DEFAULT 0,

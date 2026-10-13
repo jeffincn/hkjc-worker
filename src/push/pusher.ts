@@ -30,6 +30,10 @@ import {
   listEnabledSubscribers,
   type PushSubscriber,
 } from "./subscribers";
+import {
+  gateSubscriberDelivery,
+  maybeDeliverWindowOpenSnapshot,
+} from "./subscriber-window";
 
 /** pending_pushes INSERT with undefined→null binds + write tracking. */
 async function insertPendingPushRow(
@@ -273,9 +277,10 @@ export async function sendPushToSubscriber(
   opts?: { fetchImpl?: typeof fetch },
 ): Promise<PushResult> {
   let target: ResolvedTarget | null = null;
+  let sub: PushSubscriber | null = null;
 
   if (subscriberId != null) {
-    const sub = await getSubscriber(env, subscriberId);
+    sub = await getSubscriber(env, subscriberId);
     if (!sub || !sub.enabled) {
       return {
         skipped: true,
@@ -302,6 +307,45 @@ export async function sendPushToSubscriber(
       url: fallback,
       secret: env.PUSH_SECRET?.trim() || null,
     };
+  }
+
+  const windowGate = await gateSubscriberDelivery(env, sub, envelope);
+  if (!windowGate.allowed) {
+    return {
+      skipped: true,
+      reason: windowGate.reason ?? "outside active window",
+      http_status: null,
+      success: false,
+      retry_count: 0,
+      deliveries: [
+        {
+          subscriber_id: target.subscriber_id,
+          url: target.url,
+          http_status: null,
+          success: true,
+          signed: !!(target.secret && target.secret.length > 0),
+          skipped_window: true,
+          error_message: windowGate.reason,
+        },
+      ],
+    };
+  }
+
+  if (
+    sub &&
+    sub.active_window === "raceday" &&
+    envelope.meeting_date &&
+    envelope.venue
+  ) {
+    await maybeDeliverWindowOpenSnapshot({
+      env,
+      subscriber: sub,
+      target,
+      meeting_date: envelope.meeting_date,
+      venue: envelope.venue,
+      context: windowGate.context,
+      fetchImpl: opts?.fetchImpl,
+    });
   }
 
   const delivery = await attemptDelivery(env, envelope, target, opts?.fetchImpl ?? fetch);
@@ -423,6 +467,17 @@ async function flushSubscriberPending(
 
   if (coalesce) {
     const deliveries = await buildCoalescedDeliveries(env, rows);
+    // If the subscriber is outside its raceday window, leave rows untouched.
+    if (deliveries.length > 0) {
+      const sub =
+        subscriberId != null ? await getSubscriber(env, subscriberId) : null;
+      const gate = await gateSubscriberDelivery(
+        env,
+        sub,
+        deliveries[0]!.envelope,
+      );
+      if (!gate.allowed) return 0;
+    }
     const allIds = [...new Set(deliveries.flatMap((d) => d.source_row_ids))];
     await deletePendingRows(env, allIds);
 
@@ -502,6 +557,13 @@ async function flushSubscriberPending(
     if (state.rateLimitedSubscribers.has(subKey)) break;
 
     const envelope = await resolveRetryEnvelope(env, row);
+    const sub =
+      subscriberId != null ? await getSubscriber(env, subscriberId) : null;
+    const gate = await gateSubscriberDelivery(env, sub, envelope);
+    if (!gate.allowed) {
+      // Leave row for a later in-window flush (do not delete / do not retry-bump).
+      continue;
+    }
     await deletePendingRows(env, [row.id]);
     const outcome = await sendOrDeferPending(
       env,
