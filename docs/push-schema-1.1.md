@@ -101,6 +101,7 @@ A full snapshot for a meeting includes all available races (live tick + D1 fill 
         "whitelist_alert",
         "source_blocked",
         "source_recovered",
+        "odds_coverage_gap",
         "horse_update",
         "injury_update",
         "runs_update",

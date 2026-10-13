@@ -124,6 +124,7 @@ export const MEETING_SNAPSHOT_EVENTS = new Set<PushEvent>([
   "whitelist_alert",
   "source_blocked",
   "source_recovered",
+  "odds_coverage_gap",
 ]);
 
 export function raceNosOf(envelope: PushEnvelope): number[] {

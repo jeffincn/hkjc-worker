@@ -47,6 +47,11 @@ import {
   raceHasPublishedDividends,
   setMeta,
 } from "../store/db";
+import {
+  evaluateAndAlertCoverageGaps,
+  recordPollTicks,
+  type PollTickInput,
+} from "../store/poll-ticks";
 import { addGraphqlUsage } from "../store/usage";
 import { createSubrequestBudget } from "../util/budget";
 import { runStage } from "../util/stage";
@@ -296,6 +301,8 @@ export class MeetingPoller implements DurableObject {
       }> = [];
       const latestRaces: PushRace[] = [];
       let anyPushThisTick = false;
+      const pollTickInputs: PollTickInput[] = [];
+      const tickAt = new Date(nowMs).toISOString();
 
       await runStage(this.env, "odds", async () => {
         budget.charge(1, { force: true });
@@ -327,6 +334,7 @@ export class MeetingPoller implements DurableObject {
             bettingOpen = true;
           }
           const pushRace = toPushRace(snap);
+          let oddsChanged = false;
 
           if (isStorableOddsSnapshot(snap)) {
             latestRaces.push(pushRace);
@@ -350,6 +358,7 @@ export class MeetingPoller implements DurableObject {
               this.env,
             );
             if (ins.inserted) {
+              oddsChanged = true;
               changed.push(pushRace);
               deltaRaceNos.push(race.race_no);
               changedMeta.push({
@@ -390,6 +399,13 @@ export class MeetingPoller implements DurableObject {
             }
           }
 
+          // Presence proof even when hash dedupe skipped the snapshot write (R1b).
+          pollTickInputs.push({
+            race_no: race.race_no,
+            changed: oddsChanged,
+            tick_time: tickAt,
+          });
+
           if (resultsComplete(race) && !cfg.result_races.includes(race.race_no)) {
             cfg.result_races.push(race.race_no);
             await runStage(this.env, "pushes", async () => {
@@ -405,6 +421,23 @@ export class MeetingPoller implements DurableObject {
               anyPushThisTick = true;
             });
           }
+        }
+
+        if (pollTickInputs.length > 0) {
+          await recordPollTicks(
+            this.env,
+            meeting.meeting_date,
+            meeting.venue,
+            pollTickInputs,
+          );
+          await evaluateAndAlertCoverageGaps(this.env, {
+            meeting_date: meeting.meeting_date,
+            venue: meeting.venue,
+            race_nos: pollTickInputs.map((t) => t.race_no),
+            captured_at,
+            sample_interval_s,
+            nowMs,
+          });
         }
       }, { onError: onFetchError });
 

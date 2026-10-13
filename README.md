@@ -142,7 +142,11 @@ curl -s "$BASE/health" | jq .
     "pushes": null
   },
   "backfill": { "completed_meetings": 0, "from": null, "to": null },
-  "alerts": { "whitelist_error": "" }
+  "gaps": {
+    "odds_coverage_threshold_ms": 600000,
+    "odds_coverage": null
+  },
+  "alerts": { "whitelist_error": "", "odds_coverage_gap": null }
 }
 ```
 
@@ -151,6 +155,7 @@ curl -s "$BASE/health" | jq .
 - `push_queue.rate_limit_delays`：因 per-subscriber 速率限制而 **延迟**（非丢弃）的累计次数；`subscribers[].backlog_size` / `rate_limit_delays` 为每订阅者视图。
 - 熔断打开时不会自动删除订阅者；事件仍在 `push_events`，可用 `/v1/events` 回放。
 - `gave_up` **仅**适用于 pre-1.1 legacy（空 `event_id` + `created_at` 早于 `PUSH_1_1_DEPLOY_CUTOFF` + 非 1.1 schema）；赛日 live 推送永不会被放弃。
+- `gaps.odds_coverage` / `alerts.odds_coverage_gap`：来自 `worker_meta` 的廉价读取（非表扫描）。任一赛场 `poll_ticks` 间隔 **>10 分钟** → `COLLECTION_FAILURE`（R2），并推送一次 `odds_coverage_gap`（签名去重；仍走安静时段 / Manus 窗口门闩）。
 
 若 HKJC 更换白名单 query，`alerts.whitelist_error` 会出现 `WHITELIST_ERROR` 文案。
 
@@ -283,9 +288,26 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 参数同 latest；返回该场全部快照时间序列（仅 **内容变化** 时写入新行）。每条快照的 `runners[]` 同样带 `horse_code`。
 
+另含 `coverage`：基于 `poll_ticks`（**每次轮询每场一行**，不压实）的区间分类——`STATIC`（有 tick、间隔 ≤10 分钟）与 `MISSING`（间隔 >10 分钟 = `COLLECTION_FAILURE`）。可选 `from`/`to`（ISO）对任意 `(race, time_range)` 直接回答 `coverage.range.kind` = `STATIC` | `MISSING`（issue #26 A2）。
+
 ```bash
 curl -s -H "Authorization: Bearer $TOKEN" \
   "$BASE/v1/odds/history?date=2026-10-07&venue=HV&race_no=1" | jq .
+
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "$BASE/v1/odds/history?date=2026-10-07&venue=HV&race_no=1&from=2026-10-07T12:00:00.000Z&to=2026-10-07T13:00:00.000Z" \
+  | jq .coverage.range
+```
+
+---
+
+### 3.5.1 `GET /v1/odds/coverage`
+
+赔率轮询存在证明（issue #26 R1b）。`date`+`venue` 必填；可选 `race_no`。返回每条 `poll_ticks` 行、缺口（`COLLECTION_FAILURE`）与 `STATIC`/`MISSING` 区间。
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "$BASE/v1/odds/coverage?date=2026-10-07&venue=HV&race_no=1" | jq .
 ```
 
 ---
@@ -678,7 +700,7 @@ curl -s -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/v1/admin/subscribers/
 
 | 事件 | 默认（`false`） | 说明 |
 |---|---|---|
-| `test` / `schedule` / `backfill_progress` / `whitelist_alert` / `source_blocked` / `source_recovered` | 仍可推 | 联调与告警 |
+| `test` / `schedule` / `backfill_progress` / `whitelist_alert` / `source_blocked` / `source_recovered` / `odds_coverage_gap` | 仍可推 | 联调与告警 |
 | `odds_update` / `odds_delta` / `no_update` / `lock` / `scratch` / `result` / `horse_update` / `injury_update` / `runs_update` / `dividends` / `changes` / `backlog_replay` | **跳过** | 确认 `test` 后再开 |
 
 ### 4.5 事件类型与完整 JSON 示例
@@ -1041,6 +1063,7 @@ app.post("/hook", express.raw({ type: "application/json" }), (req, res) => {
 |---|---|
 | `meetings` / `races` / `runners` | 赛事树（`runners.horse_code` = HKJC 品牌号，可空） |
 | `odds_snapshots` | 赔率快照（`raw_json` + `content_hash`）；仅 hash 变才新行 |
+| `poll_ticks` | 每次轮询每场一行存在证明 `(meeting_date, venue, race_no, tick_time, changed)`；**不压实**（C1）；区分 STATIC 与 MISSING/COLLECTION_FAILURE（migration 0011 / R1b） |
 | `results` | 名次、最终赔率、派彩 JSON |
 | `change_events` | 退出/骑师变更等 |
 | `push_subscribers` | Webhook 订阅者（url / secret / enabled / `active_window` / `window_before_sec` / `quiet_start` / `quiet_end`）；Admin API 管理 |
@@ -1235,6 +1258,7 @@ npx wrangler secret put LIVE_PUSH_ENABLED   # 设为 true
 2. **Upsert 同值 no-op**：`ON CONFLICT DO UPDATE … WHERE … IS DISTINCT FROM …`，cron/回填路径也不会重写相同行。  
 3. **`last_fetch_at`**：每次 poll 写入 DO storage；**最多每 5 分钟**刷到 D1（`/health` 仍读 D1）。  
 4. **赔率快照**：仍用 `insertOddsSnapshotIfChanged`（hash 去重）；推送见 §4.3（`odds_delta` 为主，`odds_update` 门控；`lock`/`result` 每场一次）。
+5. **`poll_ticks`（migration 0011 / R1b）**：每次成功拉取赔率后，**每场插入一行** `(tick_time, changed)`（不压实、不合併——C1）；计为 **essential/odds** 写入。不改动 `odds_snapshots` hash 去重（C2），不加 TTL（C3）。`/v1/odds/history?from=&to=` 可答 STATIC vs MISSING；缺口 >10 分钟 = `COLLECTION_FAILURE`。
 
 ### 预期写入量（量级）
 
