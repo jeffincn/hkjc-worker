@@ -107,9 +107,10 @@ describe("hkjc-push/1.1 seq + ledger + delta + heartbeat + replay", () => {
 
   it("computes odds_delta with prev null on first observation and prev/new on change", () => {
     const first = snap("4.0", "1.8");
+    // Cloth-keyed names still resolve via horse_no fallback.
     const names = new Map([
-      [1, { horse_name_en: "ALPHA", horse_name_ch: "甲" }],
-      [2, { horse_name_en: "BETA", horse_name_ch: "乙" }],
+      ["1", { horse_name_en: "ALPHA", horse_name_ch: "甲" }],
+      ["2", { horse_name_en: "BETA", horse_name_ch: "乙" }],
     ]);
     const firstChanges = computeOddsDeltaChanges({
       prev: null,
@@ -122,6 +123,9 @@ describe("hkjc-push/1.1 seq + ledger + delta + heartbeat + replay", () => {
     const win1 = firstChanges.find((c) => c.runner_no === 1 && c.bet_type === "WIN");
     expect(win1?.new_odds).toBe(4);
     expect(win1?.horse_name_ch).toBe("甲");
+    expect(win1?.runner_id).toBeTruthy();
+    expect(win1?.status).toBe("Declared");
+    expect(win1?.pool).toBe("WIN");
 
     const second = snap("3.5", "1.7");
     const delta = computeOddsDeltaChanges({
@@ -136,6 +140,7 @@ describe("hkjc-push/1.1 seq + ledger + delta + heartbeat + replay", () => {
       prev_odds: 4,
       new_odds: 3.5,
       runner_no: 1,
+      horse_no: 1,
     });
   });
 

@@ -18,6 +18,7 @@ import {
   type CoalesceBatch,
 } from "./odds-policy";
 import { allocatePushSeq, getLastChange } from "./seq";
+import { buildCompleteSnapshotRaces } from "./snapshot-coverage";
 
 export type FullSnapshotByRace = Record<string, number>;
 
@@ -190,6 +191,8 @@ export async function emitIdleKeepalive(args: {
   source_last_updated_at: string | null;
   /** Latest push races for this meeting (from current tick fetch). */
   latestRaces: PushRace[];
+  /** Meeting card race numbers (for coverage / D1 fill). */
+  expectedRaceNos?: number[];
   /** Inside [first_post - before, final dividends). */
   inHighFreqWindow: boolean;
 }): Promise<{
@@ -214,9 +217,13 @@ export async function emitIdleKeepalive(args: {
     };
   }
 
-  const raceNos = args.latestRaces.map((r) => r.race_no);
+  const expected =
+    args.expectedRaceNos && args.expectedRaceNos.length > 0
+      ? args.expectedRaceNos
+      : args.latestRaces.map((r) => r.race_no);
+  const raceNos = expected;
   const snapshotDue =
-    args.latestRaces.length > 0 &&
+    (args.latestRaces.length > 0 || expected.length > 0) &&
     anyPeriodicSnapshotDue({
       env: args.env,
       nowMs: args.nowMs,
@@ -228,14 +235,22 @@ export async function emitIdleKeepalive(args: {
     heartbeatDue,
     snapshotDue,
     forceMergedSnapshot: !args.inHighFreqWindow,
-    hasRaces: args.latestRaces.length > 0,
+    hasRaces: args.latestRaces.length > 0 || expected.length > 0,
   });
   if (kind === "odds_update") {
+    const { races: completeRaces, meta: coverage } =
+      await buildCompleteSnapshotRaces({
+        env: args.env,
+        meeting_date: args.meeting_date,
+        venue: args.venue,
+        expectedRaceNos: expected,
+        available: args.latestRaces,
+      });
     await emitPush(args.env, {
       event: "odds_update",
       meeting_date: args.meeting_date,
       venue: args.venue,
-      races: args.latestRaces,
+      races: completeRaces,
       captured_at: args.captured_at,
       sample_interval_s: args.sample_interval_s,
       source_last_updated_at: args.source_last_updated_at,
@@ -244,13 +259,14 @@ export async function emitIdleKeepalive(args: {
         merged_heartbeat: true,
         raceday_high_freq: args.inHighFreqWindow,
         heartbeat_interval_sec: Math.round(hbMs / 1000),
+        ...coverage,
       },
     });
     return {
       emitted: "odds_update",
       lastFullByRace: markFullSnapshots(
         args.lastFullByRace,
-        args.latestRaces,
+        completeRaces,
         args.nowMs,
       ),
       heartbeatIntervalMs: hbMs,
