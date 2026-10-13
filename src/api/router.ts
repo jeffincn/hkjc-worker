@@ -1,4 +1,5 @@
 import type { Env } from "../env";
+import { horseCodeFromRunnerFields } from "../parse/horse-code";
 import { getMeta } from "../store/db";
 import { jsonError, jsonOk, requireBearer } from "./auth";
 
@@ -61,6 +62,11 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
 
   const authErr = requireBearer(request, env);
   if (authErr) return authErr;
+
+  // Resolve brand code by meeting placement (before /v1/horses/:code)
+  if (path === "/v1/horses/resolve") {
+    return resolveHorseCode(env, url);
+  }
 
   // /v1/horses/:code[/runs|/injuries]
   const horseMatch = /^\/v1\/horses\/([^/]+)(?:\/(runs|injuries))?$/.exec(path);
@@ -310,17 +316,112 @@ async function listMeetings(env: Env, url: URL): Promise<Response> {
   return jsonOk({ meetings: results ?? [] });
 }
 
+/** Map cloth number → brand code for one race (D1 read, no HKJC). */
+async function horseCodeByCloth(
+  env: Env,
+  date: string,
+  venue: string,
+  raceNo: number,
+): Promise<Map<number, string>> {
+  const { results } = await env.DB.prepare(
+    `SELECT horse_no, horse_code FROM runners
+     WHERE meeting_date=? AND venue=? AND race_no=? AND horse_code IS NOT NULL`,
+  )
+    .bind(date, venue, raceNo)
+    .all<{ horse_no: number; horse_code: string }>();
+  const map = new Map<number, string>();
+  for (const r of results ?? []) {
+    if (r.horse_code) map.set(r.horse_no, r.horse_code);
+  }
+  return map;
+}
+
+function enrichOddsDataRunners(
+  data: unknown,
+  codeByCloth: Map<number, string>,
+): unknown {
+  if (!data || typeof data !== "object") return data;
+  const snap = data as {
+    runners?: Array<
+      Record<string, unknown> & {
+        horse_no?: number;
+        runner_id?: string;
+        horse_code?: string | null;
+      }
+    >;
+  };
+  if (!Array.isArray(snap.runners)) return data;
+  return {
+    ...snap,
+    runners: snap.runners.map((r) => {
+      const fromCloth =
+        r.horse_no != null ? (codeByCloth.get(Number(r.horse_no)) ?? null) : null;
+      const horse_code =
+        horseCodeFromRunnerFields({
+          horse_code: (r.horse_code as string | null | undefined) ?? fromCloth,
+          runner_id: (r.runner_id as string | null | undefined) ?? null,
+        }) ?? fromCloth;
+      return { ...r, horse_code };
+    }),
+  };
+}
+
 async function listRaces(env: Env, url: URL): Promise<Response> {
   const date = url.searchParams.get("date");
   const venue = url.searchParams.get("venue");
   if (!date || !venue) return jsonError(400, "date and venue required");
-  const { results } = await env.DB.prepare(
+  const { results: races } = await env.DB.prepare(
     `SELECT meeting_date, venue, race_no, post_time, status, distance, going, course_desc, course_code, race_class, data_source, updated_at
      FROM races WHERE meeting_date=? AND venue=? ORDER BY race_no`,
   )
     .bind(date, venue)
     .all();
-  return jsonOk({ date, venue, races: results ?? [] });
+  const { results: runners } = await env.DB.prepare(
+    `SELECT race_no, horse_no, horse_code, name_en, name_ch, status, barrier, handicap_weight,
+            jockey_en, trainer_en, last6run, data_source, updated_at
+     FROM runners WHERE meeting_date=? AND venue=? ORDER BY race_no, horse_no`,
+  )
+    .bind(date, venue)
+    .all<{
+      race_no: number;
+      horse_no: number;
+      horse_code: string | null;
+      name_en: string | null;
+      name_ch: string | null;
+      status: string | null;
+      barrier: number | null;
+      handicap_weight: number | null;
+      jockey_en: string | null;
+      trainer_en: string | null;
+      last6run: string | null;
+      data_source: string;
+      updated_at: string;
+    }>();
+  const byRace = new Map<number, typeof runners>();
+  for (const r of runners ?? []) {
+    const list = byRace.get(r.race_no) ?? [];
+    list.push(r);
+    byRace.set(r.race_no, list);
+  }
+  return jsonOk({
+    date,
+    venue,
+    races: (races ?? []).map((race) => ({
+      ...race,
+      runners: (byRace.get((race as { race_no: number }).race_no) ?? []).map((r) => ({
+        horse_no: r.horse_no,
+        horse_code: r.horse_code,
+        name_en: r.name_en,
+        name_ch: r.name_ch,
+        status: r.status,
+        barrier: r.barrier,
+        handicap_weight: r.handicap_weight,
+        jockey_en: r.jockey_en,
+        trainer_en: r.trainer_en,
+        last6run: r.last6run,
+      })),
+    })),
+  });
 }
 
 async function latestOdds(env: Env, url: URL): Promise<Response> {
@@ -328,12 +429,13 @@ async function latestOdds(env: Env, url: URL): Promise<Response> {
   const venue = url.searchParams.get("venue");
   const raceNo = url.searchParams.get("race_no");
   if (!date || !venue || !raceNo) return jsonError(400, "date, venue, race_no required");
+  const n = Number(raceNo);
   const row = await env.DB.prepare(
     `SELECT snapshot_time, content_hash, pool_status, raw_json, data_source, created_at
      FROM odds_snapshots WHERE meeting_date=? AND venue=? AND race_no=?
      ORDER BY id DESC LIMIT 1`,
   )
-    .bind(date, venue, Number(raceNo))
+    .bind(date, venue, n)
     .first<{
       snapshot_time: string;
       content_hash: string;
@@ -342,18 +444,19 @@ async function latestOdds(env: Env, url: URL): Promise<Response> {
       data_source: string;
       created_at: string;
     }>();
-  if (!row) return jsonOk({ date, venue, race_no: Number(raceNo), snapshot: null });
+  if (!row) return jsonOk({ date, venue, race_no: n, snapshot: null });
+  const codeByCloth = await horseCodeByCloth(env, date, venue, n);
   return jsonOk({
     date,
     venue,
-    race_no: Number(raceNo),
+    race_no: n,
     snapshot: {
       snapshot_time: row.snapshot_time,
       content_hash: row.content_hash,
       pool_status: row.pool_status,
       data_source: row.data_source,
       created_at: row.created_at,
-      data: JSON.parse(row.raw_json),
+      data: enrichOddsDataRunners(JSON.parse(row.raw_json), codeByCloth),
     },
   });
 }
@@ -363,12 +466,13 @@ async function oddsHistory(env: Env, url: URL): Promise<Response> {
   const venue = url.searchParams.get("venue");
   const raceNo = url.searchParams.get("race_no");
   if (!date || !venue || !raceNo) return jsonError(400, "date, venue, race_no required");
+  const n = Number(raceNo);
   const { results } = await env.DB.prepare(
     `SELECT snapshot_time, content_hash, pool_status, raw_json, data_source, created_at
      FROM odds_snapshots WHERE meeting_date=? AND venue=? AND race_no=?
      ORDER BY id ASC`,
   )
-    .bind(date, venue, Number(raceNo))
+    .bind(date, venue, n)
     .all<{
       snapshot_time: string;
       content_hash: string;
@@ -377,17 +481,18 @@ async function oddsHistory(env: Env, url: URL): Promise<Response> {
       data_source: string;
       created_at: string;
     }>();
+  const codeByCloth = await horseCodeByCloth(env, date, venue, n);
   return jsonOk({
     date,
     venue,
-    race_no: Number(raceNo),
+    race_no: n,
     snapshots: (results ?? []).map((r) => ({
       snapshot_time: r.snapshot_time,
       content_hash: r.content_hash,
       pool_status: r.pool_status,
       data_source: r.data_source,
       created_at: r.created_at,
-      data: JSON.parse(r.raw_json),
+      data: enrichOddsDataRunners(JSON.parse(r.raw_json), codeByCloth),
     })),
   });
 }
@@ -397,8 +502,16 @@ async function listResults(env: Env, url: URL): Promise<Response> {
   const venue = url.searchParams.get("venue");
   if (!date || !venue) return jsonError(400, "date and venue required");
   const { results } = await env.DB.prepare(
-    `SELECT meeting_date, venue, race_no, horse_no, final_position, dead_heat, win_odds, place_odds, dividends_json, data_source, updated_at
-     FROM results WHERE meeting_date=? AND venue=? ORDER BY race_no, horse_no`,
+    `SELECT r.meeting_date, r.venue, r.race_no, r.horse_no,
+            COALESCE(r.horse_code, u.horse_code) AS horse_code,
+            r.final_position, r.dead_heat, r.win_odds, r.place_odds,
+            r.dividends_json, r.data_source, r.updated_at
+     FROM results r
+     LEFT JOIN runners u
+       ON u.meeting_date=r.meeting_date AND u.venue=r.venue
+      AND u.race_no=r.race_no AND u.horse_no=r.horse_no
+     WHERE r.meeting_date=? AND r.venue=?
+     ORDER BY r.race_no, r.horse_no`,
   )
     .bind(date, venue)
     .all();
@@ -413,9 +526,59 @@ async function listResults(env: Env, url: URL): Promise<Response> {
   });
 }
 
+/** Cheap D1 lookup: date+venue+race_no+horse_no → horse_code. */
+async function resolveHorseCode(env: Env, url: URL): Promise<Response> {
+  const date = url.searchParams.get("date");
+  const venue = url.searchParams.get("venue");
+  const raceNo = url.searchParams.get("race_no");
+  const horseNo = url.searchParams.get("horse_no");
+  if (!date || !venue || !raceNo || !horseNo) {
+    return jsonError(400, "date, venue, race_no, horse_no required");
+  }
+  const row = await env.DB.prepare(
+    `SELECT horse_code, name_en, name_ch FROM runners
+     WHERE meeting_date=? AND venue=? AND race_no=? AND horse_no=?`,
+  )
+    .bind(date, venue, Number(raceNo), Number(horseNo))
+    .first<{ horse_code: string | null; name_en: string | null; name_ch: string | null }>();
+  if (!row) return jsonError(404, "Runner not found");
+  return jsonOk({
+    date,
+    venue,
+    race_no: Number(raceNo),
+    horse_no: Number(horseNo),
+    horse_code: row.horse_code,
+    name_en: row.name_en,
+    name_ch: row.name_ch,
+  });
+}
+
 async function getHorse(env: Env, code: string): Promise<Response> {
-  const row = await env.DB.prepare(`SELECT * FROM horses WHERE horse_code=?`).bind(code).first();
-  if (!row) return jsonError(404, "Horse not found");
+  // Primary key is horse_code; also accept horse_id (e.g. HK_2022_H087).
+  let row = await env.DB.prepare(
+    `SELECT * FROM horses WHERE horse_code=? OR upper(horse_id)=upper(?) LIMIT 1`,
+  )
+    .bind(code, code)
+    .first();
+  if (!row) {
+    // Fallback: brand code seen on runners but HTML profile not fetched yet.
+    const fromRunner = await env.DB.prepare(
+      `SELECT horse_code, name_en, name_ch FROM runners
+       WHERE horse_code=? LIMIT 1`,
+    )
+      .bind(code)
+      .first<{ horse_code: string; name_en: string | null; name_ch: string | null }>();
+    if (!fromRunner) return jsonError(404, "Horse not found");
+    row = {
+      horse_code: fromRunner.horse_code,
+      horse_id: null,
+      name_en: fromRunner.name_en,
+      name_ch: fromRunner.name_ch,
+      data_source: "runners",
+      fetched_at: null,
+      updated_at: null,
+    };
+  }
   return jsonOk({ horse: row });
 }
 

@@ -192,6 +192,8 @@ describe("lock guards (pre-sale STOP_SELL)", () => {
         runners: [
           {
             horse_no: 1,
+            horse_code: "H001",
+            horse_id: null,
             name_en: "A",
             name_ch: null,
             status: "Declared",

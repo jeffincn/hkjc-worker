@@ -1,5 +1,6 @@
 import type { Env } from "../env";
 import type { NormalizedMeeting, NormalizedRace, NormalizedRunner } from "../parse/meeting";
+import { normalizeHorseCode } from "../parse/horse-code";
 import {
   normalizeStoredSnapshot,
   type RaceOddsSnapshot,
@@ -117,9 +118,10 @@ export async function upsertRunner(
 ): Promise<void> {
   await db
     .prepare(
-      `INSERT INTO runners (meeting_date, venue, race_no, horse_no, name_en, name_ch, status, barrier, handicap_weight, jockey_en, trainer_en, last6run, data_source, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO runners (meeting_date, venue, race_no, horse_no, horse_code, name_en, name_ch, status, barrier, handicap_weight, jockey_en, trainer_en, last6run, data_source, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(meeting_date, venue, race_no, horse_no) DO UPDATE SET
+         horse_code=COALESCE(excluded.horse_code, runners.horse_code),
          name_en=COALESCE(excluded.name_en, runners.name_en),
          name_ch=COALESCE(excluded.name_ch, runners.name_ch),
          status=COALESCE(excluded.status, runners.status),
@@ -130,7 +132,8 @@ export async function upsertRunner(
          last6run=COALESCE(excluded.last6run, runners.last6run),
          data_source=excluded.data_source,
          updated_at=excluded.updated_at
-       WHERE runners.name_en IS DISTINCT FROM COALESCE(excluded.name_en, runners.name_en)
+       WHERE runners.horse_code IS DISTINCT FROM COALESCE(excluded.horse_code, runners.horse_code)
+          OR runners.name_en IS DISTINCT FROM COALESCE(excluded.name_en, runners.name_en)
           OR runners.name_ch IS DISTINCT FROM COALESCE(excluded.name_ch, runners.name_ch)
           OR runners.status IS DISTINCT FROM COALESCE(excluded.status, runners.status)
           OR runners.barrier IS DISTINCT FROM COALESCE(excluded.barrier, runners.barrier)
@@ -145,6 +148,7 @@ export async function upsertRunner(
       venue,
       raceNo,
       runner.horse_no,
+      runner.horse_code,
       runner.name_en,
       runner.name_ch,
       runner.status,
@@ -171,9 +175,10 @@ export async function upsertResult(
 ): Promise<void> {
   await db
     .prepare(
-      `INSERT INTO results (meeting_date, venue, race_no, horse_no, final_position, dead_heat, win_odds, place_odds, dividends_json, data_source, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO results (meeting_date, venue, race_no, horse_no, horse_code, final_position, dead_heat, win_odds, place_odds, dividends_json, data_source, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(meeting_date, venue, race_no, horse_no) DO UPDATE SET
+         horse_code=COALESCE(excluded.horse_code, results.horse_code),
          final_position=COALESCE(excluded.final_position, results.final_position),
          dead_heat=COALESCE(excluded.dead_heat, results.dead_heat),
          win_odds=COALESCE(excluded.win_odds, results.win_odds),
@@ -181,7 +186,8 @@ export async function upsertResult(
          dividends_json=COALESCE(excluded.dividends_json, results.dividends_json),
          data_source=excluded.data_source,
          updated_at=excluded.updated_at
-       WHERE results.final_position IS DISTINCT FROM COALESCE(excluded.final_position, results.final_position)
+       WHERE results.horse_code IS DISTINCT FROM COALESCE(excluded.horse_code, results.horse_code)
+          OR results.final_position IS DISTINCT FROM COALESCE(excluded.final_position, results.final_position)
           OR results.dead_heat IS DISTINCT FROM COALESCE(excluded.dead_heat, results.dead_heat)
           OR results.win_odds IS DISTINCT FROM COALESCE(excluded.win_odds, results.win_odds)
           OR results.place_odds IS DISTINCT FROM COALESCE(excluded.place_odds, results.place_odds)
@@ -193,6 +199,7 @@ export async function upsertResult(
       venue,
       raceNo,
       runner.horse_no,
+      runner.horse_code,
       runner.final_position,
       runner.dead_heat == null ? null : runner.dead_heat ? 1 : 0,
       runner.win_odds,
@@ -352,6 +359,36 @@ export async function raceHadOpenOddsSnapshot(
   return false;
 }
 
+/**
+ * Ensure a minimal horses row exists for brand-code lookups (/v1/horses/:code).
+ * INSERT OR IGNORE — never overwrites HTML profiles; no extra HKJC requests.
+ */
+export async function ensureHorseStub(
+  db: D1Database,
+  runner: Pick<
+    NormalizedRunner,
+    "horse_code" | "horse_id" | "name_en" | "name_ch"
+  >,
+): Promise<void> {
+  if (!runner.horse_code) return;
+  const now = new Date().toISOString();
+  await db
+    .prepare(
+      `INSERT OR IGNORE INTO horses
+        (horse_code, horse_id, name_en, name_ch, data_source, fetched_at, updated_at)
+       VALUES (?, ?, ?, ?, 'graphql', ?, ?)`,
+    )
+    .bind(
+      runner.horse_code,
+      runner.horse_id,
+      runner.name_en,
+      runner.name_ch,
+      now,
+      now,
+    )
+    .run();
+}
+
 export async function persistMeetingTree(
   db: D1Database,
   meeting: NormalizedMeeting,
@@ -369,6 +406,7 @@ export async function persistMeetingTree(
         runner,
         meeting.data_source,
       );
+      await ensureHorseStub(db, runner);
       if (runner.final_position != null || runner.win_odds != null) {
         await upsertResult(
           db,
@@ -381,6 +419,99 @@ export async function persistMeetingTree(
       }
     }
   }
+}
+
+/**
+ * One-shot backfill of runners.horse_code / results.horse_code from stored
+ * meetings.raw_json (GraphQL raceMeetings payload). No HKJC network calls.
+ * Returns number of runner rows updated.
+ */
+export async function backfillHorseCodesFromRawMeetings(
+  db: D1Database,
+  opts?: { limitMeetings?: number },
+): Promise<{ meetings_scanned: number; runners_updated: number }> {
+  const limit = opts?.limitMeetings ?? 200;
+  const { results } = await db
+    .prepare(
+      `SELECT meeting_date, venue, raw_json FROM meetings
+       WHERE raw_json IS NOT NULL
+       ORDER BY meeting_date DESC
+       LIMIT ?`,
+    )
+    .bind(limit)
+    .all<{ meeting_date: string; venue: string; raw_json: string }>();
+
+  let runners_updated = 0;
+  for (const row of results ?? []) {
+    let parsed: {
+      races?: Array<{
+        no?: number;
+        runners?: Array<{
+          no?: string | number;
+          standbyNo?: string | number;
+          horse?: { code?: string; id?: string } | null;
+          name_en?: string | null;
+          name_ch?: string | null;
+        }>;
+      }>;
+    };
+    try {
+      parsed = JSON.parse(row.raw_json);
+    } catch {
+      continue;
+    }
+    for (const race of parsed.races ?? []) {
+      const raceNo = Number(race.no);
+      if (!Number.isFinite(raceNo)) continue;
+      for (const r of race.runners ?? []) {
+        const code = normalizeHorseCode(r.horse?.code);
+        if (!code) continue;
+        const primary = Number(r.no);
+        const standby = Number(r.standbyNo);
+        const horseNo = Number.isFinite(primary) && primary > 0
+          ? primary
+          : Number.isFinite(standby) && standby > 0
+            ? standby
+            : NaN;
+        if (!Number.isFinite(horseNo)) continue;
+        const horseId =
+          r.horse?.id != null && String(r.horse.id).trim() !== ""
+            ? String(r.horse.id).trim()
+            : null;
+        const upd = await db
+          .prepare(
+            `UPDATE runners SET horse_code=?, updated_at=?
+             WHERE meeting_date=? AND venue=? AND race_no=? AND horse_no=?
+               AND (horse_code IS NULL OR horse_code='')`,
+          )
+          .bind(
+            code,
+            new Date().toISOString(),
+            row.meeting_date,
+            row.venue,
+            raceNo,
+            horseNo,
+          )
+          .run();
+        if ((upd.meta?.changes ?? 0) > 0) runners_updated += 1;
+        await db
+          .prepare(
+            `UPDATE results SET horse_code=?
+             WHERE meeting_date=? AND venue=? AND race_no=? AND horse_no=?
+               AND (horse_code IS NULL OR horse_code='')`,
+          )
+          .bind(code, row.meeting_date, row.venue, raceNo, horseNo)
+          .run();
+        await ensureHorseStub(db, {
+          horse_code: code,
+          horse_id: horseId,
+          name_en: r.name_en ?? null,
+          name_ch: r.name_ch ?? null,
+        });
+      }
+    }
+  }
+  return { meetings_scanned: (results ?? []).length, runners_updated };
 }
 
 export async function storeChangeHistories(

@@ -19,6 +19,7 @@ export function snapshotToPushRace(snap: RaceOddsSnapshot): PushRace {
       (r): PushRunner => ({
         runner_id: r.runner_id,
         horse_no: r.horse_no,
+        horse_code: r.horse_code ?? null,
         horse_name: r.horse_name,
         win_odds: r.win_odds,
         place_odds: r.place_odds,

@@ -29,6 +29,8 @@ export interface PushRunner {
   /** Stable HKJC horse/runner identity — never cloth number alone. */
   runner_id?: string;
   horse_no: number;
+  /** HKJC brand code (e.g. H087) when known. */
+  horse_code?: string | null;
   horse_name: string | null;
   /** Additive 1.1 field; omitted by older producers. */
   horse_name_ch?: string | null;
