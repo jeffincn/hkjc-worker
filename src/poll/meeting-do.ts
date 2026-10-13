@@ -399,11 +399,11 @@ export class MeetingPoller implements DurableObject {
             }
           }
 
-          // Presence proof even when hash dedupe skipped the snapshot write.
+          // Presence proof even when hash dedupe skipped the snapshot write (R1b).
           pollTickInputs.push({
             race_no: race.race_no,
             changed: oddsChanged,
-            tick_at: tickAt,
+            tick_time: tickAt,
           });
 
           if (resultsComplete(race) && !cfg.result_races.includes(race.race_no)) {

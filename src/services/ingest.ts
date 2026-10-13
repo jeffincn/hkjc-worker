@@ -376,7 +376,7 @@ export async function ingestOneMeeting(
       pollTickInputs.push({
         race_no: race.race_no,
         changed: oddsChanged,
-        tick_at: tickAt,
+        tick_time: tickAt,
       });
 
       for (const r of race.runners) {

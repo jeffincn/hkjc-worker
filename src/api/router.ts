@@ -535,6 +535,11 @@ async function oddsHistory(env: Env, url: URL): Promise<Response> {
   const raceNo = url.searchParams.get("race_no");
   if (!date || !venue || !raceNo) return jsonError(400, "date, venue, race_no required");
   const n = Number(raceNo);
+  const from = url.searchParams.get("from");
+  const to = url.searchParams.get("to");
+  if ((from && !to) || (!from && to)) {
+    return jsonError(400, "from and to must be provided together (ISO time_range)");
+  }
   const { results } = await env.DB.prepare(
     `SELECT snapshot_time, content_hash, pool_status, raw_json, data_source, created_at
      FROM odds_snapshots WHERE meeting_date=? AND venue=? AND race_no=?
@@ -550,13 +555,31 @@ async function oddsHistory(env: Env, url: URL): Promise<Response> {
       created_at: string;
     }>();
   const codeByCloth = await horseCodeByCloth(env, date, venue, n);
-  const { loadRaceCoverage } = await import("../store/poll-ticks");
+  const { loadRaceCoverage, answerCoverageForRange } = await import(
+    "../store/poll-ticks"
+  );
   const coverage = await loadRaceCoverage({
     db: env.DB,
     meeting_date: date,
     venue,
     race_no: n,
+    from,
+    to,
   });
+  // A2: for any (race, time_range) answer STATIC vs MISSING.
+  let range: {
+    kind: "STATIC" | "MISSING";
+    from: string;
+    to: string;
+  } | null = null;
+  if (from && to) {
+    const ans = answerCoverageForRange({
+      ticks: coverage.ticks,
+      from,
+      to,
+    });
+    range = { kind: ans.kind, from: ans.from, to: ans.to };
+  }
   return jsonOk({
     date,
     venue,
@@ -569,12 +592,14 @@ async function oddsHistory(env: Env, url: URL): Promise<Response> {
       created_at: r.created_at,
       data: enrichOddsDataRunners(JSON.parse(r.raw_json), codeByCloth),
     })),
-    /** Intervals classified as static / changed / missing (issue #26). */
+    /** Poll presence: STATIC vs MISSING (issue #26 A2). */
     coverage: {
       gap_threshold_ms: coverage.gap_threshold_ms,
       gaps: coverage.gaps,
       intervals: coverage.intervals,
       tick_count: coverage.ticks.length,
+      /** Present when `from`+`to` query params set — A2 answer. */
+      range,
     },
   });
 }
