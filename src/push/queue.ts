@@ -12,6 +12,10 @@ import {
   type ResolvedTarget,
   type SubscriberDelivery,
 } from "./delivery";
+import {
+  isDuplicateBodyForSubscriber,
+  pushBodyContentHash,
+} from "./dedupe";
 import type { PushEnvelope } from "./envelope";
 import { requireEventId } from "./event-id";
 import { getPushEventById } from "./ledger";
@@ -64,7 +68,31 @@ export async function enqueueDeliveries(
   const body = JSON.stringify(envelope);
   const fetchImpl = opts?.fetchImpl ?? fetch;
 
+  // Stable body hash once per fan-out (timestamps/seq stripped).
+  const bodyHash = await pushBodyContentHash(envelope);
+
   for (const target of targets) {
+    const signed = !!(target.secret && target.secret.length > 0);
+    if (
+      await isDuplicateBodyForSubscriber(
+        env,
+        target.subscriber_id,
+        envelope.event,
+        bodyHash,
+      )
+    ) {
+      out.push({
+        subscriber_id: target.subscriber_id,
+        url: target.url,
+        http_status: null,
+        success: true,
+        signed,
+        skipped_dedupe: true,
+        error_message: "skipped: duplicate body hash",
+      });
+      continue;
+    }
+
     const gate = await allowDeliveryAttempt(env, target.subscriber_id);
     if (!gate.allowed) {
       out.push({
@@ -73,7 +101,7 @@ export async function enqueueDeliveries(
         http_status: null,
         success: false,
         error_message: `skipped: circuit ${gate.state}`,
-        signed: !!(target.secret && target.secret.length > 0),
+        signed,
         skipped_circuit: true,
       });
       continue;
@@ -98,7 +126,7 @@ export async function enqueueDeliveries(
           url: target.url,
           http_status: null,
           success: true,
-          signed: !!(target.secret && target.secret.length > 0),
+          signed,
           queued: true,
           rate_limit_delay_seconds: slot.delaySeconds > 0 ? slot.delaySeconds : undefined,
         });

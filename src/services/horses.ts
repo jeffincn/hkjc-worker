@@ -89,7 +89,9 @@ export async function refreshMeetingHorses(
     const html = await res.text();
     fetched++;
 
-    await storeRawDocument(env.DB, "html_horse_page", code, { length: html.length, url }, url);
+    await storeRawDocument(env.DB, "html_horse_page", code, { length: html.length, url }, url, {
+      env,
+    });
 
     const profile = parseHorseProfile(html, code, url);
     const profileResult = await upsertHorseProfile(env.DB, profile, {

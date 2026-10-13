@@ -12,9 +12,11 @@ import {
   flattenCoalesceBuffer,
   isInRaceDayHighFreqWindow,
   preferSnapshotOverHeartbeat,
+  resolveCoalesceMs,
   resolveEffectiveHeartbeatIntervalMs,
   shouldEmitHeartbeat,
   shouldPushFullSnapshot,
+  DEFAULT_PUSH_OFFWINDOW_COALESCE_SEC,
   type CoalesceBatch,
 } from "../src/push/odds-policy";
 import type { OddsDeltaChange, PushRace } from "../src/push/envelope";
@@ -284,6 +286,17 @@ describe("effective heartbeat interval (raceday vs offday)", () => {
         heartbeatIntervalMs: 1_800_000,
       }),
     ).toBe(true);
+  });
+});
+
+describe("resolveCoalesceMs in vs off window", () => {
+  it("uses short coalesce in-window and PUSH_OFFWINDOW_COALESCE_SEC off-window", () => {
+    const e = env({
+      PUSH_COALESCE_MS: "2000",
+      PUSH_OFFWINDOW_COALESCE_SEC: "300",
+    });
+    expect(resolveCoalesceMs(e, true)).toBe(2000);
+    expect(resolveCoalesceMs(e, false)).toBe(DEFAULT_PUSH_OFFWINDOW_COALESCE_SEC * 1000);
   });
 });
 

@@ -1,11 +1,17 @@
 import type { Env } from "../env";
-import { contentHash } from "../parse/hash";
+import { allowD1Write, trackD1Result } from "../store/d1-budget";
 import { setMeta } from "../store/db";
+import { d1Bind } from "../util/d1";
 import {
   allowDeliveryAttempt,
   recordDeliveryFailure,
   recordDeliverySuccess,
 } from "./circuit";
+import {
+  isDuplicateBodyForSubscriber,
+  pushBodyContentHash,
+  rememberBodyHashForSubscriber,
+} from "./dedupe";
 import type { PushEnvelope } from "./envelope";
 import { formatHkNow } from "./envelope";
 import { getPushEventById } from "./ledger";
@@ -28,6 +34,8 @@ export interface SubscriberDelivery {
   deferred_rate_limit?: boolean;
   /** Seconds the delivery was delayed for rate limiting. */
   rate_limit_delay_seconds?: number;
+  /** True when skipped: identical stable body already delivered to this sub. */
+  skipped_dedupe?: boolean;
 }
 
 export interface ResolvedTarget {
@@ -51,6 +59,7 @@ export async function hmacSha256Hex(secret: string, body: string): Promise<strin
 /**
  * Resolve envelope (prefer ledger) and POST to one target.
  * Updates circuit breaker + last_push_* meta on outcome.
+ * Skips HTTP when the stable body hash matches the last delivery to this sub.
  */
 export async function deliverToTarget(
   env: Env,
@@ -59,11 +68,31 @@ export async function deliverToTarget(
   target: ResolvedTarget,
   fetchImpl: typeof fetch,
 ): Promise<SubscriberDelivery> {
+  const signed = !!(target.secret && target.secret.length > 0);
+  const bodyHash = await pushBodyContentHash(envelope);
+  if (
+    await isDuplicateBodyForSubscriber(
+      env,
+      target.subscriber_id,
+      envelope.event,
+      bodyHash,
+    )
+  ) {
+    return {
+      subscriber_id: target.subscriber_id,
+      url: target.url,
+      http_status: null,
+      success: true,
+      signed,
+      skipped_dedupe: true,
+      error_message: "skipped: duplicate body hash",
+    };
+  }
+
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     "User-Agent": USER_AGENT,
   };
-  const signed = !!(target.secret && target.secret.length > 0);
   if (signed && target.secret) {
     headers["X-Signature"] = await hmacSha256Hex(target.secret, body);
   }
@@ -80,6 +109,12 @@ export async function deliverToTarget(
       target: target.url,
     });
     if (success) {
+      await rememberBodyHashForSubscriber(
+        env,
+        target.subscriber_id,
+        envelope.event,
+        bodyHash,
+      );
       await recordDeliverySuccess(env, target.subscriber_id, res.status);
       await markLastPush(env, res.status);
     } else {
@@ -194,22 +229,25 @@ async function logPush(
     target?: string;
   },
 ): Promise<void> {
-  const hash = await contentHash(envelope);
-  await env.DB.prepare(
-    `INSERT INTO push_log (event_type, target_url, http_status, retry_count, success, payload_hash, error_message, sent_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  )
-    .bind(
-      envelope.event,
-      info.target ?? null,
-      info.http_status ?? null,
-      info.retry_count ?? 0,
-      info.success ? 1 : 0,
-      hash,
-      info.error_message ?? null,
-      formatHkNow(),
-    )
-    .run();
+  // Verbose push_log is non-essential — skip when D1 write budget is degraded.
+  if (!(await allowD1Write(env, "push_log"))) return;
+  // Stable body hash (timestamps/seq stripped) so dry-run scripts can dedupe.
+  const hash = await pushBodyContentHash(envelope);
+  const result = await d1Bind(
+    env.DB.prepare(
+      `INSERT INTO push_log (event_type, target_url, http_status, retry_count, success, payload_hash, error_message, sent_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ),
+    envelope.event,
+    info.target ?? null,
+    info.http_status ?? null,
+    info.retry_count ?? 0,
+    info.success ? 1 : 0,
+    hash,
+    info.error_message ?? null,
+    formatHkNow(),
+  ).run();
+  await trackD1Result(env, result);
 }
 
 /** Reflect newest push of any type (not only odds_update). */

@@ -1,4 +1,6 @@
 import type { Env } from "../env";
+import { d1Bind } from "../util/d1";
+import { trackD1Result } from "../store/d1-budget";
 import type { PushEnvelope } from "./envelope";
 import { ensureEventId, hasNonEmptyEventId, isPushSchema11 } from "./event-id";
 
@@ -20,7 +22,7 @@ export async function enqueueRetry(
   env: Env,
   envelope: PushEnvelope,
   retryCount: number,
-  lastError: string,
+  lastError: string | null | undefined,
   subscriberId: number | null = null,
 ): Promise<void> {
   const ensured = ensureEventId(envelope);
@@ -29,39 +31,43 @@ export async function enqueueRetry(
     throw new Error("invariant: 1.1 envelope missing event_id before pending_pushes");
   }
   const eventId = hasNonEmptyEventId(ensured.event_id) ? ensured.event_id : null;
+  const eventType = ensured.event ?? "unknown";
+  const createdAt = ensured.sent_at ?? new Date().toISOString();
+  const err = lastError ?? null;
+  const sub = subscriberId ?? null;
 
   if (retryCount >= BACKOFF_MINUTES.length) {
-    await env.DB.prepare(
-      `INSERT INTO pending_pushes (event_type, payload_json, retry_count, next_retry_at, created_at, last_error, subscriber_id, event_id)
-       VALUES (?, ?, ?, NULL, ?, ?, ?, ?)`,
-    )
-      .bind(
-        ensured.event,
-        JSON.stringify(ensured),
-        retryCount,
-        ensured.sent_at ?? new Date().toISOString(),
-        lastError ?? null,
-        subscriberId ?? null,
-        eventId,
-      )
-      .run();
-    return;
-  }
-  const delayMin = BACKOFF_MINUTES[retryCount];
-  const next = new Date(Date.now() + delayMin * 60_000).toISOString();
-  await env.DB.prepare(
-    `INSERT INTO pending_pushes (event_type, payload_json, retry_count, next_retry_at, created_at, last_error, subscriber_id, event_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  )
-    .bind(
-      ensured.event,
+    const result = await d1Bind(
+      env.DB.prepare(
+        `INSERT INTO pending_pushes (event_type, payload_json, retry_count, next_retry_at, created_at, last_error, subscriber_id, event_id)
+         VALUES (?, ?, ?, NULL, ?, ?, ?, ?)`,
+      ),
+      eventType,
       JSON.stringify(ensured),
       retryCount,
-      next,
-      ensured.sent_at ?? new Date().toISOString(),
-      lastError ?? null,
-      subscriberId ?? null,
+      createdAt,
+      err,
+      sub,
       eventId,
-    )
-    .run();
+    ).run();
+    await trackD1Result(env, result);
+    return;
+  }
+  const delayMin = BACKOFF_MINUTES[retryCount] ?? 15;
+  const next = new Date(Date.now() + delayMin * 60_000).toISOString();
+  const result = await d1Bind(
+    env.DB.prepare(
+      `INSERT INTO pending_pushes (event_type, payload_json, retry_count, next_retry_at, created_at, last_error, subscriber_id, event_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ),
+    eventType,
+    JSON.stringify(ensured),
+    retryCount,
+    next,
+    createdAt,
+    err,
+    sub,
+    eventId,
+  ).run();
+  await trackD1Result(env, result);
 }

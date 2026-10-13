@@ -8,6 +8,11 @@ export const DEFAULT_PUSH_FULL_SNAPSHOT_INTERVAL_SEC = 300;
 /** Coalesce same-meeting odds changes within this window (default 2000ms). */
 export const DEFAULT_PUSH_COALESCE_MS = 2000;
 /**
+ * Outside the race-day high-freq window, coalesce deltas over this many
+ * seconds (default 300). Overrides PUSH_COALESCE_MS when off-window.
+ */
+export const DEFAULT_PUSH_OFFWINDOW_COALESCE_SEC = 300;
+/**
  * Heartbeat inside the race-day high-frequency window (default 300s).
  * Env key remains HEARTBEAT_INTERVAL_SEC for raceday cadence.
  */
@@ -29,6 +34,22 @@ export function pushFullSnapshotIntervalSec(env: Env): number {
 
 export function pushCoalesceMs(env: Env): number {
   return Math.max(0, envNum(env, "PUSH_COALESCE_MS", DEFAULT_PUSH_COALESCE_MS));
+}
+
+export function pushOffwindowCoalesceSec(env: Env): number {
+  return Math.max(
+    0,
+    envNum(env, "PUSH_OFFWINDOW_COALESCE_SEC", DEFAULT_PUSH_OFFWINDOW_COALESCE_SEC),
+  );
+}
+
+/**
+ * In-window: PUSH_COALESCE_MS (default 2s).
+ * Off-window: PUSH_OFFWINDOW_COALESCE_SEC (default 300s).
+ */
+export function resolveCoalesceMs(env: Env, inHighFreqWindow: boolean): number {
+  if (inHighFreqWindow) return pushCoalesceMs(env);
+  return pushOffwindowCoalesceSec(env) * 1000;
 }
 
 export function heartbeatIntervalSec(env: Env): number {

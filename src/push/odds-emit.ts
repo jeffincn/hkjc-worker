@@ -1,6 +1,17 @@
 import type { Env } from "../env";
 import type { RaceOddsSnapshot } from "../parse/odds";
 import { buildPoolInvestments } from "./delta";
+import {
+  applyEmittedChangesToLastPushed,
+  filterChangesAgainstLastPushed,
+  lastPushedFromRaces,
+  loadLastOddsUpdateHash,
+  loadLastPushedOdds,
+  oddsUpdateRacesHash,
+  saveLastOddsUpdateHash,
+  saveLastPushedOdds,
+  type LastPushedOdds,
+} from "./dedupe";
 import { emitPush } from "./emit";
 import type { OddsDeltaChange, PushRace } from "./envelope";
 import type { PmPoolRaw } from "../graphql/types";
@@ -9,7 +20,7 @@ import {
   coalesceWindowElapsed,
   flattenCoalesceBuffer,
   preferSnapshotOverHeartbeat,
-  pushCoalesceMs,
+  resolveCoalesceMs,
   pushFullSnapshotIntervalSec,
   resolveEffectiveHeartbeatIntervalMs,
   shouldEmitHeartbeat,
@@ -83,6 +94,25 @@ export function anyPeriodicSnapshotDue(args: {
   return false;
 }
 
+/**
+ * Drop empty / unchanged-vs-last-pushed delta rows. Returns null when nothing
+ * remains to enqueue.
+ */
+export async function filterDeltaForPush(
+  env: Env,
+  meetingDate: string,
+  venue: string,
+  changes: OddsDeltaChange[],
+  lastPushed?: LastPushedOdds | null,
+): Promise<{ changes: OddsDeltaChange[]; lastPushed: LastPushedOdds } | null> {
+  if (changes.length === 0) return null;
+  const last =
+    lastPushed ?? (await loadLastPushedOdds(env.DB, meetingDate, venue));
+  const filtered = filterChangesAgainstLastPushed(changes, last);
+  if (filtered.changes.length === 0) return null;
+  return { changes: filtered.changes, lastPushed: filtered.next };
+}
+
 export async function enqueueOddsDeltaBatch(
   env: Env,
   buffer: CoalesceBuffer | null,
@@ -97,7 +127,9 @@ export async function enqueueOddsDeltaBatch(
     race_nos: number[];
     source_last_updated_at: string | null;
   },
-): Promise<CoalesceBuffer> {
+): Promise<CoalesceBuffer | null> {
+  // Never buffer an empty changes[] payload.
+  if (args.changes.length === 0) return buffer;
   const seq = await allocatePushSeq(env, args.meeting_date, args.venue);
   const batch: CoalesceBatch = {
     captured_at: args.captured_at,
@@ -119,15 +151,25 @@ export async function flushOddsDeltaCoalesce(
     venue: string;
     poolInvs: PmPoolRaw[];
   },
-): Promise<void> {
+): Promise<boolean> {
   const flat = flattenCoalesceBuffer(buffer);
-  if (flat.changes.length === 0) return;
+  if (flat.changes.length === 0) return false;
+
+  // Re-filter against last-pushed at flush time (state may have advanced).
+  const gated = await filterDeltaForPush(
+    env,
+    args.meeting_date,
+    args.venue,
+    flat.changes,
+  );
+  if (!gated) return false;
+
   await emitPush(env, {
     event: "odds_delta",
     meeting_date: args.meeting_date,
     venue: args.venue,
     races: flat.races,
-    changes: flat.changes,
+    changes: gated.changes,
     pools: buildPoolInvestments(args.poolInvs, flat.race_nos),
     captured_at: flat.captured_at,
     sample_interval_s: flat.sample_interval_s,
@@ -141,6 +183,8 @@ export async function flushOddsDeltaCoalesce(
           }
         : undefined,
   });
+  await saveLastPushedOdds(env, args.meeting_date, args.venue, gated.lastPushed);
+  return true;
 }
 
 /**
@@ -157,27 +201,91 @@ export async function maybeFlushOddsDeltaCoalesce(
     nowMs: number;
     /** Force flush regardless of window (e.g. meeting done). */
     force?: boolean;
+    /** When set, selects in-window vs off-window coalesce length. */
+    inHighFreqWindow?: boolean;
+    /** Override coalesce length (ms). */
+    coalesceMs?: number;
   },
 ): Promise<{ buffer: CoalesceBuffer | null; flushed: boolean }> {
   if (!buffer || buffer.batches.length === 0) {
     return { buffer: null, flushed: false };
   }
-  const coalesceMs = pushCoalesceMs(env);
+  const coalesceMs =
+    args.coalesceMs ??
+    resolveCoalesceMs(env, args.inHighFreqWindow !== false);
   const due =
     args.force === true ||
     coalesceMs <= 0 ||
     coalesceWindowElapsed(buffer, args.nowMs, coalesceMs);
   if (!due) return { buffer, flushed: false };
-  await flushOddsDeltaCoalesce(env, buffer, args);
-  return { buffer: null, flushed: true };
+  const ok = await flushOddsDeltaCoalesce(env, buffer, args);
+  return { buffer: null, flushed: ok };
+}
+
+/**
+ * Emit a full odds_update unless the stable races hash matches the last
+ * pushed hash (survives DO restart via D1). Returns whether it was sent.
+ */
+export async function emitOddsUpdateIfChanged(args: {
+  env: Env;
+  meeting_date: string;
+  venue: string;
+  races: PushRace[];
+  captured_at: string;
+  sample_interval_s: number | null;
+  source_last_updated_at: string | null;
+  meta?: Record<string, unknown>;
+  /** Optional DO-cached hash to avoid a D1 read. */
+  cachedHash?: string | null;
+}): Promise<{
+  emitted: boolean;
+  hash: string;
+  lastFullByRaceUpdate: PushRace[];
+}> {
+  const hash = await oddsUpdateRacesHash(args.races);
+  const last =
+    args.cachedHash !== undefined
+      ? args.cachedHash
+      : await loadLastOddsUpdateHash(
+          args.env.DB,
+          args.meeting_date,
+          args.venue,
+        );
+  if (last != null && last === hash) {
+    return { emitted: false, hash, lastFullByRaceUpdate: [] };
+  }
+  await emitPush(args.env, {
+    event: "odds_update",
+    meeting_date: args.meeting_date,
+    venue: args.venue,
+    races: args.races,
+    captured_at: args.captured_at,
+    sample_interval_s: args.sample_interval_s,
+    source_last_updated_at: args.source_last_updated_at,
+    meta: args.meta,
+  });
+  await saveLastOddsUpdateHash(
+    args.env,
+    args.meeting_date,
+    args.venue,
+    hash,
+  );
+  // Full snapshot becomes the new last-pushed odds baseline.
+  await saveLastPushedOdds(
+    args.env,
+    args.meeting_date,
+    args.venue,
+    lastPushedFromRaces(args.races),
+  );
+  return { emitted: true, hash, lastFullByRaceUpdate: args.races };
 }
 
 /**
  * Idle keepalive: prefer a single odds_update when a periodic full snapshot
  * is due in the same heartbeat window; otherwise no_update.
  *
- * Outside the race-day high-freq window, always merge heartbeat + full
- * snapshot (receiver answers once per OFFDAY_HEARTBEAT_INTERVAL_SEC).
+ * Outside the race-day high-freq window, merge heartbeat + full snapshot
+ * only when content changed since last push; otherwise no_update.
  */
 export async function emitIdleKeepalive(args: {
   env: Env;
@@ -195,10 +303,13 @@ export async function emitIdleKeepalive(args: {
   expectedRaceNos?: number[];
   /** Inside [first_post - before, final dividends). */
   inHighFreqWindow: boolean;
+  /** DO-cached last odds_update content hash. */
+  lastOddsUpdateHash?: string | null;
 }): Promise<{
   emitted: "odds_update" | "no_update" | null;
   lastFullByRace: FullSnapshotByRace;
   heartbeatIntervalMs: number;
+  lastOddsUpdateHash: string | null;
 }> {
   const hbMs = resolveEffectiveHeartbeatIntervalMs(
     args.env,
@@ -214,6 +325,7 @@ export async function emitIdleKeepalive(args: {
       emitted: null,
       lastFullByRace: args.lastFullByRace,
       heartbeatIntervalMs: hbMs,
+      lastOddsUpdateHash: args.lastOddsUpdateHash ?? null,
     };
   }
 
@@ -246,14 +358,15 @@ export async function emitIdleKeepalive(args: {
         expectedRaceNos: expected,
         available: args.latestRaces,
       });
-    await emitPush(args.env, {
-      event: "odds_update",
+    const sent = await emitOddsUpdateIfChanged({
+      env: args.env,
       meeting_date: args.meeting_date,
       venue: args.venue,
       races: completeRaces,
       captured_at: args.captured_at,
       sample_interval_s: args.sample_interval_s,
       source_last_updated_at: args.source_last_updated_at,
+      cachedHash: args.lastOddsUpdateHash,
       meta: {
         keepalive: true,
         merged_heartbeat: true,
@@ -262,18 +375,22 @@ export async function emitIdleKeepalive(args: {
         ...coverage,
       },
     });
-    return {
-      emitted: "odds_update",
-      lastFullByRace: markFullSnapshots(
-        args.lastFullByRace,
-        completeRaces,
-        args.nowMs,
-      ),
-      heartbeatIntervalMs: hbMs,
-    };
+    if (sent.emitted) {
+      return {
+        emitted: "odds_update",
+        lastFullByRace: markFullSnapshots(
+          args.lastFullByRace,
+          completeRaces,
+          args.nowMs,
+        ),
+        heartbeatIntervalMs: hbMs,
+        lastOddsUpdateHash: sent.hash,
+      };
+    }
+    // Content unchanged since last push — fall through to no_update keepalive.
   }
 
-  if (kind === "no_update") {
+  if (kind === "no_update" || kind === "odds_update") {
     const last = await getLastChange(
       args.env,
       args.meeting_date,
@@ -292,12 +409,14 @@ export async function emitIdleKeepalive(args: {
       meta: {
         raceday_high_freq: args.inHighFreqWindow,
         heartbeat_interval_sec: Math.round(hbMs / 1000),
+        skipped_duplicate_snapshot: kind === "odds_update",
       },
     });
     return {
       emitted: "no_update",
       lastFullByRace: args.lastFullByRace,
       heartbeatIntervalMs: hbMs,
+      lastOddsUpdateHash: args.lastOddsUpdateHash ?? null,
     };
   }
 
@@ -305,5 +424,9 @@ export async function emitIdleKeepalive(args: {
     emitted: null,
     lastFullByRace: args.lastFullByRace,
     heartbeatIntervalMs: hbMs,
+    lastOddsUpdateHash: args.lastOddsUpdateHash ?? null,
   };
 }
+
+// Re-export for callers that still import apply helpers from here.
+export { applyEmittedChangesToLastPushed, filterChangesAgainstLastPushed };

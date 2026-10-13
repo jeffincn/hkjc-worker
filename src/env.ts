@@ -46,6 +46,11 @@ export interface Env {
   /** Coalesce same-meeting odds_delta batches within this many ms (default 2000). */
   PUSH_COALESCE_MS?: string;
   /**
+   * Outside race-day high-freq window, coalesce odds_delta over this many
+   * seconds (default 300). Full odds_update only with the offday heartbeat.
+   */
+  PUSH_OFFWINDOW_COALESCE_SEC?: string;
+  /**
    * Race-day high-freq keepalive (default 300). When a periodic full snapshot
    * is also due, emit one odds_update instead of no_update.
    */
@@ -60,6 +65,11 @@ export interface Env {
    * (default 7200). Window ends when the final race's dividends are published.
    */
   RACEDAY_WINDOW_BEFORE_SEC?: string;
+  /**
+   * Soft daily D1 rows-written budget (UTC day). Default 40000000 (~80% of a
+   * paid-plan-scale cap). Above 80% of this value, non-essential writes are skipped.
+   */
+  D1_DAILY_WRITE_BUDGET?: string;
 }
 
 export function envNum(env: Env, key: keyof Env, fallback: number): number {
