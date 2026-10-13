@@ -8,10 +8,12 @@ import {
 } from "../src/parse/horse-code";
 import type { NormalizedMeeting } from "../src/parse/meeting";
 import { buildRaceOddsSnapshot } from "../src/parse/odds";
+import { persistMeetingTree } from "../src/store/db";
 import {
   backfillHorseCodesFromRawMeetings,
-  persistMeetingTree,
-} from "../src/store/db";
+  backfillHorseCodesFromStore,
+  runHorseCodeBackfill,
+} from "../src/services/horse-code-backfill";
 
 const AUTH = { Authorization: "Bearer test-api-token" };
 

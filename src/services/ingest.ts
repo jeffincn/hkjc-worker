@@ -57,7 +57,6 @@ import {
 } from "../push/pusher";
 import type { RaceOddsSnapshot } from "../parse/odds";
 import {
-  backfillHorseCodesFromRawMeetings,
   getMeta,
   insertOddsSnapshotIfChanged,
   persistMeetingTree,
@@ -66,6 +65,7 @@ import {
   storeChangeHistories,
   storeDividendsAsResults,
 } from "../store/db";
+import { runHorseCodeBackfill } from "./horse-code-backfill";
 import { storeRawDocument } from "../store/horses";
 import { createSubrequestBudget, type SubrequestBudget } from "../util/budget";
 import { runStage } from "../util/stage";
@@ -100,16 +100,18 @@ export async function ingestActiveMeeting(env: Env): Promise<{
   let whitelist_error: string | undefined;
   const liveMeetings: Array<{ date: string; venue: string }> = [];
 
-  // One-shot D1-only backfill of horse_code from stored meetings.raw_json
-  // (no extra HKJC requests). Gated so it runs at most once per deployment.
+  // One-shot D1-only backfill v2: meetings.raw_json + odds_snapshots.runner_id.
+  // v1 only scanned meetings.raw_json (often rbcMeeting without horse.code) and
+  // only ran on admin ingest — production runners stayed null. Prefer explicit
+  // POST /v1/admin/backfill-horse-codes for full control.
   try {
-    const done = await getMeta(env.DB, "horse_code_backfill_v1");
+    const done = await getMeta(env.DB, "horse_code_backfill_v2");
     if (done !== "1") {
-      await backfillHorseCodesFromRawMeetings(env.DB, { limitMeetings: 100 });
-      await setMeta(env.DB, "horse_code_backfill_v1", "1");
+      await runHorseCodeBackfill(env, { source: "store", limit_meetings: 100 });
+      await setMeta(env.DB, "horse_code_backfill_v2", "1");
     }
   } catch (e) {
-    console.error("horse_code backfill failed", e);
+    console.error("horse_code backfill v2 failed", e);
   }
 
   try {
