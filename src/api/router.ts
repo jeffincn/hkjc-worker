@@ -39,6 +39,8 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
       date?: string;
       venue?: string;
       hkjc_delay_ms?: number;
+      /** Clear Standby / cloth-collision / name-mismatch codes before backfill. */
+      reset_ambiguous?: boolean;
     };
     const result = await runHorseCodeBackfill(env, {
       source: body.source ?? "store",
@@ -46,6 +48,22 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
       date: body.date,
       venue: body.venue,
       hkjc_delay_ms: body.hkjc_delay_ms,
+      reset_ambiguous: body.reset_ambiguous === true,
+    });
+    return jsonOk(result);
+  }
+
+  if (request.method === "POST" && path === "/v1/admin/reset-ambiguous-horse-codes") {
+    const authErr = requireBearer(request, env);
+    if (authErr) return authErr;
+    const { resetAmbiguousHorseCodes } = await import("../services/horse-code-backfill");
+    const body = (await request.json().catch(() => ({}))) as {
+      date?: string;
+      venue?: string;
+    };
+    const result = await resetAmbiguousHorseCodes(env.DB, {
+      date: body.date,
+      venue: body.venue,
     });
     return jsonOk(result);
   }
@@ -337,7 +355,10 @@ async function listMeetings(env: Env, url: URL): Promise<Response> {
   return jsonOk({ meetings: results ?? [] });
 }
 
-/** Map cloth number → brand code for one race (D1 read, no HKJC). */
+/**
+ * Map cloth → brand code for Declared runners only.
+ * Never use for Standby — same cloth can belong to a different horse.
+ */
 async function horseCodeByCloth(
   env: Env,
   date: string,
@@ -346,7 +367,9 @@ async function horseCodeByCloth(
 ): Promise<Map<number, string>> {
   const { results } = await env.DB.prepare(
     `SELECT horse_no, horse_code FROM runners
-     WHERE meeting_date=? AND venue=? AND race_no=? AND horse_code IS NOT NULL`,
+     WHERE meeting_date=? AND venue=? AND race_no=?
+       AND horse_code IS NOT NULL AND horse_code!=''
+       AND upper(coalesce(status,'')) NOT LIKE '%STANDBY%'`,
   )
     .bind(date, venue, raceNo)
     .all<{ horse_no: number; horse_code: string }>();
@@ -368,6 +391,7 @@ function enrichOddsDataRunners(
         horse_no?: number;
         runner_id?: string;
         horse_code?: string | null;
+        status?: string | null;
       }
     >;
   };
@@ -375,11 +399,16 @@ function enrichOddsDataRunners(
   return {
     ...snap,
     runners: snap.runners.map((r) => {
+      const status = typeof r.status === "string" ? r.status : "";
+      const standby = status.toUpperCase().includes("STANDBY");
+      // Prefer runner_id / explicit horse_code; cloth map only for Declared.
       const fromCloth =
-        r.horse_no != null ? (codeByCloth.get(Number(r.horse_no)) ?? null) : null;
+        !standby && r.horse_no != null
+          ? (codeByCloth.get(Number(r.horse_no)) ?? null)
+          : null;
       const horse_code =
         horseCodeFromRunnerFields({
-          horse_code: (r.horse_code as string | null | undefined) ?? fromCloth,
+          horse_code: (r.horse_code as string | null | undefined) ?? null,
           runner_id: (r.runner_id as string | null | undefined) ?? null,
         }) ?? fromCloth;
       return { ...r, horse_code };
