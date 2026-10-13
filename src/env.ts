@@ -32,6 +32,12 @@ export interface Env {
   PUSH_QUEUE_MAX_ATTEMPTS?: string;
   /** Re-arm MeetingPoller when last tick older than this many ms (default 600000). */
   POLLER_STALE_MS?: string;
+  /** Max HTTP deliveries per second per subscriber (default 2); excess delayed, never dropped. */
+  PUSH_RATE_PER_SUB_PER_SEC?: string;
+  /** Min active pending rows per subscriber before backlog coalesce (default 2). */
+  PUSH_BACKLOG_COALESCE_MIN?: string;
+  /** Max odds change rows per backlog_replay chunk (default 200). */
+  PUSH_BACKLOG_MAX_CHANGES?: string;
 }
 
 export function envNum(env: Env, key: keyof Env, fallback: number): number {

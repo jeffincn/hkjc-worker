@@ -24,6 +24,10 @@ export interface SubscriberDelivery {
   queued?: boolean;
   /** True when skipped because circuit breaker is open. */
   skipped_circuit?: boolean;
+  /** True when deferred due to per-subscriber rate limit (not dropped). */
+  deferred_rate_limit?: boolean;
+  /** Seconds the delivery was delayed for rate limiting. */
+  rate_limit_delay_seconds?: number;
 }
 
 export interface ResolvedTarget {

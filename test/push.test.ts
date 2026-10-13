@@ -88,6 +88,7 @@ describe("push envelope + retry", () => {
     expect(isLivePushEvent("odds_delta")).toBe(true);
     expect(isLivePushEvent("no_update")).toBe(true);
     expect(isLivePushEvent("lock")).toBe(true);
+    expect(isLivePushEvent("backlog_replay")).toBe(true);
     expect(isLivePushEvent("test")).toBe(false);
     expect(isLivePushEvent("backfill_progress")).toBe(false);
   });

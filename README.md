@@ -108,7 +108,8 @@ curl -s "$BASE/health" | jq .
     "pending_pushes": 2,
     "pending_due": 1,
     "pending_deferred": 1,
-    "gave_up": 0
+    "gave_up": 0,
+    "rate_limit_delays": 0
   },
   "subscribers": [
     {
@@ -120,7 +121,9 @@ curl -s "$BASE/health" | jq .
       "last_success_at": "…",
       "last_failure_at": null,
       "last_http_status": 202,
-      "last_error": null
+      "last_error": null,
+      "backlog_size": 0,
+      "rate_limit_delays": 0
     }
   ],
   "poller": {
@@ -145,6 +148,7 @@ curl -s "$BASE/health" | jq .
 
 - `last_push_at` / `last_push_status` 取自 **最新一条任意类型** 的 `push_log`（不再只看 odds_update）。
 - `push_queue.gave_up` / `pending_due` / `pending_deferred`：故意放弃的 pre-1.1 行数、到期待重试、延后/ piggyback 等待数（触顶 `PUSH_RETRY_MAX_PER_RUN` 时是 defer 不是 drop）。
+- `push_queue.rate_limit_delays`：因 per-subscriber 速率限制而 **延迟**（非丢弃）的累计次数；`subscribers[].backlog_size` / `rate_limit_delays` 为每订阅者视图。
 - 熔断打开时不会自动删除订阅者；事件仍在 `push_events`，可用 `/v1/events` 回放。
 - `gave_up` **仅**适用于 pre-1.1 legacy（空 `event_id` + `created_at` 早于 `PUSH_1_1_DEPLOY_CUTOFF` + 非 1.1 schema）；赛日 live 推送永不会被放弃。
 
@@ -535,9 +539,13 @@ curl -s -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/v1/admin/subscribers/
 | 事件 | 默认（`false`） | 说明 |
 |---|---|---|
 | `test` / `schedule` / `backfill_progress` / `whitelist_alert` / `source_blocked` / `source_recovered` | 仍可推 | 联调与告警 |
-| `odds_update` / `odds_delta` / `no_update` / `lock` / `scratch` / `result` / `horse_update` / `injury_update` / `runs_update` / `dividends` / `changes` | **跳过** | 确认 `test` 后再开 |
+| `odds_update` / `odds_delta` / `no_update` / `lock` / `scratch` / `result` / `horse_update` / `injury_update` / `runs_update` / `dividends` / `changes` / `backlog_replay` | **跳过** | 确认 `test` 后再开 |
 
 ### 4.5 事件类型与完整 JSON 示例
+
+#### `backlog_replay`（积压合并）
+
+订阅者 `pending_pushes` 积压时由 flush/piggyback 生成（见 §4.6）。新 `event_id`/`seq`；`changes[]` 含全部中间赔率变更（每条带原 `seq`/`captured_at`）；`meta.covered_seq_from`/`covered_seq_to` 标明覆盖的原 seq 范围。细节见 [`docs/push-schema-1.1.md`](docs/push-schema-1.1.md)。
 
 #### `odds_delta`（1.1 新增）
 
@@ -852,7 +860,13 @@ curl -s -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/v1/admin/subscribers/
 3. **无队列绑定**（本地 / 测试）：回退为进程内直推（行为与旧版一致）。  
 4. 直推或队列耗尽后仍失败：写入 `pending_pushes`（含 `subscriber_id` + `event_id`）；legacy 退避 **1 → 5 → 15 分钟**，并可 piggy-back。  
 5. **熔断**：连续失败 ≥ `CIRCUIT_BREAKER_THRESHOLD`（默认 10）或连续 429 ≥ `CIRCUIT_BREAKER_429_THRESHOLD`（默认 3）→ `open`（停发 HTTP，账本保留供 `/v1/events` 回放）；5 分钟后 `half_open` 探测，成功则 `closed`。**从不自动删除订阅者**。  
-6. Ingest / DO poll 各 stage（schedule、odds、dividends、horses、runs、injuries、pushes…）错误隔离；DO alarm 在 `finally` 中 **必定** 重排；小时 cron 兼 watchdog，发现 stale poller 则 `/start` 重武装。
+6. **Per-subscriber 速率限制**：每个订阅者最多 `PUSH_RATE_PER_SUB_PER_SEC`（默认 **2**）次 HTTP/秒。超额投递用队列 `delaySeconds`（或直推写入 `pending_pushes` 短延迟）**延后，绝不丢弃**——避免 webhook.site 等接收方在约 30–40 次突发后回 429。  
+7. **Backlog 合并回放**：当某订阅者 `pending_pushes` 积压 ≥ `PUSH_BACKLOG_COALESCE_MIN`（默认 2）时（熔断恢复、宕机、legacy 积压等），**不再逐条重放**。按会议合并：
+   - `odds_delta`：`changes[]` 按序拼接（保留每条变更自己的 `seq` / `captured_at` / prev/new odds），过大按 `PUSH_BACKLOG_MAX_CHANGES`（默认 200）切块 → 事件类型 `backlog_replay`（新 `event_id` + 新 `seq`；`meta.covered_seq_from` / `covered_seq_to` / `coalesced_event_ids`）
+   - **按场次增量**（`lock` / `result` / `scratch` / `dividends`）：按 `(event, race_no)` 保留每场最新信封，**不丢场次**（同场多次只留最新；无法解析 `race_no` 时退回逐条重发）
+   - **会议快照**（如 `odds_update` / `schedule` / `changes` / 马匹类）：同类型只留最新
+   - 原始事件仍在账本，可用 `/v1/events` 按原 `event_id`/`seq` 查阅。  
+8. Ingest / DO poll 各 stage（schedule、odds、dividends、horses、runs、injuries、pushes…）错误隔离；DO alarm 在 `finally` 中 **必定** 重排；小时 cron 兼 watchdog，发现 stale poller 则 `/start` 重武装。
 
 ### 4.7 可选 HMAC 校验（接收方伪代码）
 
@@ -933,6 +947,9 @@ app.post("/hook", express.raw({ type: "application/json" }), (req, res) => {
 | `CIRCUIT_BREAKER_429_THRESHOLD` | var | `3` | 连续 429 打开熔断 |
 | `CIRCUIT_HALF_OPEN_MS` | var | `300000` | open → half_open 探测间隔 |
 | `PUSH_QUEUE_MAX_ATTEMPTS` | var | `5` | 队列投递最大尝试次数（之后进 `pending_pushes`） |
+| `PUSH_RATE_PER_SUB_PER_SEC` | var | `2` | 每订阅者每秒最大 HTTP 投递数；超额 delay 不丢弃 |
+| `PUSH_BACKLOG_COALESCE_MIN` | var | `2` | 每订阅者 pending 达到此数时合并为 `backlog_replay` |
+| `PUSH_BACKLOG_MAX_CHANGES` | var | `200` | 单个 `backlog_replay` 最多包含的 odds change 行数 |
 | `POLLER_STALE_MS` | var | `600000` | cron watchdog 判定 MeetingPoller 过期并重武装 |
 
 `wrangler.toml` 已配置自定义域名：

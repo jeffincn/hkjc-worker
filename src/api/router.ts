@@ -188,7 +188,9 @@ async function handleHealth(env: Env): Promise<Response> {
   }
 
   const { countPendingPushStats } = await import("../push/pusher");
+  const { getTotalRateLimitDelays } = await import("../push/rate-limit");
   const pendingStats = await countPendingPushStats(env);
+  const rate_limit_delays = await getTotalRateLimitDelays(env);
 
   const { hkDay, resolveDailyRequestBudget, resolvePollIntervalMs, HEALTHY_BLOCK_STATE } =
     await import("../poll/live");
@@ -236,6 +238,8 @@ async function handleHealth(env: Env): Promise<Response> {
       pending_due: pendingStats.due,
       pending_deferred: pendingStats.deferred,
       gave_up: pendingStats.gave_up,
+      /** Cumulative per-subscriber rate-limit delays (delayed, not dropped). */
+      rate_limit_delays,
     },
     subscribers: circuits,
     poller,

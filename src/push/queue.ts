@@ -16,6 +16,7 @@ import type { PushEnvelope } from "./envelope";
 import { requireEventId } from "./event-id";
 import { getPushEventById } from "./ledger";
 import { enqueueRetry } from "./pending";
+import { reserveDeliverySlot } from "./rate-limit";
 import { getSubscriber } from "./subscribers";
 
 /** Queue message: one (event, subscriber) delivery unit. */
@@ -24,6 +25,12 @@ export interface PushDeliveryMessage {
   subscriber_id: number | null;
   /** 0-based attempt; used for retry backoff delay. */
   attempt: number;
+  /**
+   * True when a rate-limit slot was already reserved for this message
+   * (enqueue with delaySeconds, or process re-delay after reserve).
+   * Prevents double-advancing the per-subscriber clock.
+   */
+  rate_reserved?: boolean;
 }
 
 const QUEUE_BACKOFF_SECONDS = [60, 300, 900, 1800, 3600];
@@ -74,11 +81,17 @@ export async function enqueueDeliveries(
 
     if (useQueue) {
       try {
-        await env.PUSH_QUEUE!.send({
-          event_id: eventId,
-          subscriber_id: target.subscriber_id,
-          attempt: 0,
-        } satisfies PushDeliveryMessage);
+        const slot = await reserveDeliverySlot(env, target.subscriber_id);
+        const sendOpts = slot.delaySeconds > 0 ? { delaySeconds: slot.delaySeconds } : undefined;
+        await env.PUSH_QUEUE!.send(
+          {
+            event_id: eventId,
+            subscriber_id: target.subscriber_id,
+            attempt: 0,
+            rate_reserved: true,
+          } satisfies PushDeliveryMessage,
+          sendOpts,
+        );
         await bumpQueueBacklog(env, 1);
         out.push({
           subscriber_id: target.subscriber_id,
@@ -87,6 +100,7 @@ export async function enqueueDeliveries(
           success: true,
           signed: !!(target.secret && target.secret.length > 0),
           queued: true,
+          rate_limit_delay_seconds: slot.delaySeconds > 0 ? slot.delaySeconds : undefined,
         });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -106,6 +120,35 @@ export async function enqueueDeliveries(
         });
       }
     } else {
+      // Direct path: honor rate limit by deferring to pending_pushes (not drop).
+      const slot = await reserveDeliverySlot(env, target.subscriber_id);
+      if (slot.delaySeconds > 0) {
+        const next = new Date(Date.now() + slot.delaySeconds * 1000).toISOString();
+        await env.DB.prepare(
+          `INSERT INTO pending_pushes (event_type, payload_json, retry_count, next_retry_at, created_at, last_error, subscriber_id, event_id)
+           VALUES (?, ?, 0, ?, ?, ?, ?, ?)`,
+        )
+          .bind(
+            envelope.event,
+            body,
+            next,
+            envelope.sent_at ?? new Date().toISOString(),
+            `rate_limit_delay_${slot.delaySeconds}s`,
+            target.subscriber_id,
+            eventId,
+          )
+          .run();
+        out.push({
+          subscriber_id: target.subscriber_id,
+          url: target.url,
+          http_status: null,
+          success: true,
+          signed: !!(target.secret && target.secret.length > 0),
+          deferred_rate_limit: true,
+          rate_limit_delay_seconds: slot.delaySeconds,
+        });
+        continue;
+      }
       const delivery = await deliverToTarget(env, envelope, body, target, fetchImpl);
       if (!delivery.success && !delivery.skipped_circuit) {
         await enqueueRetry(
@@ -128,7 +171,12 @@ export async function processDeliveryMessage(
   env: Env,
   msg: PushDeliveryMessage,
   opts?: { fetchImpl?: typeof fetch },
-): Promise<{ ack: boolean; retryDelaySeconds?: number; nextAttempt?: number }> {
+): Promise<{
+  ack: boolean;
+  retryDelaySeconds?: number;
+  nextAttempt?: number;
+  rateReserved?: boolean;
+}> {
   const envelope = await getPushEventById(env, msg.event_id);
   if (!envelope) {
     console.error("push queue: event_id not in ledger", msg.event_id);
@@ -144,7 +192,20 @@ export async function processDeliveryMessage(
       60_000,
       circuitHalfOpenMs(env) - (Date.now() - openedAt),
     );
-    return { ack: false, retryDelaySeconds: Math.ceil(remainingMs / 1000) };
+    // Slot not consumed; next attempt must reserve again.
+    return { ack: false, retryDelaySeconds: Math.ceil(remainingMs / 1000), rateReserved: false };
+  }
+
+  // Rate-limit at HTTP boundary. Skip when enqueue already reserved this slot.
+  if (!msg.rate_reserved) {
+    const slot = await reserveDeliverySlot(env, msg.subscriber_id);
+    if (slot.delaySeconds > 0) {
+      return {
+        ack: false,
+        retryDelaySeconds: slot.delaySeconds,
+        rateReserved: true,
+      };
+    }
   }
 
   let target: ResolvedTarget | null = null;
@@ -193,6 +254,8 @@ export async function processDeliveryMessage(
     ack: false,
     retryDelaySeconds: queueRetryDelaySeconds(msg.attempt ?? 0),
     nextAttempt,
+    // Failure backoff is not a rate-limit reservation.
+    rateReserved: false,
   };
 }
 
@@ -228,29 +291,45 @@ export async function handlePushQueueBatch(
         event_id: body.event_id,
         subscriber_id: body.subscriber_id ?? null,
         attempt: body.attempt ?? 0,
+        rate_reserved: body.rate_reserved === true,
       });
       if (result.ack) {
         message.ack();
       } else if (typeof message.retry === "function") {
-        // Native retry keeps the same body; bump attempt via re-send when possible.
-        if (result.nextAttempt != null && hasPushQueue(env)) {
-          await env.PUSH_QUEUE!.send({
-            event_id: body.event_id,
-            subscriber_id: body.subscriber_id ?? null,
-            attempt: result.nextAttempt,
-          });
+        // Prefer re-send so we can control rate_reserved on the next attempt.
+        // Native message.retry() keeps the old body and would incorrectly skip
+        // rate-limit after a circuit-open deferral (rate_reserved cleared).
+        if (hasPushQueue(env)) {
+          const attempt =
+            result.nextAttempt != null ? result.nextAttempt : (body.attempt ?? 0);
+          await env.PUSH_QUEUE!.send(
+            {
+              event_id: body.event_id,
+              subscriber_id: body.subscriber_id ?? null,
+              attempt,
+              rate_reserved: result.rateReserved === true,
+            },
+            result.retryDelaySeconds != null
+              ? { delaySeconds: result.retryDelaySeconds }
+              : undefined,
+          );
           message.ack();
-          // backlog already counted; re-send is same logical message
         } else {
           message.retry({ delaySeconds: result.retryDelaySeconds ?? 60 });
         }
       } else {
         if (hasPushQueue(env)) {
-          await env.PUSH_QUEUE!.send({
-            event_id: body.event_id,
-            subscriber_id: body.subscriber_id ?? null,
-            attempt: result.nextAttempt ?? (body.attempt ?? 0) + 1,
-          });
+          await env.PUSH_QUEUE!.send(
+            {
+              event_id: body.event_id,
+              subscriber_id: body.subscriber_id ?? null,
+              attempt: result.nextAttempt ?? (body.attempt ?? 0) + 1,
+              rate_reserved: result.rateReserved === true,
+            },
+            result.retryDelaySeconds != null && result.rateReserved
+              ? { delaySeconds: result.retryDelaySeconds }
+              : undefined,
+          );
         }
         message.ack();
       }
