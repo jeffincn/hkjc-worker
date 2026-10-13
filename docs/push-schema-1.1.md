@@ -9,7 +9,7 @@ Additive, backward-compatible evolution of `hkjc-push/1.0`.
 - Delivery is decoupled: each `(event_id, subscriber)` is enqueued to Cloudflare Queue `hkjc-push-deliveries` (binding `PUSH_QUEUE`) so fan-out/retries never share one Worker's subrequest budget. Without the binding (tests/local), the worker falls back to direct HTTP send.
 - Per-subscriber circuit breaker (`closed` / `open` / `half_open`) stops HTTP to a failing receiver without deleting the subscriber; ledger replay via `/v1/events` remains available.
 - Per-subscriber delivery rate limit (`PUSH_RATE_PER_SUB_PER_SEC`, default 2): excess is delayed via queue `delaySeconds` (or short `pending_pushes` deferral on the direct path) — **never dropped**.
-- Backlog coalescing: when a subscriber has a pending/retrying backlog (circuit reopen, outage, legacy rows), `odds_delta` changes are merged per meeting into one or more size-bounded `backlog_replay` pushes; non-odds events of the same type collapse to the latest.
+- Backlog coalescing: when a subscriber has a pending/retrying backlog (circuit reopen, outage, legacy rows), `odds_delta` changes are merged per meeting into one or more size-bounded `backlog_replay` pushes. Per-race incremental events (`lock` / `result` / `scratch` / `dividends`) keep the **latest envelope per `race_no`** (never drop a race); meeting-level snapshots (`odds_update`, …) collapse to latest; if `race_no` cannot be determined, resend one-by-one.
 
 ## Odds basis
 
@@ -303,7 +303,9 @@ When a subscriber accumulates a pending/retrying backlog (e.g. after circuit reo
 | Source events | Coalesce rule |
 |---|---|
 | `odds_delta` | Concatenate every `changes[]` row **in seq order**. Each row keeps its own `prev_odds` / `new_odds` and is annotated with originating `seq` + `captured_at` (+ `source_event_id`). Chunked by `PUSH_BACKLOG_MAX_CHANGES` (default 200). |
-| Any other type | Same `event` → keep **latest** only (highest seq). |
+| `lock` / `result` / `scratch` / `dividends` | **Per-race incremental** (envelopes often carry only the races that changed that cycle). Keep the latest envelope per `(event, race_no)` so no race is dropped; an envelope covering multiple races is delivered once. If no `race_no` can be resolved from `races[]` / `meta.race_nos`, **resend one-by-one**. |
+| Meeting snapshots (`odds_update`, `no_update`, `schedule`, `changes`, horse pages, alerts, …) | Same `event` → keep **latest** only (highest seq). |
+| Unknown types | Resend one-by-one. |
 
 The coalesced push uses:
 

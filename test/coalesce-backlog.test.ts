@@ -26,6 +26,7 @@ async function reset() {
   env.PUSH_BACKLOG_COALESCE_MIN = "2";
   env.PUSH_BACKLOG_MAX_CHANGES = "200";
   env.PUSH_RATE_PER_SUB_PER_SEC = "100";
+  env.PUSH_RETRY_MAX_PER_RUN = "20";
 }
 
 function change(
@@ -134,7 +135,7 @@ describe("backlog replay coalescing", () => {
     expect(chunk.seq_to).toBe(11);
   });
 
-  it("collapses non-odds same type to latest and size-bounds odds chunks", () => {
+  it("collapses meeting-snapshot types to latest and size-bounds odds chunks", () => {
     const base = {
       schema: "hkjc-push/1.1" as const,
       sent_at: "2026-10-12T12:00:01+08:00",
@@ -149,17 +150,17 @@ describe("backlog replay coalescing", () => {
       },
       races: [],
     };
-    const lock1: PushEnvelope = {
+    const snap1: PushEnvelope = {
       ...base,
-      event: "lock",
-      event_id: "l1",
+      event: "odds_update",
+      event_id: "s1",
       seq: 1,
       captured_at: "2026-10-12T12:00:01+08:00",
     };
-    const lock2: PushEnvelope = {
+    const snap2: PushEnvelope = {
       ...base,
-      event: "lock",
-      event_id: "l2",
+      event: "odds_update",
+      event_id: "s2",
       seq: 5,
       captured_at: "2026-10-12T12:00:05+08:00",
     };
@@ -183,18 +184,211 @@ describe("backlog replay coalescing", () => {
     };
 
     const rows = [
-      { row: { id: 1, event_type: "lock", payload_json: "{}", retry_count: 0, subscriber_id: 1, event_id: "l1", last_error: null }, envelope: lock1 },
+      { row: { id: 1, event_type: "odds_update", payload_json: "{}", retry_count: 0, subscriber_id: 1, event_id: "s1", last_error: null }, envelope: snap1 },
       { row: { id: 2, event_type: "odds_delta", payload_json: "{}", retry_count: 0, subscriber_id: 1, event_id: "d1", last_error: null }, envelope: d1 },
       { row: { id: 3, event_type: "odds_delta", payload_json: "{}", retry_count: 0, subscriber_id: 1, event_id: "d2", last_error: null }, envelope: d2 },
-      { row: { id: 4, event_type: "lock", payload_json: "{}", retry_count: 0, subscriber_id: 1, event_id: "l2", last_error: null }, envelope: lock2 },
+      { row: { id: 4, event_type: "odds_update", payload_json: "{}", retry_count: 0, subscriber_id: 1, event_id: "s2", last_error: null }, envelope: snap2 },
     ];
 
     const plan = planMeetingCoalesce(rows, 1);
-    expect(plan.latestByType).toHaveLength(1);
-    expect(plan.latestByType[0]!.envelope.event_id).toBe("l2");
+    expect(plan.nonOddsDeliveries).toHaveLength(1);
+    expect(plan.nonOddsDeliveries[0]!.envelope.event_id).toBe("s2");
     expect(plan.oddsChunks).toHaveLength(2);
     expect(plan.oddsChunks[0]!.changes).toHaveLength(1);
     expect(plan.oddsChunks[1]!.changes).toHaveLength(1);
+  });
+
+  it("keeps lock/result/dividends per race_no so no race is dropped", () => {
+    const base = {
+      schema: "hkjc-push/1.1" as const,
+      sent_at: "2026-10-12T12:00:01+08:00",
+      meeting_date: "2026-10-12",
+      venue: "ST",
+      source: { name: "HKJC GraphQL" as const, url: "https://x", last_updated_at: null },
+      quality: {
+        missing_source_time: true,
+        post_start: false,
+        late_ms: 0,
+        sample_interval_s: null,
+      },
+    };
+    const race = (race_no: number) => ({
+      race_no,
+      post_time: null,
+      snapshot_time: "2026-10-12T12:00:00+08:00",
+      pool_status: "Closed",
+      runners: [],
+    });
+
+    const lockR1: PushEnvelope = {
+      ...base,
+      event: "lock",
+      event_id: "lock-r1",
+      seq: 1,
+      captured_at: "2026-10-12T12:00:01+08:00",
+      races: [race(1)],
+    };
+    const lockR2: PushEnvelope = {
+      ...base,
+      event: "lock",
+      event_id: "lock-r2",
+      seq: 2,
+      captured_at: "2026-10-12T12:00:02+08:00",
+      races: [race(2)],
+    };
+    // Later lock for race 1 must supersede the earlier one, not race 2.
+    const lockR1b: PushEnvelope = {
+      ...base,
+      event: "lock",
+      event_id: "lock-r1b",
+      seq: 3,
+      captured_at: "2026-10-12T12:00:03+08:00",
+      races: [race(1)],
+    };
+    const resultR1: PushEnvelope = {
+      ...base,
+      event: "result",
+      event_id: "res-r1",
+      seq: 4,
+      captured_at: "2026-10-12T12:00:04+08:00",
+      races: [race(1)],
+    };
+    const resultR3: PushEnvelope = {
+      ...base,
+      event: "result",
+      event_id: "res-r3",
+      seq: 5,
+      captured_at: "2026-10-12T12:00:05+08:00",
+      races: [race(3)],
+    };
+    const divR2: PushEnvelope = {
+      ...base,
+      event: "dividends",
+      event_id: "div-r2",
+      seq: 6,
+      captured_at: "2026-10-12T12:00:06+08:00",
+      races: [race(2)],
+      meta: { race_nos: [2] },
+    };
+    const divR4: PushEnvelope = {
+      ...base,
+      event: "dividends",
+      event_id: "div-r4",
+      seq: 7,
+      captured_at: "2026-10-12T12:00:07+08:00",
+      races: [race(4)],
+      meta: { race_nos: [4] },
+    };
+
+    const mk = (
+      id: number,
+      envelope: PushEnvelope,
+    ): { row: PendingPushRow; envelope: PushEnvelope } => ({
+      row: {
+        id,
+        event_type: envelope.event,
+        payload_json: "{}",
+        retry_count: 0,
+        subscriber_id: 1,
+        event_id: envelope.event_id,
+        last_error: null,
+      },
+      envelope,
+    });
+
+    const plan = planMeetingCoalesce(
+      [
+        mk(1, lockR1),
+        mk(2, lockR2),
+        mk(3, lockR1b),
+        mk(4, resultR1),
+        mk(5, resultR3),
+        mk(6, divR2),
+        mk(7, divR4),
+      ],
+      200,
+    );
+
+    const locks = plan.nonOddsDeliveries.filter((d) => d.envelope.event === "lock");
+    const results = plan.nonOddsDeliveries.filter((d) => d.envelope.event === "result");
+    const divs = plan.nonOddsDeliveries.filter((d) => d.envelope.event === "dividends");
+
+    // R1 + R2 locks kept; superseded lock-r1 dropped
+    expect(locks.map((l) => l.envelope.event_id).sort()).toEqual(["lock-r1b", "lock-r2"]);
+    expect(locks.flatMap((l) => l.envelope.races.map((r) => r.race_no)).sort()).toEqual([1, 2]);
+
+    // Both result races preserved
+    expect(results.map((r) => r.envelope.event_id).sort()).toEqual(["res-r1", "res-r3"]);
+    expect(results.flatMap((r) => r.envelope.races.map((x) => x.race_no)).sort()).toEqual([1, 3]);
+
+    // Both dividends races preserved
+    expect(divs.map((d) => d.envelope.event_id).sort()).toEqual(["div-r2", "div-r4"]);
+    expect(divs.flatMap((d) => d.envelope.races.map((r) => r.race_no)).sort()).toEqual([2, 4]);
+  });
+
+  it("resends per-race events one-by-one when race_no cannot be determined", () => {
+    const base = {
+      schema: "hkjc-push/1.1" as const,
+      sent_at: "2026-10-12T12:00:01+08:00",
+      meeting_date: "2026-10-12",
+      venue: "HV",
+      source: { name: "HKJC GraphQL" as const, url: "https://x", last_updated_at: null },
+      quality: {
+        missing_source_time: true,
+        post_start: false,
+        late_ms: 0,
+        sample_interval_s: null,
+      },
+      races: [] as PushEnvelope["races"],
+    };
+    const a: PushEnvelope = {
+      ...base,
+      event: "lock",
+      event_id: "lock-unknown-a",
+      seq: 1,
+      captured_at: "2026-10-12T12:00:01+08:00",
+    };
+    const b: PushEnvelope = {
+      ...base,
+      event: "lock",
+      event_id: "lock-unknown-b",
+      seq: 2,
+      captured_at: "2026-10-12T12:00:02+08:00",
+    };
+    const plan = planMeetingCoalesce(
+      [
+        {
+          row: {
+            id: 1,
+            event_type: "lock",
+            payload_json: "{}",
+            retry_count: 0,
+            subscriber_id: 1,
+            event_id: "lock-unknown-a",
+            last_error: null,
+          },
+          envelope: a,
+        },
+        {
+          row: {
+            id: 2,
+            event_type: "lock",
+            payload_json: "{}",
+            retry_count: 0,
+            subscriber_id: 1,
+            event_id: "lock-unknown-b",
+            last_error: null,
+          },
+          envelope: b,
+        },
+      ],
+      200,
+    );
+    expect(plan.nonOddsDeliveries).toHaveLength(2);
+    expect(plan.nonOddsDeliveries.map((d) => d.envelope.event_id)).toEqual([
+      "lock-unknown-a",
+      "lock-unknown-b",
+    ]);
   });
 
   it("flushDueRetries coalesces backlog into backlog_replay instead of one-by-one", async () => {
@@ -269,6 +463,95 @@ describe("backlog replay coalescing", () => {
       `SELECT COUNT(*) AS n FROM pending_pushes`,
     ).first<{ n: number }>();
     expect(remaining?.n).toBe(0);
+  });
+
+  it("flushDueRetries preserves every race's lock/result/dividends across backlog", async () => {
+    env.PUSH_RETRY_MAX_PER_RUN = "20";
+    const sub = await createSubscriber(env, { url: "https://races.example/hook" });
+    const race = (race_no: number) => ({
+      race_no,
+      post_time: null as string | null,
+      snapshot_time: "2026-10-12T18:00:00+08:00",
+      pool_status: "Closed",
+      runners: [],
+    });
+
+    const lock1 = await preparePushEvent(env, {
+      event: "lock",
+      meeting_date: "2026-10-12",
+      venue: "ST",
+      races: [race(1)],
+      source_last_updated_at: null,
+    });
+    const lock2 = await preparePushEvent(env, {
+      event: "lock",
+      meeting_date: "2026-10-12",
+      venue: "ST",
+      races: [race(2)],
+      source_last_updated_at: null,
+    });
+    const result1 = await preparePushEvent(env, {
+      event: "result",
+      meeting_date: "2026-10-12",
+      venue: "ST",
+      races: [race(1)],
+      source_last_updated_at: null,
+    });
+    const result2 = await preparePushEvent(env, {
+      event: "result",
+      meeting_date: "2026-10-12",
+      venue: "ST",
+      races: [race(2)],
+      source_last_updated_at: null,
+    });
+    const div1 = await preparePushEvent(env, {
+      event: "dividends",
+      meeting_date: "2026-10-12",
+      venue: "ST",
+      races: [race(1)],
+      source_last_updated_at: null,
+      meta: { race_nos: [1] },
+    });
+    const div2 = await preparePushEvent(env, {
+      event: "dividends",
+      meeting_date: "2026-10-12",
+      venue: "ST",
+      races: [race(2)],
+      source_last_updated_at: null,
+      meta: { race_nos: [2] },
+    });
+
+    for (const e of [lock1, lock2, result1, result2, div1, div2]) {
+      await env.DB.prepare(
+        `INSERT INTO pending_pushes (event_type, payload_json, retry_count, next_retry_at, created_at, last_error, subscriber_id, event_id)
+         VALUES (?, ?, 0, '2000-01-01T00:00:00Z', ?, NULL, ?, ?)`,
+      )
+        .bind(e.event, JSON.stringify(e), new Date().toISOString(), sub.id, e.event_id)
+        .run();
+    }
+
+    const bodies: PushEnvelope[] = [];
+    const fetchImpl: typeof fetch = async (_input, init) => {
+      bodies.push(JSON.parse(String(init?.body ?? "{}")) as PushEnvelope);
+      return new Response("{}", { status: 202 });
+    };
+
+    const sent = await flushDueRetries(env, { fetchImpl });
+    expect(sent).toBe(6);
+
+    const raceNos = (event: string) =>
+      bodies
+        .filter((b) => b.event === event)
+        .flatMap((b) => b.races.map((r) => r.race_no))
+        .sort((a, b) => a - b);
+
+    expect(raceNos("lock")).toEqual([1, 2]);
+    expect(raceNos("result")).toEqual([1, 2]);
+    expect(raceNos("dividends")).toEqual([1, 2]);
+    // No race silently dropped: 2 locks + 2 results + 2 dividends
+    expect(bodies.filter((b) => b.event === "lock")).toHaveLength(2);
+    expect(bodies.filter((b) => b.event === "result")).toHaveLength(2);
+    expect(bodies.filter((b) => b.event === "dividends")).toHaveLength(2);
   });
 
   it("buildCoalescedDeliveries writes ledger backlog_replay with covered seq range", async () => {

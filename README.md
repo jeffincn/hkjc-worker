@@ -861,7 +861,11 @@ curl -s -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/v1/admin/subscribers/
 4. 直推或队列耗尽后仍失败：写入 `pending_pushes`（含 `subscriber_id` + `event_id`）；legacy 退避 **1 → 5 → 15 分钟**，并可 piggy-back。  
 5. **熔断**：连续失败 ≥ `CIRCUIT_BREAKER_THRESHOLD`（默认 10）或连续 429 ≥ `CIRCUIT_BREAKER_429_THRESHOLD`（默认 3）→ `open`（停发 HTTP，账本保留供 `/v1/events` 回放）；5 分钟后 `half_open` 探测，成功则 `closed`。**从不自动删除订阅者**。  
 6. **Per-subscriber 速率限制**：每个订阅者最多 `PUSH_RATE_PER_SUB_PER_SEC`（默认 **2**）次 HTTP/秒。超额投递用队列 `delaySeconds`（或直推写入 `pending_pushes` 短延迟）**延后，绝不丢弃**——避免 webhook.site 等接收方在约 30–40 次突发后回 429。  
-7. **Backlog 合并回放**：当某订阅者 `pending_pushes` 积压 ≥ `PUSH_BACKLOG_COALESCE_MIN`（默认 2）时（熔断恢复、宕机、legacy 积压等），**不再逐条重放**。按会议合并：`odds_delta` 的 `changes[]` 按序拼接（保留每条变更自己的 `seq` / `captured_at` / prev/new odds），非 odds 同类型只留最新；过大时按 `PUSH_BACKLOG_MAX_CHANGES`（默认 200）切块。产出事件类型 `backlog_replay`（新 `event_id` + 新 `seq`），`meta.covered_seq_from` / `covered_seq_to` / `coalesced_event_ids` 标明覆盖范围；原始事件仍在账本，可用 `/v1/events` 按原 `event_id`/`seq` 查阅。  
+7. **Backlog 合并回放**：当某订阅者 `pending_pushes` 积压 ≥ `PUSH_BACKLOG_COALESCE_MIN`（默认 2）时（熔断恢复、宕机、legacy 积压等），**不再逐条重放**。按会议合并：
+   - `odds_delta`：`changes[]` 按序拼接（保留每条变更自己的 `seq` / `captured_at` / prev/new odds），过大按 `PUSH_BACKLOG_MAX_CHANGES`（默认 200）切块 → 事件类型 `backlog_replay`（新 `event_id` + 新 `seq`；`meta.covered_seq_from` / `covered_seq_to` / `coalesced_event_ids`）
+   - **按场次增量**（`lock` / `result` / `scratch` / `dividends`）：按 `(event, race_no)` 保留每场最新信封，**不丢场次**（同场多次只留最新；无法解析 `race_no` 时退回逐条重发）
+   - **会议快照**（如 `odds_update` / `schedule` / `changes` / 马匹类）：同类型只留最新
+   - 原始事件仍在账本，可用 `/v1/events` 按原 `event_id`/`seq` 查阅。  
 8. Ingest / DO poll 各 stage（schedule、odds、dividends、horses、runs、injuries、pushes…）错误隔离；DO alarm 在 `finally` 中 **必定** 重排；小时 cron 兼 watchdog，发现 stale poller 则 `/start` 重武装。
 
 ### 4.7 可选 HMAC 校验（接收方伪代码）

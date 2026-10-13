@@ -96,11 +96,107 @@ function mergePools(
 }
 
 /**
+ * Per-race incremental events: envelopes carry only the races that changed in
+ * that cycle (see MeetingPoller lock/result emits). Collapsing to "latest of
+ * type" would drop earlier races — coalesce by (event, race_no) instead.
+ */
+export const PER_RACE_INCREMENTAL_EVENTS = new Set<PushEvent>([
+  "lock",
+  "result",
+  "scratch",
+  "dividends",
+]);
+
+/**
+ * Meeting-level / full-snapshot events: latest envelope of the type is enough
+ * (odds state, schedule, meta-only alerts, horse pages, …).
+ */
+export const MEETING_SNAPSHOT_EVENTS = new Set<PushEvent>([
+  "odds_update",
+  "no_update",
+  "schedule",
+  "changes",
+  "horse_update",
+  "injury_update",
+  "runs_update",
+  "test",
+  "backfill_progress",
+  "whitelist_alert",
+  "source_blocked",
+  "source_recovered",
+]);
+
+export function raceNosOf(envelope: PushEnvelope): number[] {
+  const nos: number[] = [];
+  for (const r of envelope.races ?? []) {
+    if (typeof r.race_no === "number" && r.race_no > 0) nos.push(r.race_no);
+  }
+  // dividends may carry race_nos only in meta.race_nos / meta.races
+  const meta = envelope.meta;
+  if (meta && Array.isArray(meta.race_nos)) {
+    for (const n of meta.race_nos) {
+      const num = Number(n);
+      if (Number.isFinite(num) && num > 0) nos.push(num);
+    }
+  }
+  return [...new Set(nos)].sort((a, b) => a - b);
+}
+
+type NonOddsItem = { envelope: PushEnvelope; row: PendingPushRow };
+
+/**
+ * Plan non-odds deliveries for one event type:
+ * - per-race incremental with identifiable race_nos → keep latest envelope per
+ *   race_no (unique envelopes; one envelope covering many races is sent once)
+ * - meeting snapshots → keep latest envelope of the type
+ * - unsure (unknown type, or per-race type with no race_no) → resend one-by-one
+ */
+export function planNonOddsDeliveries(
+  items: NonOddsItem[],
+): NonOddsItem[] {
+  if (items.length === 0) return [];
+  const event = items[0]!.envelope.event;
+
+  if (PER_RACE_INCREMENTAL_EVENTS.has(event)) {
+    const anyMissingRace = items.some((i) => raceNosOf(i.envelope).length === 0);
+    if (anyMissingRace) {
+      // Unsure which races are covered — do not drop; replay every row.
+      return items;
+    }
+    // Latest wins per race_no; deliver the unique envelopes that cover them.
+    const byRace = new Map<number, NonOddsItem>();
+    for (const item of items) {
+      for (const raceNo of raceNosOf(item.envelope)) {
+        byRace.set(raceNo, item);
+      }
+    }
+    const seen = new Set<number>();
+    const out: NonOddsItem[] = [];
+    // Stable order by first-seen race_no ascending for determinism.
+    for (const raceNo of [...byRace.keys()].sort((a, b) => a - b)) {
+      const item = byRace.get(raceNo)!;
+      if (seen.has(item.row.id)) continue;
+      seen.add(item.row.id);
+      out.push(item);
+    }
+    return out;
+  }
+
+  if (MEETING_SNAPSHOT_EVENTS.has(event)) {
+    return [items[items.length - 1]!];
+  }
+
+  // Unknown event type — resend one-by-one.
+  return items;
+}
+
+/**
  * Coalesce a subscriber's pending rows for one meeting:
  * - odds_delta: concatenate every change in seq order (annotated with seq/captured_at)
- * - other event types: keep only the latest (highest seq, then id)
- * Returns one or more size-bounded backlog_replay envelopes for odds, plus
- * latest envelopes for non-odds types (unchanged event type).
+ * - per-race incremental (lock/result/scratch/dividends): keep latest per race_no
+ * - meeting snapshots: keep latest of type
+ * - unsure: resend one-by-one
+ * Returns size-bounded backlog_replay chunks for odds, plus non-odds deliveries.
  */
 export function planMeetingCoalesce(
   rows: Array<{ row: PendingPushRow; envelope: PushEnvelope }>,
@@ -118,10 +214,9 @@ export function planMeetingCoalesce(
     venue: string | null;
     source_last_updated_at: string | null;
   }>;
-  latestByType: Array<{
-    envelope: PushEnvelope;
-    row: PendingPushRow;
-  }>;
+  /** @deprecated alias — prefer nonOddsDeliveries */
+  latestByType: NonOddsItem[];
+  nonOddsDeliveries: NonOddsItem[];
 } {
   const ordered = [...rows].sort((a, b) => {
     const seq = (a.envelope.seq ?? 0) - (b.envelope.seq ?? 0);
@@ -132,10 +227,16 @@ export function planMeetingCoalesce(
   const oddsRows = ordered.filter((r) => r.envelope.event === "odds_delta");
   const nonOdds = ordered.filter((r) => r.envelope.event !== "odds_delta");
 
-  // Collapse non-odds of the same type to the latest.
-  const latestMap = new Map<PushEvent, { envelope: PushEnvelope; row: PendingPushRow }>();
+  // Group non-odds by event type, then apply per-type coalesce rules.
+  const byType = new Map<PushEvent, NonOddsItem[]>();
   for (const item of nonOdds) {
-    latestMap.set(item.envelope.event, item);
+    const list = byType.get(item.envelope.event) ?? [];
+    list.push(item);
+    byType.set(item.envelope.event, list);
+  }
+  const nonOddsDeliveries: NonOddsItem[] = [];
+  for (const group of byType.values()) {
+    nonOddsDeliveries.push(...planNonOddsDeliveries(group));
   }
 
   const allChanges: BacklogOddsChange[] = [];
@@ -187,7 +288,8 @@ export function planMeetingCoalesce(
 
   return {
     oddsChunks,
-    latestByType: [...latestMap.values()],
+    latestByType: nonOddsDeliveries,
+    nonOddsDeliveries,
   };
 }
 
@@ -248,12 +350,31 @@ export async function buildCoalescedDeliveries(
       });
     }
 
-    for (const latest of plan.latestByType) {
+    for (const item of plan.nonOddsDeliveries) {
       out.push({
-        envelope: latest.envelope,
-        source_row_ids: [latest.row.id],
-        retry_count: latest.row.retry_count ?? 0,
+        envelope: item.envelope,
+        source_row_ids: [item.row.id],
+        retry_count: item.row.retry_count ?? 0,
       });
+    }
+
+    // Rows that were coalesced away (superseded per race_no / snapshot) must
+    // still be deleted by the caller — include their ids as side-car on the
+    // first delivery of that type when present, else attach to a synthetic
+    // bookkeeping entry via source_row_ids of all group rows minus kept.
+    const keptIds = new Set(
+      [
+        ...plan.oddsChunks.flatMap((c) => c.source_row_ids),
+        ...plan.nonOddsDeliveries.map((d) => d.row.id),
+      ],
+    );
+    const droppedIds = group
+      .map((g) => g.row.id)
+      .filter((id) => !keptIds.has(id));
+    if (droppedIds.length > 0 && out.length > 0) {
+      // Attach dropped ids to the last delivery so flush deletes them once.
+      const last = out[out.length - 1]!;
+      last.source_row_ids = [...new Set([...last.source_row_ids, ...droppedIds])];
     }
   }
 
