@@ -1,5 +1,8 @@
 import type { NormalizedMeeting, NormalizedRace, NormalizedRunner } from "../parse/meeting";
-import type { RaceOddsSnapshot } from "../parse/odds";
+import {
+  normalizeStoredSnapshot,
+  type RaceOddsSnapshot,
+} from "../parse/odds";
 import { contentHash } from "../parse/hash";
 import type { ChangeHistoryRaw, PmPoolRaw } from "../graphql/types";
 
@@ -224,7 +227,7 @@ export async function getLatestOddsSnapshot(
     .first<{ raw_json: string }>();
   if (!row) return null;
   try {
-    return JSON.parse(row.raw_json) as RaceOddsSnapshot;
+    return normalizeStoredSnapshot(JSON.parse(row.raw_json) as RaceOddsSnapshot);
   } catch {
     return null;
   }
@@ -255,7 +258,9 @@ export async function insertOddsSnapshotIfChanged(
   let previous: RaceOddsSnapshot | null = null;
   if (existingRow?.raw_json) {
     try {
-      previous = JSON.parse(existingRow.raw_json) as RaceOddsSnapshot;
+      previous = normalizeStoredSnapshot(
+        JSON.parse(existingRow.raw_json) as RaceOddsSnapshot,
+      );
     } catch {
       previous = null;
     }

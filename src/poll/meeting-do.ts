@@ -27,6 +27,7 @@ import {
   maybeFlushOddsDeltaCoalesce,
   type FullSnapshotByRace,
 } from "../push/odds-emit";
+import { buildCompleteSnapshotRaces, snapshotToPushRace } from "../push/snapshot-coverage";
 import {
   finalRaceNo,
   firstRacePostMs,
@@ -95,34 +96,35 @@ const ERROR_RESCHEDULE_MS = 60_000;
 function namesForRace(
   meeting: ReturnType<typeof normalizeMeeting>,
   raceNo: number,
-): Map<number, HorseNamePair> {
-  const map = new Map<number, HorseNamePair>();
+  snap?: RaceOddsSnapshot,
+): Map<string, HorseNamePair> {
+  const map = new Map<string, HorseNamePair>();
+  // Prefer snapshot runner_ids (stable); meeting tree alone is cloth-keyed.
+  if (snap) {
+    for (const r of snap.runners) {
+      map.set(r.runner_id, {
+        horse_name_en: r.horse_name,
+        horse_name_ch: null,
+      });
+    }
+  }
   const race = meeting.races.find((r) => r.race_no === raceNo);
   for (const r of race?.runners ?? []) {
-    map.set(r.horse_no, {
-      horse_name_en: r.name_en ?? null,
-      horse_name_ch: r.name_ch ?? null,
-    });
+    // Fill Chinese names when cloth matches a declared runner already in map.
+    for (const [id, pair] of map) {
+      if (pair.horse_name_en && r.name_en && pair.horse_name_en === r.name_en) {
+        map.set(id, {
+          horse_name_en: r.name_en ?? pair.horse_name_en,
+          horse_name_ch: r.name_ch ?? pair.horse_name_ch,
+        });
+      }
+    }
   }
   return map;
 }
 
 function toPushRace(snap: RaceOddsSnapshot): PushRace {
-  return {
-    race_no: snap.race_no,
-    post_time: snap.post_time,
-    snapshot_time: snap.snapshot_time,
-    pool_status: snap.pool_status,
-    source_last_updated_at: snap.payload.last_update,
-    runners: snap.runners.map((r) => ({
-      horse_no: r.horse_no,
-      horse_name: r.horse_name,
-      win_odds: r.win_odds,
-      place_odds: r.place_odds,
-      status: r.status,
-      final_position: r.final_position,
-    })),
-  };
+  return snapshotToPushRace(snap);
 }
 
 /**
@@ -350,7 +352,7 @@ export class MeetingPoller implements DurableObject {
               const delta = computeOddsDeltaChanges({
                 prev: ins.previous,
                 next: snap,
-                horseNames: namesForRace(meeting, race.race_no),
+                horseNames: namesForRace(meeting, race.race_no, snap),
               });
               allDeltaChanges.push(...delta);
             }
@@ -464,23 +466,43 @@ export class MeetingPoller implements DurableObject {
           if (flushed.flushed) anyPushThisTick = true;
         }
 
-        const fullRaces = decideFullSnapshotRaces({
+        const dueFull = decideFullSnapshotRaces({
           env: this.env,
           nowMs,
           lastFullByRace,
           changed: changedMeta,
         });
-        if (fullRaces.length > 0) {
+        // Root cause of incomplete seq327/329: we previously emitted only the
+        // due/changed subset. Always send a meeting-complete races[] (live +
+        // D1 fill) with covered_races / missing_races / race_source_ts.
+        if (dueFull.length > 0) {
+          const expectedRaceNos = meeting.races.map((r) => r.race_no);
+          const { races: completeRaces, meta: coverage } =
+            await buildCompleteSnapshotRaces({
+              env: this.env,
+              meeting_date: meeting.meeting_date,
+              venue: meeting.venue,
+              expectedRaceNos,
+              available: latestRaces.length > 0 ? latestRaces : dueFull,
+            });
           await emitPush(this.env, {
             event: "odds_update",
             meeting_date: meeting.meeting_date,
             venue: meeting.venue,
-            races: fullRaces,
+            races: completeRaces,
             captured_at,
             sample_interval_s,
             source_last_updated_at: meetingSourceTime,
+            meta: {
+              ...coverage,
+              trigger_race_nos: dueFull.map((r) => r.race_no),
+            },
           });
-          lastFullByRace = markFullSnapshots(lastFullByRace, fullRaces, nowMs);
+          lastFullByRace = markFullSnapshots(
+            lastFullByRace,
+            completeRaces,
+            nowMs,
+          );
           anyPushThisTick = true;
         }
 
@@ -518,6 +540,7 @@ export class MeetingPoller implements DurableObject {
             sample_interval_s,
             source_last_updated_at: meetingSourceTime,
             latestRaces,
+            expectedRaceNos: meeting.races.map((r) => r.race_no),
             inHighFreqWindow,
           });
           lastFullByRace = idle.lastFullByRace;
