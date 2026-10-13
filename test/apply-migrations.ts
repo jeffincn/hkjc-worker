@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS runners (
   venue TEXT NOT NULL,
   race_no INTEGER NOT NULL,
   horse_no INTEGER NOT NULL,
+  horse_code TEXT,
   name_en TEXT,
   name_ch TEXT,
   status TEXT,
@@ -45,6 +46,7 @@ CREATE TABLE IF NOT EXISTS runners (
   updated_at TEXT NOT NULL,
   PRIMARY KEY (meeting_date, venue, race_no, horse_no)
 );
+CREATE INDEX IF NOT EXISTS idx_runners_horse_code ON runners (horse_code);
 CREATE TABLE IF NOT EXISTS odds_snapshots (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   meeting_date TEXT NOT NULL,
@@ -64,6 +66,7 @@ CREATE TABLE IF NOT EXISTS results (
   venue TEXT NOT NULL,
   race_no INTEGER NOT NULL,
   horse_no INTEGER NOT NULL,
+  horse_code TEXT,
   final_position INTEGER,
   dead_heat INTEGER,
   win_odds REAL,

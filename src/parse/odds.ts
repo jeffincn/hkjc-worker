@@ -1,4 +1,5 @@
 import type { OddsNode, PmPoolRaw, RaceRaw, RunnerRaw } from "../graphql/types";
+import { horseCodeFromRunnerFields, normalizeHorseCode } from "./horse-code";
 
 /** Binary entry class for odds identity (standby never shares declared cloth odds). */
 export type RunnerEntryStatus = "Declared" | "Standby";
@@ -11,6 +12,8 @@ export interface RunnerOdds {
   runner_id: string;
   /** Saddle cloth / standby number for display; not a unique key. */
   horse_no: number;
+  /** HKJC brand code (e.g. H087) when known; null otherwise. */
+  horse_code: string | null;
   horse_name: string | null;
   win_odds: number | null;
   place_odds: number | null;
@@ -143,6 +146,10 @@ export function normalizeStoredRunner(
   return {
     runner_id,
     horse_no,
+    horse_code: horseCodeFromRunnerFields({
+      horse_code: r.horse_code,
+      runner_id,
+    }),
     horse_name: r.horse_name ?? null,
     win_odds: r.win_odds ?? null,
     place_odds: r.place_odds ?? null,
@@ -189,6 +196,9 @@ export function buildRaceOddsSnapshot(args: {
             ? fromStandby
             : -1;
     const runner_id = resolveRunnerId(r, horse_no, entry);
+    const horse_code =
+      normalizeHorseCode(r.horse?.code) ??
+      (normalizeHorseCode(runner_id) ? runner_id.toUpperCase() : null);
     // Pool combString maps to declared cloth numbers only — never apply to Standby.
     const win_odds =
       entry === "Declared" && horse_no > 0
@@ -199,6 +209,7 @@ export function buildRaceOddsSnapshot(args: {
     return {
       runner_id,
       horse_no,
+      horse_code,
       horse_name: r.name_en ?? null,
       win_odds,
       place_odds,
@@ -224,6 +235,7 @@ export function buildRaceOddsSnapshot(args: {
     runners.push({
       runner_id,
       horse_no,
+      horse_code: null,
       horse_name: null,
       win_odds: winMap[key] ?? null,
       place_odds: plaMap[key] ?? null,

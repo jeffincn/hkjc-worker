@@ -29,6 +29,8 @@ function sampleMeeting(overrides?: Partial<NormalizedMeeting>): NormalizedMeetin
         runners: [
           {
             horse_no: 1,
+            horse_code: "H001",
+            horse_id: "HK_2022_H001",
             name_en: "Alpha",
             name_ch: null,
             status: "Declared",

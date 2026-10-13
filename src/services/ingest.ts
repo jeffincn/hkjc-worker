@@ -57,6 +57,8 @@ import {
 } from "../push/pusher";
 import type { RaceOddsSnapshot } from "../parse/odds";
 import {
+  backfillHorseCodesFromRawMeetings,
+  getMeta,
   insertOddsSnapshotIfChanged,
   persistMeetingTree,
   raceHadOpenOddsSnapshot,
@@ -97,6 +99,18 @@ export async function ingestActiveMeeting(env: Env): Promise<{
   const out: Array<{ date: string; venue: string; races: number; snapshots_changed: number }> = [];
   let whitelist_error: string | undefined;
   const liveMeetings: Array<{ date: string; venue: string }> = [];
+
+  // One-shot D1-only backfill of horse_code from stored meetings.raw_json
+  // (no extra HKJC requests). Gated so it runs at most once per deployment.
+  try {
+    const done = await getMeta(env.DB, "horse_code_backfill_v1");
+    if (done !== "1") {
+      await backfillHorseCodesFromRawMeetings(env.DB, { limitMeetings: 100 });
+      await setMeta(env.DB, "horse_code_backfill_v1", "1");
+    }
+  } catch (e) {
+    console.error("horse_code backfill failed", e);
+  }
 
   try {
     const scheduleResult = await runStage(env, "schedule", async () => {

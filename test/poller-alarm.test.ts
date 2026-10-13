@@ -1,7 +1,14 @@
 import { env, fetchMock, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { GRAPHQL_ENDPOINT } from "../src/graphql/queries";
-import type { BlockState } from "../src/poll/live";
+import {
+  backoffIntervalMs,
+  DEFAULT_DAILY_REQUEST_BUDGET,
+  DEFAULT_POLL_INTERVAL_MS,
+  effectiveIntervalMs,
+  throttleIntervalMs,
+  type BlockState,
+} from "../src/poll/live";
 
 const u = new URL(GRAPHQL_ENDPOINT);
 
@@ -30,14 +37,39 @@ describe("MeetingPoller alarm: source block backoff + accounting", () => {
     const before = Date.now();
     expect(await runDurableObjectAlarm(stub)).toBe(true);
 
+    // Effective interval = max(schedule, budget-throttle, backoff).
+    // Throttle uses HKT-midnight horizon, so wall-clock time-of-day changes
+    // the value (e.g. ~10s near HK midnight vs 6s midday). Compute expected
+    // from the same helpers the DO uses — must not hard-code 6000.
+    const liveMs = DEFAULT_POLL_INTERVAL_MS;
+    const blocked: BlockState = {
+      blocked: true,
+      level: 1,
+      consecutive_failures: 1,
+      reason: "http_403",
+      since: new Date(before).toISOString(),
+      last_error_at: new Date(before).toISOString(),
+    };
+    const expectedMs = effectiveIntervalMs({
+      scheduleMs: 3000,
+      throttleMs: throttleIntervalMs({
+        baseMs: liveMs,
+        usedToday: 1, // one 403 attempt counted
+        budget: DEFAULT_DAILY_REQUEST_BUDGET,
+        nowMs: before,
+        horizonEndMs: null,
+      }),
+      backoffMs: backoffIntervalMs(liveMs, blocked),
+    });
+
     await runInDurableObject(stub, async (_inst, state) => {
       const block = await state.storage.get<BlockState>("block_state");
       expect(block?.blocked).toBe(true);
       expect(block?.reason).toBe("http_403");
-      expect(await state.storage.get<number>("current_interval_ms")).toBe(6000);
+      expect(await state.storage.get<number>("current_interval_ms")).toBe(expectedMs);
       const alarm = (await state.storage.getAlarm()) ?? 0;
-      expect(alarm - before).toBeGreaterThanOrEqual(5000);
-      expect(alarm - before).toBeLessThan(8000);
+      expect(alarm - before).toBeGreaterThanOrEqual(expectedMs - 1000);
+      expect(alarm - before).toBeLessThan(expectedMs + 2000);
       const usage = await state.storage.get<{ global: number; pending: number }>("gql_usage");
       expect((usage?.global ?? 0) + (usage?.pending ?? 0)).toBe(1); // 403 is not retried
     });

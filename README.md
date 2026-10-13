@@ -210,11 +210,27 @@ curl -s -H "Authorization: Bearer $TOKEN" \
       "going": "GOOD TO FIRM",
       "course_code": "C+3",
       "race_class": "Class 5",
-      "data_source": "graphql"
+      "data_source": "graphql",
+      "runners": [
+        {
+          "horse_no": 1,
+          "horse_code": "H087",
+          "name_en": "CAN'T GO WONG",
+          "name_ch": null,
+          "status": "Declared",
+          "barrier": 2,
+          "handicap_weight": 126,
+          "jockey_en": "Z Purton",
+          "trainer_en": "F C Lor",
+          "last6run": "…"
+        }
+      ]
     }
   ]
 }
 ```
+
+每场 `runners[]` 含 HKJC 品牌号 `horse_code`（如 `H087`；回填/rbc 缺口时可为 `null`）。
 
 ---
 
@@ -244,11 +260,13 @@ curl -s -H "Authorization: Bearer $TOKEN" \
       "pool_status": "STOP_SELL",
       "runners": [
         {
+          "runner_id": "H087",
           "horse_no": 1,
+          "horse_code": "H087",
           "horse_name": "CAN'T GO WONG",
           "win_odds": 4.0,
           "place_odds": 1.8,
-          "status": "Ran",
+          "status": "Declared",
           "final_position": 8
         }
       ]
@@ -257,13 +275,13 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 }
 ```
 
-无快照时 `snapshot` 为 `null`。
+无快照时 `snapshot` 为 `null`。`runners[].horse_code` 在入库时写入；读路径也会用 `runners` 表按马号补齐旧快照。
 
 ---
 
 ### 3.5 `GET /v1/odds/history`
 
-参数同 latest；返回该场全部快照时间序列（仅 **内容变化** 时写入新行）。
+参数同 latest；返回该场全部快照时间序列（仅 **内容变化** 时写入新行）。每条快照的 `runners[]` 同样带 `horse_code`。
 
 ```bash
 curl -s -H "Authorization: Bearer $TOKEN" \
@@ -291,6 +309,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
     {
       "race_no": 1,
       "horse_no": 1,
+      "horse_code": "H087",
       "final_position": 8,
       "dead_heat": 0,
       "win_odds": 4.0,
@@ -302,7 +321,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 }
 ```
 
-回填来源行可能 `final_position` / `win_odds` / `place_odds` 为 `null`，但 `dividends` 可能有值。
+回填来源行可能 `final_position` / `win_odds` / `place_odds` 为 `null`，但 `dividends` 可能有值。`horse_code` 优先取 `results` 列，否则 JOIN `runners`。
 
 ---
 
@@ -350,14 +369,40 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 ### 3.9 马匹资料
 
-GraphQL **无**伤患/往绩；来自官网 HTML，`data_source` 为 `html_horse` / `html_vet`。
+GraphQL **无**伤患/往绩；档案详情来自官网 HTML（`html_horse` / `html_vet`）。会议树入库时会写入 `runners.horse_code`（GraphQL `horse.code`），并对 `horses` 表 `INSERT OR IGNORE` 占位行，因此 **`/v1/horses/H087` 在 HTML 未刷前也可命中**。完整档案由赛日 HTML 刷新覆盖。`horses` 主键为品牌号 `horse_code`；亦可用 `horse_id` 查询。
+
+#### `GET /v1/horses/resolve`
+
+按会议位置解析品牌号（纯 D1 读，无额外 HKJC 请求）：
+
+| 参数 | 必填 |
+|---|---|
+| `date` / `venue` / `race_no` / `horse_no` | 是 |
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "$BASE/v1/horses/resolve?date=2026-10-07&venue=HV&race_no=1&horse_no=1" | jq .
+```
+
+```json
+{
+  "date": "2026-10-07",
+  "venue": "HV",
+  "race_no": 1,
+  "horse_no": 1,
+  "horse_code": "H087",
+  "name_en": "CAN'T GO WONG",
+  "name_ch": null
+}
+```
 
 #### `GET /v1/horses/:code`
+
+按品牌号（如 `H087`）或 `horse_id`（如 `HK_2022_H087`）查询。
 
 ```bash
 curl -s -H "Authorization: Bearer $TOKEN" "$BASE/v1/horses/H087" | jq .
 ```
-
 
 ```json
 {
@@ -948,7 +993,7 @@ app.post("/hook", express.raw({ type: "application/json" }), (req, res) => {
 
 | 表 | 作用 |
 |---|---|
-| `meetings` / `races` / `runners` | 赛事树 |
+| `meetings` / `races` / `runners` | 赛事树（`runners.horse_code` = HKJC 品牌号，可空） |
 | `odds_snapshots` | 赔率快照（`raw_json` + `content_hash`）；仅 hash 变才新行 |
 | `results` | 名次、最终赔率、派彩 JSON |
 | `change_events` | 退出/骑师变更等 |

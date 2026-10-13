@@ -7,6 +7,7 @@ import type {
   RaceRaw,
   RunnerRaw,
 } from "../graphql/types";
+import { normalizeHorseCode } from "./horse-code";
 import { parseOddsValue } from "./odds";
 
 export interface NormalizedMeeting {
@@ -33,6 +34,10 @@ export interface NormalizedRace {
 
 export interface NormalizedRunner {
   horse_no: number;
+  /** HKJC brand code (e.g. H087) from GraphQL horse.code; null when unknown. */
+  horse_code: string | null;
+  /** GraphQL horse.id when present (e.g. HK_2022_H087). */
+  horse_id: string | null;
   name_en: string | null;
   name_ch: string | null;
   status: string | null;
@@ -65,8 +70,14 @@ export function normalizeRunner(r: RunnerRaw): NormalizedRunner {
   const standby = numOrNull(r.standbyNo);
   // Standby runners often have empty `no` and a standbyNo — never coerce "" → 0.
   const horse_no = primary ?? standby ?? -1;
+  const horse_id =
+    r.horse?.id != null && String(r.horse.id).trim() !== ""
+      ? String(r.horse.id).trim()
+      : null;
   return {
     horse_no,
+    horse_code: normalizeHorseCode(r.horse?.code),
+    horse_id,
     name_en: r.name_en ?? null,
     name_ch: r.name_ch ?? null,
     status: r.status ?? null,
