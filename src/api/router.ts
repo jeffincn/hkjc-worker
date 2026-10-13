@@ -29,6 +29,27 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
     return jsonOk(result);
   }
 
+  if (request.method === "POST" && path === "/v1/admin/backfill-horse-codes") {
+    const authErr = requireBearer(request, env);
+    if (authErr) return authErr;
+    const { runHorseCodeBackfill } = await import("../services/horse-code-backfill");
+    const body = (await request.json().catch(() => ({}))) as {
+      source?: "store" | "hkjc" | "both";
+      limit_meetings?: number;
+      date?: string;
+      venue?: string;
+      hkjc_delay_ms?: number;
+    };
+    const result = await runHorseCodeBackfill(env, {
+      source: body.source ?? "store",
+      limit_meetings: body.limit_meetings,
+      date: body.date,
+      venue: body.venue,
+      hkjc_delay_ms: body.hkjc_delay_ms,
+    });
+    return jsonOk(result);
+  }
+
   if (request.method === "POST" && path === "/v1/admin/test-push") {
     const authErr = requireBearer(request, env);
     if (authErr) return authErr;
