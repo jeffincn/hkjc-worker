@@ -375,18 +375,25 @@ GraphQL **无**伤患/往绩；档案详情来自官网 HTML（`html_horse` / `h
 
 迁移 `0010` 后，历史 `runners` 的 `horse_code` 可能仍为 `null`：自动回填只挂在 `/v1/admin/ingest` 上；且许多会议的 `meetings.raw_json` 来自 **rbcMeeting**（白名单查询仅有 `runners.no/status`，**无** `horse.code`）。赛日轮询写入的 `odds_snapshots.runners[].runner_id` 通常已是品牌号（如 `H087`），是离线回填的主来源。
 
+**身份规则：** 禁止仅按 `horse_no` 在 Declared+Standby 共用布号时赋值。优先按 `name_en` 匹配；仅当该布号在来源中唯一且目标行非 Standby 时才允许按 `horse_no` 回退。
+
+若曾跑过错误的 `source=store` 回填（Standby 被打上 Declared 的 code），先清再填：
+
 ```bash
-# 1) 推荐：纯 D1，无 HKJC 请求（从 meetings.raw_json + odds_snapshots 填）
+# 修复错误赋值：清除 Standby / 布号碰撞 / 名称不符，再按身份回填
 curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"source":"store","limit_meetings":200}' \
+  -d '{"source":"store","reset_ambiguous":true,"limit_meetings":200}' \
   "$BASE/v1/admin/backfill-horse-codes" | jq .
 
-# 2) 针对某日某场（例：2026-10-11 ST）
+# 或分两步
+curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"date":"2026-10-11","venue":"ST"}' \
+  "$BASE/v1/admin/reset-ambiguous-horse-codes" | jq .
 curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"source":"store","date":"2026-10-11","venue":"ST"}' \
   "$BASE/v1/admin/backfill-horse-codes" | jq .
 
-# 3) 仍缺时：限速重拉 raceMeetings FULL（计入 30k/日；HKJC 对过往日可能返回空）
+# 仍缺时：限速重拉 raceMeetings FULL（计入 30k/日；HKJC 对过往日可能返回空）
 curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"source":"both","date":"2026-10-11","venue":"ST","limit_meetings":5,"hkjc_delay_ms":400}' \
   "$BASE/v1/admin/backfill-horse-codes" | jq .
@@ -397,6 +404,8 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/
 ```bash
 curl -s -H "Authorization: Bearer $TOKEN" \
   "$BASE/v1/horses/resolve?date=2026-10-11&venue=ST&race_no=1&horse_no=1" | jq .
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "$BASE/v1/horses/resolve?date=2026-10-11&venue=ST&race_no=8&horse_no=2" | jq .
 ```
 
 #### `GET /v1/horses/resolve`
@@ -516,7 +525,8 @@ curl -s -H "Authorization: Bearer $TOKEN" "$BASE/v1/horses/H087/injuries" | jq .
 |---|---|---|
 | `POST` | `/v1/admin/ingest` | 拉取当前 GraphQL 赛事入库（并触发马匹页按策略刷新） |
 | `POST` | `/v1/admin/backfill` | 回填一步；body 可选 `{"limit":5}` |
-| `POST` | `/v1/admin/backfill-horse-codes` | 回填 `runners.horse_code`：`{"source":"store"\|"hkjc"\|"both","date?","venue?","limit_meetings?"}` |
+| `POST` | `/v1/admin/backfill-horse-codes` | 回填 `runners.horse_code`：`{"source":"store"\|"hkjc"\|"both","reset_ambiguous?","date?","venue?","limit_meetings?"}` |
+| `POST` | `/v1/admin/reset-ambiguous-horse-codes` | 清除 Standby／布号碰撞／名称不符的错误 `horse_code`：`{"date?","venue?"}` |
 | `POST` | `/v1/admin/test-push` | 推送 `event:"test"`（需有启用中的订阅者，或兜底 `PUSH_TARGET_URL`） |
 | `GET` | `/v1/admin/subscribers` | 列出订阅者（**不返回 secret**，仅 `has_secret`） |
 | `POST` | `/v1/admin/subscribers` | 新增：`{"url","secret?","enabled?","active_window?","window_before_sec?","quiet_start?","quiet_end?"}` |
