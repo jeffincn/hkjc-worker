@@ -12,7 +12,6 @@ import { normalizeMeeting, resultsComplete } from "../parse/meeting";
 import { buildRaceOddsSnapshot, poolsByRace } from "../parse/odds";
 import type { RaceOddsSnapshot } from "../parse/odds";
 import {
-  buildPoolInvestments,
   computeOddsDeltaChanges,
   maxSourceTime,
   type HorseNamePair,
@@ -20,13 +19,28 @@ import {
 import { emitPush } from "../push/emit";
 import type { PushRace } from "../push/envelope";
 import { formatHkNow } from "../push/envelope";
-import { isInFastWindow, shouldEmitNoUpdate } from "../push/heartbeat";
-import { getLastChange } from "../push/seq";
+import {
+  decideFullSnapshotRaces,
+  emitIdleKeepalive,
+  enqueueOddsDeltaBatch,
+  markFullSnapshots,
+  maybeFlushOddsDeltaCoalesce,
+  type FullSnapshotByRace,
+} from "../push/odds-emit";
+import {
+  finalRaceNo,
+  firstRacePostMs,
+  isInRaceDayHighFreqWindow,
+  pushCoalesceMs,
+  racedayWindowBeforeSec,
+  type CoalesceBuffer,
+} from "../push/odds-policy";
 import {
   insertOddsSnapshotIfChanged,
   meetingTreeContentHash,
   persistMeetingTree,
   raceHadOpenOddsSnapshot,
+  raceHasPublishedDividends,
   setMeta,
 } from "../store/db";
 import { addGraphqlUsage } from "../store/usage";
@@ -266,6 +280,14 @@ export class MeetingPoller implements DurableObject {
         .filter((t) => Number.isFinite(t));
       horizonEndMs = postMsList.length > 0 ? Math.max(...postMsList) + MEETING_TAIL_MS : null;
 
+      const changedMeta: Array<{
+        previous: RaceOddsSnapshot | null;
+        next: RaceOddsSnapshot;
+        pushRace: PushRace;
+      }> = [];
+      const latestRaces: PushRace[] = [];
+      let anyPushThisTick = false;
+
       await runStage(this.env, "odds", async () => {
         budget.charge(1, { force: true });
         const oddsRes = await fetchGraphQL<PmPoolsOddsData>({
@@ -298,6 +320,7 @@ export class MeetingPoller implements DurableObject {
           const pushRace = toPushRace(snap);
 
           if (isStorableOddsSnapshot(snap)) {
+            latestRaces.push(pushRace);
             const alreadyLocked = cfg.locked_races.includes(race.race_no);
             // Only needed for lock detection; skip the D1 read once locked.
             const hadPriorOpen = alreadyLocked
@@ -319,6 +342,11 @@ export class MeetingPoller implements DurableObject {
             if (ins.inserted) {
               changed.push(pushRace);
               deltaRaceNos.push(race.race_no);
+              changedMeta.push({
+                previous: ins.previous,
+                next: snap,
+                pushRace,
+              });
               const delta = computeOddsDeltaChanges({
                 prev: ins.previous,
                 next: snap,
@@ -344,9 +372,10 @@ export class MeetingPoller implements DurableObject {
                   venue: meeting.venue,
                   races: [pushRace],
                   captured_at,
-            sample_interval_s,
+                  sample_interval_s,
                   source_last_updated_at: snap.payload.last_update,
                 });
+                anyPushThisTick = true;
               });
             }
           }
@@ -360,9 +389,10 @@ export class MeetingPoller implements DurableObject {
                 venue: meeting.venue,
                 races: [pushRace],
                 captured_at,
-            sample_interval_s,
+                sample_interval_s,
                 source_last_updated_at: snap.payload.last_update,
               });
+              anyPushThisTick = true;
             });
           }
         }
@@ -371,57 +401,148 @@ export class MeetingPoller implements DurableObject {
       const meetingSourceTime = maxSourceTime(sourceTimes);
 
       await runStage(this.env, "pushes", async () => {
-        if (changed.length > 0) {
+        let lastFullByRace =
+          (await this.state.storage.get<FullSnapshotByRace>(
+            "last_full_snapshot_by_race",
+          )) ?? {};
+        let coalesceBuf =
+          (await this.state.storage.get<CoalesceBuffer>("odds_coalesce_buffer")) ??
+          null;
+        let lastAnyPushAtMs =
+          (await this.state.storage.get<number>("last_any_push_at_ms")) ?? null;
+
+        // Flush coalesce window opened on a prior tick.
+        {
+          const flushed = await maybeFlushOddsDeltaCoalesce(
+            this.env,
+            coalesceBuf,
+            {
+              meeting_date: meeting.meeting_date,
+              venue: meeting.venue,
+              poolInvs,
+              nowMs,
+            },
+          );
+          coalesceBuf = flushed.buffer;
+          if (flushed.flushed) anyPushThisTick = true;
+        }
+
+        if (allDeltaChanges.length > 0) {
+          coalesceBuf = await enqueueOddsDeltaBatch(this.env, coalesceBuf, {
+            meeting_date: meeting.meeting_date,
+            venue: meeting.venue,
+            nowMs,
+            captured_at,
+            sample_interval_s,
+            changes: allDeltaChanges,
+            races: changed,
+            race_nos: deltaRaceNos,
+            source_last_updated_at: meetingSourceTime,
+          });
+
+          // With POLL_INTERVAL_MS (3s) > PUSH_COALESCE_MS (2s), flush this tick
+          // so deltas are not held across a full poll interval. Shorter polls
+          // keep the buffer until the window elapses.
+          const coalesceMs = pushCoalesceMs(this.env);
+          const forceFlush =
+            coalesceMs <= 0 ||
+            (await this.state.storage.get<number>("current_interval_ms")) ===
+              undefined ||
+            prevIntervalMs >= coalesceMs;
+          const flushed = await maybeFlushOddsDeltaCoalesce(
+            this.env,
+            coalesceBuf,
+            {
+              meeting_date: meeting.meeting_date,
+              venue: meeting.venue,
+              poolInvs,
+              nowMs,
+              force: forceFlush,
+            },
+          );
+          coalesceBuf = flushed.buffer;
+          if (flushed.flushed) anyPushThisTick = true;
+        }
+
+        const fullRaces = decideFullSnapshotRaces({
+          env: this.env,
+          nowMs,
+          lastFullByRace,
+          changed: changedMeta,
+        });
+        if (fullRaces.length > 0) {
           await emitPush(this.env, {
             event: "odds_update",
             meeting_date: meeting.meeting_date,
             venue: meeting.venue,
-            races: changed,
+            races: fullRaces,
             captured_at,
             sample_interval_s,
             source_last_updated_at: meetingSourceTime,
           });
+          lastFullByRace = markFullSnapshots(lastFullByRace, fullRaces, nowMs);
+          anyPushThisTick = true;
+        }
 
-          if (allDeltaChanges.length > 0) {
-            await emitPush(this.env, {
-              event: "odds_delta",
-              meeting_date: meeting.meeting_date,
-              venue: meeting.venue,
-              races: changed,
-              changes: allDeltaChanges,
-              pools: buildPoolInvestments(poolInvs, deltaRaceNos),
-              captured_at,
+        if (!anyPushThisTick && changed.length === 0) {
+          const lastNo = finalRaceNo(meeting.races);
+          const finalDivs =
+            lastNo == null
+              ? false
+              : ((await this.state.storage.get<boolean>(
+                  "final_dividends_published",
+                )) ??
+                (await raceHasPublishedDividends(
+                  this.env.DB,
+                  meeting.meeting_date,
+                  meeting.venue,
+                  lastNo,
+                )));
+          if (finalDivs) {
+            await this.state.storage.put("final_dividends_published", true);
+          }
+          const inHighFreqWindow = isInRaceDayHighFreqWindow({
+            nowMs,
+            firstPostMs: firstRacePostMs(meeting.races),
+            finalDividendsPublished: finalDivs,
+            windowBeforeSec: racedayWindowBeforeSec(this.env),
+          });
+          const idle = await emitIdleKeepalive({
+            env: this.env,
+            nowMs,
+            lastAnyPushAtMs,
+            lastFullByRace,
+            meeting_date: meeting.meeting_date,
+            venue: meeting.venue,
+            captured_at,
             sample_interval_s,
-              source_last_updated_at: meetingSourceTime,
-            });
+            source_last_updated_at: meetingSourceTime,
+            latestRaces,
+            inHighFreqWindow,
+          });
+          lastFullByRace = idle.lastFullByRace;
+          if (idle.emitted) anyPushThisTick = true;
+        }
+
+        if (anyPushThisTick) {
+          lastAnyPushAtMs = nowMs;
+        }
+
+        await this.state.storage.put("last_full_snapshot_by_race", lastFullByRace);
+        if (coalesceBuf && coalesceBuf.batches.length > 0) {
+          await this.state.storage.put("odds_coalesce_buffer", coalesceBuf);
+          // Wake before next poll if coalesce deadline is sooner.
+          const coalesceMs = pushCoalesceMs(this.env);
+          if (coalesceMs > 0) {
+            const deadline = coalesceBuf.opened_at_ms + coalesceMs;
+            await this.state.storage.put("odds_coalesce_deadline_ms", deadline);
           }
         } else {
-          const post = selectRelevantPostTime(
-            meeting.races.map((r) => ({ post_time: r.post_time, status: r.status })),
-            nowMs,
-          );
-          const fast = isInFastWindow(post, nowMs);
-          const lastNoUpdateAtMs =
-            (await this.state.storage.get<number>("last_no_update_at_ms")) ?? null;
-          if (shouldEmitNoUpdate({ nowMs, lastNoUpdateAtMs, inFastWindow: fast })) {
-            const last = await getLastChange(
-              this.env,
-              meeting.meeting_date,
-              meeting.venue,
-            );
-            await emitPush(this.env, {
-              event: "no_update",
-              meeting_date: meeting.meeting_date,
-              venue: meeting.venue,
-              races: [],
-              captured_at,
-            sample_interval_s,
-              source_last_updated_at: meetingSourceTime,
-              last_change_seq: last.last_change_seq,
-              last_change_at: last.last_change_at,
-            });
-            await this.state.storage.put("last_no_update_at_ms", nowMs);
-          }
+          await this.state.storage.delete("odds_coalesce_buffer");
+          await this.state.storage.delete("odds_coalesce_deadline_ms");
+        }
+        if (lastAnyPushAtMs != null) {
+          await this.state.storage.put("last_any_push_at_ms", lastAnyPushAtMs);
         }
       });
 
@@ -433,6 +554,21 @@ export class MeetingPoller implements DurableObject {
         meeting.races.every((r) => cfg.result_races.includes(r.race_no));
 
       if (allDone) {
+        // Drain any buffered odds_delta before stopping the poller.
+        const pending =
+          (await this.state.storage.get<CoalesceBuffer>("odds_coalesce_buffer")) ??
+          null;
+        if (pending && pending.batches.length > 0) {
+          await maybeFlushOddsDeltaCoalesce(this.env, pending, {
+            meeting_date: meeting.meeting_date,
+            venue: meeting.venue,
+            poolInvs,
+            nowMs: Date.now(),
+            force: true,
+          });
+          await this.state.storage.delete("odds_coalesce_buffer");
+          await this.state.storage.delete("odds_coalesce_deadline_ms");
+        }
         stopPolling = true;
         return;
       }
@@ -481,7 +617,19 @@ export class MeetingPoller implements DurableObject {
       if (!stopPolling) {
         try {
           // Fixed cadence from tick start (no drift by work duration).
-          const at = Math.max(tickStartMs + effectiveMs, Date.now() + MIN_ALARM_GAP_MS);
+          let at = Math.max(tickStartMs + effectiveMs, Date.now() + MIN_ALARM_GAP_MS);
+          // If an odds_delta coalesce window is open, wake at the deadline so
+          // we flush without waiting for the next poll interval.
+          const coalesceDeadline = await this.state.storage.get<number>(
+            "odds_coalesce_deadline_ms",
+          );
+          if (
+            coalesceDeadline != null &&
+            Number.isFinite(coalesceDeadline) &&
+            coalesceDeadline < at
+          ) {
+            at = Math.max(coalesceDeadline, Date.now() + MIN_ALARM_GAP_MS);
+          }
           await this.state.storage.put("current_interval_ms", effectiveMs);
           await this.state.storage.setAlarm(at);
         } catch (alarmErr) {

@@ -10,7 +10,6 @@ import { emitPush, preparePushEvent } from "../src/push/emit";
 import { ODDS_BASIS, type PushEnvelope } from "../src/push/envelope";
 import {
   isInFastWindow,
-  NO_UPDATE_FAST_MS,
   NO_UPDATE_SLOW_MS,
   shouldEmitNoUpdate,
 } from "../src/push/heartbeat";
@@ -168,40 +167,31 @@ describe("hkjc-push/1.1 seq + ledger + delta + heartbeat + replay", () => {
     ]);
   });
 
-  it("rate-limits no_update heartbeat (60s fast / 5min slow)", () => {
+  it("rate-limits keepalive by effective heartbeat interval (raceday 300s)", () => {
     const now = Date.parse("2026-10-07T18:20:00+08:00");
+    // isInFastWindow still describes the poll fast window (≤30 min to post).
     expect(isInFastWindow("2026-10-07T18:35:00+08:00", now)).toBe(true);
     expect(isInFastWindow("2026-10-07T22:00:00+08:00", now)).toBe(false);
 
     expect(
-      shouldEmitNoUpdate({ nowMs: now, lastNoUpdateAtMs: null, inFastWindow: true }),
-    ).toBe(true);
-    expect(
       shouldEmitNoUpdate({
         nowMs: now,
-        lastNoUpdateAtMs: now - NO_UPDATE_FAST_MS + 1000,
-        inFastWindow: true,
-      }),
-    ).toBe(false);
-    expect(
-      shouldEmitNoUpdate({
-        nowMs: now,
-        lastNoUpdateAtMs: now - NO_UPDATE_FAST_MS,
-        inFastWindow: true,
+        lastAnyPushAtMs: null,
+        heartbeatIntervalMs: NO_UPDATE_SLOW_MS,
       }),
     ).toBe(true);
     expect(
       shouldEmitNoUpdate({
         nowMs: now,
-        lastNoUpdateAtMs: now - NO_UPDATE_SLOW_MS + 1000,
-        inFastWindow: false,
+        lastAnyPushAtMs: now - NO_UPDATE_SLOW_MS + 1000,
+        heartbeatIntervalMs: NO_UPDATE_SLOW_MS,
       }),
     ).toBe(false);
     expect(
       shouldEmitNoUpdate({
         nowMs: now,
-        lastNoUpdateAtMs: now - NO_UPDATE_SLOW_MS,
-        inFastWindow: false,
+        lastAnyPushAtMs: now - NO_UPDATE_SLOW_MS,
+        heartbeatIntervalMs: NO_UPDATE_SLOW_MS,
       }),
     ).toBe(true);
   });

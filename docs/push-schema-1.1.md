@@ -10,6 +10,7 @@ Additive, backward-compatible evolution of `hkjc-push/1.0`.
 - Per-subscriber circuit breaker (`closed` / `open` / `half_open`) stops HTTP to a failing receiver without deleting the subscriber; ledger replay via `/v1/events` remains available.
 - Per-subscriber delivery rate limit (`PUSH_RATE_PER_SUB_PER_SEC`, default 2): excess is delayed via queue `delaySeconds` (or short `pending_pushes` deferral on the direct path) — **never dropped**.
 - Backlog coalescing: when a subscriber has a pending/retrying backlog (circuit reopen, outage, legacy rows), `odds_delta` changes are merged per meeting into one or more size-bounded `backlog_replay` pushes. Per-race incremental events (`lock` / `result` / `scratch` / `dividends`) keep the **latest envelope per `race_no`** (never drop a race); meeting-level snapshots (`odds_update`, …) collapse to latest; if `race_no` cannot be determined, resend one-by-one.
+- Live emission throttle (additive): hash-unchanged ticks do not push odds. On change, emit `odds_delta` (coalesced within `PUSH_COALESCE_MS`, default 2000; each `changes[]` row may carry originating `captured_at` / `seq` / `sample_interval_s`). Full `odds_update` only on first snapshot per race, `pool_status` change, or at most every `PUSH_FULL_SNAPSHOT_INTERVAL_SEC` (default 300). Race-day high-freq window = `[first_post - RACEDAY_WINDOW_BEFORE_SEC, final_race_dividends)`; inside: keepalive `HEARTBEAT_INTERVAL_SEC` (300) merged with full snapshot when both due; outside: `OFFDAY_HEARTBEAT_INTERVAL_SEC` (1800) always merged with full snapshot.
 
 ## Odds basis
 
@@ -251,7 +252,20 @@ Pool turnover (when available) is exposed only on `pools[].investment` as the **
         "new_odds": { "type": ["number", "null"] },
         "source_last_updated_at": { "type": ["string", "null"] },
         "race_post_time": { "type": ["string", "null"] },
-        "pool_status": { "type": ["string", "null"] }
+        "pool_status": { "type": ["string", "null"] },
+        "captured_at": {
+          "type": "string",
+          "description": "Present on live-coalesced odds_delta: originating observation time"
+        },
+        "seq": {
+          "type": "integer",
+          "description": "Present on live-coalesced odds_delta: originating observation seq"
+        },
+        "sample_interval_s": {
+          "type": ["number", "null"],
+          "exclusiveMinimum": 0,
+          "description": "Present on live-coalesced odds_delta: poll interval at observation"
+        }
       }
     },
     "backlogOddsChange": {

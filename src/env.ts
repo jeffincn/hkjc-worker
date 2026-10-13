@@ -38,6 +38,28 @@ export interface Env {
   PUSH_BACKLOG_COALESCE_MIN?: string;
   /** Max odds change rows per backlog_replay chunk (default 200). */
   PUSH_BACKLOG_MAX_CHANGES?: string;
+  /**
+   * Full odds_update at most this often per race (default 300).
+   * Still emitted on first snapshot and pool_status change.
+   */
+  PUSH_FULL_SNAPSHOT_INTERVAL_SEC?: string;
+  /** Coalesce same-meeting odds_delta batches within this many ms (default 2000). */
+  PUSH_COALESCE_MS?: string;
+  /**
+   * Race-day high-freq keepalive (default 300). When a periodic full snapshot
+   * is also due, emit one odds_update instead of no_update.
+   */
+  HEARTBEAT_INTERVAL_SEC?: string;
+  /**
+   * Keepalive outside the race-day high-freq window / non-race days
+   * (default 1800). Always merged with a full odds_update snapshot.
+   */
+  OFFDAY_HEARTBEAT_INTERVAL_SEC?: string;
+  /**
+   * High-freq window opens this many seconds before the first race post time
+   * (default 7200). Window ends when the final race's dividends are published.
+   */
+  RACEDAY_WINDOW_BEFORE_SEC?: string;
 }
 
 export function envNum(env: Env, key: keyof Env, fallback: number): number {
