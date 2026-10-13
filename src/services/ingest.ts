@@ -39,7 +39,9 @@ import { emitPush } from "../push/emit";
 import { formatHkNow, type PushRace } from "../push/envelope";
 import {
   decideFullSnapshotRaces,
+  emitOddsUpdateIfChanged,
   enqueueOddsDeltaBatch,
+  filterDeltaForPush,
   markFullSnapshots,
   maybeFlushOddsDeltaCoalesce,
 } from "../push/odds-emit";
@@ -454,26 +456,34 @@ export async function ingestOneMeeting(
   await runStage(env, "pushes", async () => {
     let piggybackOk = false;
     if (allDeltaChanges.length > 0) {
-      // Ingest is one-shot (no DO buffer): force-flush after enqueue.
-      const buf = await enqueueOddsDeltaBatch(env, null, {
-        meeting_date: meeting.meeting_date,
-        venue: meeting.venue,
-        nowMs,
-        captured_at,
-        sample_interval_s: null,
-        changes: allDeltaChanges,
-        races: pushRaces,
-        race_nos: deltaRaceNos,
-        source_last_updated_at: meetingSourceTime,
-      });
-      const flushed = await maybeFlushOddsDeltaCoalesce(env, buf, {
-        meeting_date: meeting.meeting_date,
-        venue: meeting.venue,
-        poolInvs,
-        nowMs,
-        force: true,
-      });
-      piggybackOk = flushed.flushed;
+      const gated = await filterDeltaForPush(
+        env,
+        meeting.meeting_date,
+        meeting.venue,
+        allDeltaChanges,
+      );
+      if (gated) {
+        // Ingest is one-shot (no DO buffer): force-flush after enqueue.
+        const buf = await enqueueOddsDeltaBatch(env, null, {
+          meeting_date: meeting.meeting_date,
+          venue: meeting.venue,
+          nowMs,
+          captured_at,
+          sample_interval_s: null,
+          changes: gated.changes,
+          races: pushRaces,
+          race_nos: deltaRaceNos,
+          source_last_updated_at: meetingSourceTime,
+        });
+        const flushed = await maybeFlushOddsDeltaCoalesce(env, buf, {
+          meeting_date: meeting.meeting_date,
+          venue: meeting.venue,
+          poolInvs,
+          nowMs,
+          force: true,
+        });
+        piggybackOk = flushed.flushed;
+      }
     }
 
     const dueFull = decideFullSnapshotRaces({
@@ -491,20 +501,23 @@ export async function ingestOneMeeting(
           expectedRaceNos: meeting.races.map((r) => r.race_no),
           available: pushRaces.length > 0 ? pushRaces : dueFull,
         });
-      const r = await emitPush(env, {
-        event: "odds_update",
+      const sent = await emitOddsUpdateIfChanged({
+        env,
         meeting_date: meeting.meeting_date,
         venue: meeting.venue,
         races: completeRaces,
         captured_at,
+        sample_interval_s: null,
         source_last_updated_at: meetingSourceTime,
         meta: {
           ...coverage,
           trigger_race_nos: dueFull.map((x) => x.race_no),
         },
       });
-      markFullSnapshots({}, completeRaces, nowMs);
-      piggybackOk = piggybackOk || r.result.success;
+      if (sent.emitted) {
+        markFullSnapshots({}, completeRaces, nowMs);
+        piggybackOk = true;
+      }
     }
 
     if (piggybackOk) {

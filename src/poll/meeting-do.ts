@@ -23,7 +23,9 @@ import { formatHkNow } from "../push/envelope";
 import {
   decideFullSnapshotRaces,
   emitIdleKeepalive,
+  emitOddsUpdateIfChanged,
   enqueueOddsDeltaBatch,
+  filterDeltaForPush,
   markFullSnapshots,
   maybeFlushOddsDeltaCoalesce,
   type FullSnapshotByRace,
@@ -33,7 +35,7 @@ import {
   finalRaceNo,
   firstRacePostMs,
   isInRaceDayHighFreqWindow,
-  pushCoalesceMs,
+  resolveCoalesceMs,
   racedayWindowBeforeSec,
   type CoalesceBuffer,
 } from "../push/odds-policy";
@@ -418,6 +420,32 @@ export class MeetingPoller implements DurableObject {
           null;
         let lastAnyPushAtMs =
           (await this.state.storage.get<number>("last_any_push_at_ms")) ?? null;
+        let lastOddsUpdateHash =
+          (await this.state.storage.get<string>("last_odds_update_hash")) ?? null;
+
+        const lastNo = finalRaceNo(meeting.races);
+        const finalDivs =
+          lastNo == null
+            ? false
+            : ((await this.state.storage.get<boolean>(
+                "final_dividends_published",
+              )) ??
+              (await raceHasPublishedDividends(
+                this.env.DB,
+                meeting.meeting_date,
+                meeting.venue,
+                lastNo,
+              )));
+        if (finalDivs) {
+          await this.state.storage.put("final_dividends_published", true);
+        }
+        const inHighFreqWindow = isInRaceDayHighFreqWindow({
+          nowMs,
+          firstPostMs: firstRacePostMs(meeting.races),
+          finalDividendsPublished: finalDivs,
+          windowBeforeSec: racedayWindowBeforeSec(this.env),
+        });
+        const coalesceMs = resolveCoalesceMs(this.env, inHighFreqWindow);
 
         // Flush coalesce window opened on a prior tick.
         {
@@ -429,6 +457,8 @@ export class MeetingPoller implements DurableObject {
               venue: meeting.venue,
               poolInvs,
               nowMs,
+              inHighFreqWindow,
+              coalesceMs,
             },
           );
           coalesceBuf = flushed.buffer;
@@ -436,105 +466,98 @@ export class MeetingPoller implements DurableObject {
         }
 
         if (allDeltaChanges.length > 0) {
-          coalesceBuf = await enqueueOddsDeltaBatch(this.env, coalesceBuf, {
-            meeting_date: meeting.meeting_date,
-            venue: meeting.venue,
-            nowMs,
-            captured_at,
-            sample_interval_s,
-            changes: allDeltaChanges,
-            races: changed,
-            race_nos: deltaRaceNos,
-            source_last_updated_at: meetingSourceTime,
-          });
-
-          // With POLL_INTERVAL_MS (3s) > PUSH_COALESCE_MS (2s), flush this tick
-          // so deltas are not held across a full poll interval. Shorter polls
-          // keep the buffer until the window elapses.
-          const coalesceMs = pushCoalesceMs(this.env);
-          const forceFlush =
-            coalesceMs <= 0 ||
-            (await this.state.storage.get<number>("current_interval_ms")) ===
-              undefined ||
-            prevIntervalMs >= coalesceMs;
-          const flushed = await maybeFlushOddsDeltaCoalesce(
+          // Compare against last-pushed odds (not last-polled) so float/format
+          // noise and standby/declared flip-flops do not re-emit.
+          const gated = await filterDeltaForPush(
             this.env,
-            coalesceBuf,
-            {
+            meeting.meeting_date,
+            meeting.venue,
+            allDeltaChanges,
+          );
+          if (gated) {
+            coalesceBuf = await enqueueOddsDeltaBatch(this.env, coalesceBuf, {
               meeting_date: meeting.meeting_date,
               venue: meeting.venue,
-              poolInvs,
               nowMs,
-              force: forceFlush,
-            },
-          );
-          coalesceBuf = flushed.buffer;
-          if (flushed.flushed) anyPushThisTick = true;
+              captured_at,
+              sample_interval_s,
+              changes: gated.changes,
+              races: changed,
+              race_nos: deltaRaceNos,
+              source_last_updated_at: meetingSourceTime,
+            });
+
+            // In-window: poll (3s) > coalesce (2s) → flush this tick.
+            // Off-window: 300s coalesce holds across many polls.
+            const forceFlush =
+              coalesceMs <= 0 ||
+              (await this.state.storage.get<number>("current_interval_ms")) ===
+                undefined ||
+              prevIntervalMs >= coalesceMs;
+            const flushed = await maybeFlushOddsDeltaCoalesce(
+              this.env,
+              coalesceBuf,
+              {
+                meeting_date: meeting.meeting_date,
+                venue: meeting.venue,
+                poolInvs,
+                nowMs,
+                force: forceFlush,
+                inHighFreqWindow,
+                coalesceMs,
+              },
+            );
+            coalesceBuf = flushed.buffer;
+            if (flushed.flushed) anyPushThisTick = true;
+          }
         }
 
-        const dueFull = decideFullSnapshotRaces({
-          env: this.env,
-          nowMs,
-          lastFullByRace,
-          changed: changedMeta,
-        });
-        // Root cause of incomplete seq327/329: we previously emitted only the
-        // due/changed subset. Always send a meeting-complete races[] (live +
-        // D1 fill) with covered_races / missing_races / race_source_ts.
-        if (dueFull.length > 0) {
-          const expectedRaceNos = meeting.races.map((r) => r.race_no);
-          const { races: completeRaces, meta: coverage } =
-            await buildCompleteSnapshotRaces({
+        // Outside the race-day high-freq window: no periodic/pool_status
+        // odds_update — only the offday heartbeat may send a full snapshot.
+        if (inHighFreqWindow) {
+          const dueFull = decideFullSnapshotRaces({
+            env: this.env,
+            nowMs,
+            lastFullByRace,
+            changed: changedMeta,
+          });
+          if (dueFull.length > 0) {
+            const expectedRaceNos = meeting.races.map((r) => r.race_no);
+            const { races: completeRaces, meta: coverage } =
+              await buildCompleteSnapshotRaces({
+                env: this.env,
+                meeting_date: meeting.meeting_date,
+                venue: meeting.venue,
+                expectedRaceNos,
+                available: latestRaces.length > 0 ? latestRaces : dueFull,
+              });
+            const sent = await emitOddsUpdateIfChanged({
               env: this.env,
               meeting_date: meeting.meeting_date,
               venue: meeting.venue,
-              expectedRaceNos,
-              available: latestRaces.length > 0 ? latestRaces : dueFull,
+              races: completeRaces,
+              captured_at,
+              sample_interval_s,
+              source_last_updated_at: meetingSourceTime,
+              cachedHash: lastOddsUpdateHash,
+              meta: {
+                ...coverage,
+                trigger_race_nos: dueFull.map((r) => r.race_no),
+              },
             });
-          await emitPush(this.env, {
-            event: "odds_update",
-            meeting_date: meeting.meeting_date,
-            venue: meeting.venue,
-            races: completeRaces,
-            captured_at,
-            sample_interval_s,
-            source_last_updated_at: meetingSourceTime,
-            meta: {
-              ...coverage,
-              trigger_race_nos: dueFull.map((r) => r.race_no),
-            },
-          });
-          lastFullByRace = markFullSnapshots(
-            lastFullByRace,
-            completeRaces,
-            nowMs,
-          );
-          anyPushThisTick = true;
+            if (sent.emitted) {
+              lastFullByRace = markFullSnapshots(
+                lastFullByRace,
+                completeRaces,
+                nowMs,
+              );
+              lastOddsUpdateHash = sent.hash;
+              anyPushThisTick = true;
+            }
+          }
         }
 
         if (!anyPushThisTick && changed.length === 0) {
-          const lastNo = finalRaceNo(meeting.races);
-          const finalDivs =
-            lastNo == null
-              ? false
-              : ((await this.state.storage.get<boolean>(
-                  "final_dividends_published",
-                )) ??
-                (await raceHasPublishedDividends(
-                  this.env.DB,
-                  meeting.meeting_date,
-                  meeting.venue,
-                  lastNo,
-                )));
-          if (finalDivs) {
-            await this.state.storage.put("final_dividends_published", true);
-          }
-          const inHighFreqWindow = isInRaceDayHighFreqWindow({
-            nowMs,
-            firstPostMs: firstRacePostMs(meeting.races),
-            finalDividendsPublished: finalDivs,
-            windowBeforeSec: racedayWindowBeforeSec(this.env),
-          });
           const idle = await emitIdleKeepalive({
             env: this.env,
             nowMs,
@@ -548,8 +571,10 @@ export class MeetingPoller implements DurableObject {
             latestRaces,
             expectedRaceNos: meeting.races.map((r) => r.race_no),
             inHighFreqWindow,
+            lastOddsUpdateHash,
           });
           lastFullByRace = idle.lastFullByRace;
+          lastOddsUpdateHash = idle.lastOddsUpdateHash;
           if (idle.emitted) anyPushThisTick = true;
         }
 
@@ -558,10 +583,12 @@ export class MeetingPoller implements DurableObject {
         }
 
         await this.state.storage.put("last_full_snapshot_by_race", lastFullByRace);
+        if (lastOddsUpdateHash != null) {
+          await this.state.storage.put("last_odds_update_hash", lastOddsUpdateHash);
+        }
         if (coalesceBuf && coalesceBuf.batches.length > 0) {
           await this.state.storage.put("odds_coalesce_buffer", coalesceBuf);
           // Wake before next poll if coalesce deadline is sooner.
-          const coalesceMs = pushCoalesceMs(this.env);
           if (coalesceMs > 0) {
             const deadline = coalesceBuf.opened_at_ms + coalesceMs;
             await this.state.storage.put("odds_coalesce_deadline_ms", deadline);
