@@ -445,8 +445,8 @@ curl -s -H "Authorization: Bearer $TOKEN" "$BASE/v1/horses/H087/injuries" | jq .
 | `POST` | `/v1/admin/backfill` | 回填一步；body 可选 `{"limit":5}` |
 | `POST` | `/v1/admin/test-push` | 推送 `event:"test"`（需有启用中的订阅者，或兜底 `PUSH_TARGET_URL`） |
 | `GET` | `/v1/admin/subscribers` | 列出订阅者（**不返回 secret**，仅 `has_secret`） |
-| `POST` | `/v1/admin/subscribers` | 新增订阅者：`{"url","secret?","enabled?"}` |
-| `PATCH` | `/v1/admin/subscribers/:id` | 更新 `url` / `secret` / `enabled`（`secret: null` 或 `""` 清除） |
+| `POST` | `/v1/admin/subscribers` | 新增：`{"url","secret?","enabled?","active_window?","window_before_sec?"}` |
+| `PATCH` | `/v1/admin/subscribers/:id` | 更新 `url` / `secret` / `enabled` / `active_window` / `window_before_sec`（`secret: null` 或 `""` 清除） |
 | `DELETE` | `/v1/admin/subscribers/:id` | 删除订阅者 |
 
 ```bash
@@ -462,6 +462,10 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/
   "$BASE/v1/admin/subscribers" | jq .
 curl -s -X PATCH -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"enabled":false}' "$BASE/v1/admin/subscribers/1" | jq .
+# Manus-style race-day window (3h before first post → final dividends)
+curl -s -X PATCH -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"active_window":"raceday","window_before_sec":10800}' \
+  "$BASE/v1/admin/subscribers/4" | jq .
 curl -s -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/v1/admin/subscribers/1" | jq .
 ```
 
@@ -475,12 +479,33 @@ curl -s -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/v1/admin/subscribers/
       "url": "https://webhook.site/…",
       "enabled": true,
       "has_secret": false,
+      "active_window": "always",
+      "window_before_sec": 10800,
       "created_at": "2026-10-08T00:00:00.000Z",
       "updated_at": "2026-10-08T00:00:00.000Z"
+    },
+    {
+      "id": 4,
+      "url": "https://api.manus.im/api/webhook/triggers/…",
+      "enabled": true,
+      "has_secret": true,
+      "active_window": "raceday",
+      "window_before_sec": 10800
     }
   ]
 }
 ```
+
+#### 订阅者投递窗口（`active_window`）
+
+| `active_window` | 行为 |
+|---|---|
+| `always`（默认） | 接收全部事件（含心跳 / off-window keepalive） |
+| `raceday` | **仅**在该会议窗口内投递：`[first_post − window_before_sec, final_race dividends)` |
+
+- `window_before_sec` 默认 **10800**（赛日前 3 小时）。窗口外：**不发送、不入队**（含 `no_update` / heartbeat）。
+- 窗口首次打开时，对该订阅者先发一条完整 `odds_update` 会议快照（`meta.window_open_snapshot: true`），再发后续事件。
+- 迁移 `0008_subscriber_active_window.sql` 将 **subscriber id=4**（Manus）设为 `raceday` / `10800`；其余保持 `always`。
 
 ---
 
@@ -910,7 +935,7 @@ app.post("/hook", express.raw({ type: "application/json" }), (req, res) => {
 | `odds_snapshots` | 赔率快照（`raw_json` + `content_hash`）；仅 hash 变才新行 |
 | `results` | 名次、最终赔率、派彩 JSON |
 | `change_events` | 退出/骑师变更等 |
-| `push_subscribers` | Webhook 订阅者（url / secret / enabled）；Admin API 管理 |
+| `push_subscribers` | Webhook 订阅者（url / secret / enabled / `active_window` / `window_before_sec`）；Admin API 管理 |
 | `push_seq` | 每会议单调 `seq` + `last_change_seq`/`last_change_at` |
 | `push_events` | 推送事件账本（每事件一份不可变 JSON） |
 | `push_log` / `pending_pushes` | 推送审计与按订阅者重试队列（含 `event_id`） |

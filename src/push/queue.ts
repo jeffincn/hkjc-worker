@@ -22,6 +22,10 @@ import { getPushEventById } from "./ledger";
 import { enqueueRetry } from "./pending";
 import { reserveDeliverySlot } from "./rate-limit";
 import { getSubscriber } from "./subscribers";
+import {
+  gateSubscriberDelivery,
+  maybeDeliverWindowOpenSnapshot,
+} from "./subscriber-window";
 
 /** Queue message: one (event, subscriber) delivery unit. */
 export interface PushDeliveryMessage {
@@ -73,6 +77,44 @@ export async function enqueueDeliveries(
 
   for (const target of targets) {
     const signed = !!(target.secret && target.secret.length > 0);
+
+    // Per-subscriber raceday window: outside → neither send nor queue.
+    let subRow =
+      target.subscriber_id != null
+        ? await getSubscriber(env, target.subscriber_id)
+        : null;
+    const windowGate = await gateSubscriberDelivery(env, subRow, envelope);
+    if (!windowGate.allowed) {
+      out.push({
+        subscriber_id: target.subscriber_id,
+        url: target.url,
+        http_status: null,
+        success: true,
+        signed,
+        skipped_window: true,
+        error_message: windowGate.reason ?? "outside active window",
+      });
+      continue;
+    }
+
+    // On first in-window delivery for a raceday subscriber, send full snapshot.
+    if (
+      subRow &&
+      subRow.active_window === "raceday" &&
+      envelope.meeting_date &&
+      envelope.venue
+    ) {
+      await maybeDeliverWindowOpenSnapshot({
+        env,
+        subscriber: subRow,
+        target,
+        meeting_date: envelope.meeting_date,
+        venue: envelope.venue,
+        context: windowGate.context,
+        fetchImpl,
+      });
+    }
+
     if (
       await isDuplicateBodyForSubscriber(
         env,
@@ -237,13 +279,14 @@ export async function processDeliveryMessage(
   }
 
   let target: ResolvedTarget | null = null;
+  let subRow = null as Awaited<ReturnType<typeof getSubscriber>>;
   if (msg.subscriber_id != null) {
-    const sub = await getSubscriber(env, msg.subscriber_id);
-    if (!sub || !sub.enabled) {
+    subRow = await getSubscriber(env, msg.subscriber_id);
+    if (!subRow || !subRow.enabled) {
       await bumpQueueBacklog(env, -1);
       return { ack: true };
     }
-    target = { subscriber_id: sub.id, url: sub.url, secret: sub.secret };
+    target = { subscriber_id: subRow.id, url: subRow.url, secret: subRow.secret };
   } else {
     const fallback = env.PUSH_TARGET_URL?.trim();
     if (!fallback) {
@@ -255,6 +298,30 @@ export async function processDeliveryMessage(
       url: fallback,
       secret: env.PUSH_SECRET?.trim() || null,
     };
+  }
+
+  // Drop if raceday window closed (do not leave forever-retrying).
+  const windowGate = await gateSubscriberDelivery(env, subRow, envelope);
+  if (!windowGate.allowed) {
+    await bumpQueueBacklog(env, -1);
+    return { ack: true };
+  }
+
+  if (
+    subRow &&
+    subRow.active_window === "raceday" &&
+    envelope.meeting_date &&
+    envelope.venue
+  ) {
+    await maybeDeliverWindowOpenSnapshot({
+      env,
+      subscriber: subRow,
+      target,
+      meeting_date: envelope.meeting_date,
+      venue: envelope.venue,
+      context: windowGate.context,
+      fetchImpl: opts?.fetchImpl,
+    });
   }
 
   const delivery = await deliverOne(env, msg.event_id, target, opts?.fetchImpl ?? fetch);
