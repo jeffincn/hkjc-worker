@@ -132,6 +132,8 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
       return latestOdds(env, url);
     case "/v1/odds/history":
       return oddsHistory(env, url);
+    case "/v1/odds/coverage":
+      return oddsCoverage(env, url);
     case "/v1/results":
       return listResults(env, url);
     case "/v1/changes":
@@ -283,6 +285,18 @@ async function handleHealth(env: Env): Promise<Response> {
     // worker_meta / counter may be unavailable
   }
 
+  // Odds poll coverage gaps (>10 min) — cheap meta read, not a table scan.
+  const { POLL_GAP_META_KEY, POLL_GAP_THRESHOLD_MS } = await import(
+    "../store/poll-ticks"
+  );
+  let odds_coverage_gap: unknown = null;
+  try {
+    const raw = await getMeta(env.DB, POLL_GAP_META_KEY);
+    if (raw) odds_coverage_gap = JSON.parse(raw);
+  } catch {
+    // ignore
+  }
+
   return jsonOk({
     ok: true,
     service: "hkjc-data-worker",
@@ -329,9 +343,13 @@ async function handleHealth(env: Env): Promise<Response> {
       final_position_in_backfill: null,
       horse_names_in_backfill: null,
       history_beyond_rbc_window: "unavailable via GraphQL",
+      /** Live poll presence gaps from poll_ticks (issue #26). */
+      odds_coverage_threshold_ms: POLL_GAP_THRESHOLD_MS,
+      odds_coverage: odds_coverage_gap,
     },
     alerts: {
       whitelist_error: whitelistAlert,
+      odds_coverage_gap,
     },
   });
 }
@@ -532,6 +550,13 @@ async function oddsHistory(env: Env, url: URL): Promise<Response> {
       created_at: string;
     }>();
   const codeByCloth = await horseCodeByCloth(env, date, venue, n);
+  const { loadRaceCoverage } = await import("../store/poll-ticks");
+  const coverage = await loadRaceCoverage({
+    db: env.DB,
+    meeting_date: date,
+    venue,
+    race_no: n,
+  });
   return jsonOk({
     date,
     venue,
@@ -544,6 +569,74 @@ async function oddsHistory(env: Env, url: URL): Promise<Response> {
       created_at: r.created_at,
       data: enrichOddsDataRunners(JSON.parse(r.raw_json), codeByCloth),
     })),
+    /** Intervals classified as static / changed / missing (issue #26). */
+    coverage: {
+      gap_threshold_ms: coverage.gap_threshold_ms,
+      gaps: coverage.gaps,
+      intervals: coverage.intervals,
+      tick_count: coverage.ticks.length,
+    },
+  });
+}
+
+/** Poll presence / coverage for one race (or all races when race_no omitted). */
+async function oddsCoverage(env: Env, url: URL): Promise<Response> {
+  const date = url.searchParams.get("date");
+  const venue = url.searchParams.get("venue");
+  const raceNo = url.searchParams.get("race_no");
+  if (!date || !venue) return jsonError(400, "date and venue required");
+
+  const {
+    listPollTicks,
+    loadRaceCoverage,
+    detectGapsForRace,
+    buildCoverageIntervals,
+    POLL_GAP_THRESHOLD_MS,
+  } = await import("../store/poll-ticks");
+
+  if (raceNo != null && raceNo !== "") {
+    const n = Number(raceNo);
+    if (!Number.isFinite(n) || n <= 0) {
+      return jsonError(400, "race_no must be a positive number");
+    }
+    const coverage = await loadRaceCoverage({
+      db: env.DB,
+      meeting_date: date,
+      venue,
+      race_no: n,
+    });
+    return jsonOk({
+      date,
+      venue,
+      race_no: n,
+      gap_threshold_ms: coverage.gap_threshold_ms,
+      ticks: coverage.ticks,
+      gaps: coverage.gaps,
+      intervals: coverage.intervals,
+    });
+  }
+
+  const ticks = await listPollTicks(env.DB, date, venue);
+  const byRace = new Map<number, typeof ticks>();
+  for (const t of ticks) {
+    const list = byRace.get(t.race_no) ?? [];
+    list.push(t);
+    byRace.set(t.race_no, list);
+  }
+  const races = [...byRace.keys()].sort((a, b) => a - b).map((race_no) => {
+    const raceTicks = byRace.get(race_no) ?? [];
+    return {
+      race_no,
+      tick_count: raceTicks.length,
+      gaps: detectGapsForRace({ race_no, ticks: raceTicks }),
+      intervals: buildCoverageIntervals({ ticks: raceTicks }),
+    };
+  });
+  return jsonOk({
+    date,
+    venue,
+    gap_threshold_ms: POLL_GAP_THRESHOLD_MS,
+    races,
   });
 }
 

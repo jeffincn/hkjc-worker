@@ -258,6 +258,18 @@ CREATE TABLE IF NOT EXISTS graphql_usage (
 );
 CREATE INDEX IF NOT EXISTS idx_push_events_meeting_seq
   ON push_events (meeting_date, venue, seq);
+CREATE TABLE IF NOT EXISTS poll_ticks (
+  meeting_date TEXT NOT NULL,
+  venue TEXT NOT NULL,
+  race_no INTEGER NOT NULL,
+  tick_minute TEXT NOT NULL,
+  changed INTEGER NOT NULL DEFAULT 0,
+  last_tick_at TEXT NOT NULL,
+  tick_count INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY (meeting_date, venue, race_no, tick_minute)
+);
+CREATE INDEX IF NOT EXISTS idx_poll_ticks_race
+  ON poll_ticks (meeting_date, venue, race_no, tick_minute);
 `;
 
 beforeAll(async () => {

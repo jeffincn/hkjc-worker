@@ -13,6 +13,8 @@ export type PushEvent =
   | "whitelist_alert"
   | "source_blocked"
   | "source_recovered"
+  /** Poll presence gap >10 min (issue #26); ops alert, not LIVE_PUSH-gated. */
+  | "odds_coverage_gap"
   | "horse_update"
   | "injury_update"
   | "runs_update"
@@ -306,7 +308,7 @@ export function buildEnvelope(args: BuildEnvelopeArgs): PushEnvelope {
   return envelope;
 }
 
-/** Live events gated by LIVE_PUSH_ENABLED (test / schedule / backfill_progress / whitelist_alert / source_blocked / source_recovered always allowed). */
+/** Live events gated by LIVE_PUSH_ENABLED (test / schedule / backfill_progress / whitelist_alert / source_blocked / source_recovered / odds_coverage_gap always allowed). */
 export function isLivePushEvent(event: PushEvent): boolean {
   return (
     event === "odds_update" ||

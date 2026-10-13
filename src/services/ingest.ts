@@ -65,6 +65,11 @@ import {
   storeChangeHistories,
   storeDividendsAsResults,
 } from "../store/db";
+import {
+  evaluateAndAlertCoverageGaps,
+  recordPollTicks,
+  type PollTickInput,
+} from "../store/poll-ticks";
 import { runHorseCodeBackfill } from "./horse-code-backfill";
 import { storeRawDocument } from "../store/horses";
 import { createSubrequestBudget, type SubrequestBudget } from "../util/budget";
@@ -283,6 +288,8 @@ export async function ingestOneMeeting(
   const nowMs = Date.now();
 
   // Priority: odds fetch + lock/result enqueue
+  const pollTickInputs: PollTickInput[] = [];
+  const tickAt = new Date(nowMs).toISOString();
   await runStage(env, "odds", async () => {
     sub.charge(1, { force: true });
     const oddsRes = await fetchGraphQL<PmPoolsOddsData>({
@@ -316,6 +323,7 @@ export async function ingestOneMeeting(
         plaPool: pair?.pla,
       });
       sourceTimes.push(snap.payload.last_update);
+      let oddsChanged = false;
 
       if (isStorableOddsSnapshot(snap)) {
         const hadPriorOpen = await raceHadOpenOddsSnapshot(
@@ -335,6 +343,7 @@ export async function ingestOneMeeting(
           env,
         );
         if (ins.inserted) {
+          oddsChanged = true;
           changed++;
           const pushRace = toPushRace(snap);
           pushRaces.push(pushRace);
@@ -364,6 +373,12 @@ export async function ingestOneMeeting(
         }
       }
 
+      pollTickInputs.push({
+        race_no: race.race_no,
+        changed: oddsChanged,
+        tick_at: tickAt,
+      });
+
       for (const r of race.runners) {
         if (isScratchedStatus(r.status)) scratched = true;
       }
@@ -371,6 +386,23 @@ export async function ingestOneMeeting(
       if (resultsComplete(race)) {
         resultRaces.push(toPushRace(snap));
       }
+    }
+
+    if (pollTickInputs.length > 0) {
+      await recordPollTicks(
+        env,
+        meeting.meeting_date,
+        meeting.venue,
+        pollTickInputs,
+      );
+      await evaluateAndAlertCoverageGaps(env, {
+        meeting_date: meeting.meeting_date,
+        venue: meeting.venue,
+        race_nos: pollTickInputs.map((t) => t.race_no),
+        captured_at,
+        sample_interval_s: null,
+        nowMs,
+      });
     }
   });
 
