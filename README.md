@@ -526,13 +526,20 @@ curl -s -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/v1/admin/subscribers/
 | `post_start` | 捕获时至少一场的 `post_time` 已过 |
 | `late_ms` | `sent_at - captured_at`（毫秒） |
 
-### 4.3 变更才推（hash diff）+ 心跳
+### 4.3 变更才推（hash diff）+ 节流推送 + 赛日感知心跳
 
-1. 每次拉取都会尝试入库。
+1. 每次拉取都会尝试入库（D1 `odds_snapshots` 仍按 hash 去重写入）。
 2. 对载荷做稳定 canonical JSON → SHA-256。
-3. **与上一份 hash 相同**：不推 `odds_update`/`odds_delta`；MeetingPoller 在会议进行中可发 **`no_update` 心跳**（快窗 ≤30 分钟距开跑：最多 1 次/60s；否则最多 1 次/5min）。
-4. **hash 不同**：写新快照，推 `odds_update`（兼容）+ `odds_delta`（差分）。
-5. 马匹类推送 **按会议批量**（`meta.horse_codes`），**绝不逐马刷屏**。
+3. **与上一份 hash 相同**：不推赔率事件；仅在心跳窗口到期且本窗口内无其它推送时发 keepalive（见下）。
+4. **hash 不同**：
+   - **始终**推 `odds_delta`（`changes[]` 含 prev/new）；同会议在 `PUSH_COALESCE_MS`（默认 **2000**）内的多次观测合并为**一条** `odds_delta`，每条 change 保留自己的 `captured_at` / `seq` / `sample_interval_s`。
+   - **不再**每次都推全量 `odds_update`。全量快照仅在：该场**首次**快照、**pool_status 变化**、或距上次全量 ≥ `PUSH_FULL_SNAPSHOT_INTERVAL_SEC`（默认 **300**）时推送。
+5. **赛日高频窗口**（按会议）：从**第一场** `post_time` 前 `RACEDAY_WINDOW_BEFORE_SEC`（默认 **7200** = 2h）起，到**最后一场派彩（dividends）已入库**止。
+   - **窗口内**：变更才推 + 2s coalesce；空闲 keepalive = `HEARTBEAT_INTERVAL_SEC`（默认 **300**）。若同期全量快照也到期，合并为**一次** `odds_update`（`meta.merged_heartbeat`），否则发 `no_update`。
+   - **窗口外**（非赛日 / 赛日前 / 派彩后）：keepalive = `OFFDAY_HEARTBEAT_INTERVAL_SEC`（默认 **1800**），且**始终**与全量 `odds_update` 合并为一次推送（接收方每 30 分钟只需应答一次）。
+6. 马匹类推送 **按会议批量**（`meta.horse_codes`），**绝不逐马刷屏**。
+
+**3s 轮询下的量级（示意）**：原先约每小时 ~73×`odds_update` + ~72×`odds_delta`（变更双发）。节流后约 ~N×`odds_delta`（N≈变更 tick 数，3s>2s 时几乎不跨 tick 合并）+ 少量全量 `odds_update`（首场/状态变/≤每 5min）+ 赛日空闲 ≤12 次/小时 keepalive（或与到期快照合并）。窗口外约 2 次/小时合并快照。
 
 ### 4.4 `LIVE_PUSH_ENABLED` 门闩
 
@@ -549,7 +556,7 @@ curl -s -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/v1/admin/subscribers/
 
 #### `odds_delta`（1.1 新增）
 
-每次检测到赔率变化时与 `odds_update` **一并**发出。`changes[]` 每条 = 一匹马 × 一种彩种（`WIN`/`PLA`）；首次观测 `prev_odds` 为 `null`。`pools[].investment` 为**整池总投注额**（来自 `raceMeetings` 的 `poolInvs.investment`）；赔率白名单 query `QUERY_PM_POOLS_ODDS` **不含** `investment`，取不到时为 `null`（永不把池总额写成单马金额）。
+赔率变化时的主推送（全量 `odds_update` 仅按 §4.3 门控）。`changes[]` 每条 = 一匹马 × 一种彩种（`WIN`/`PLA`）；首次观测 `prev_odds` 为 `null`。合并窗口内发出的 `odds_delta` 会在每条 change 上带 `captured_at` / `seq` / `sample_interval_s`。`pools[].investment` 为**整池总投注额**（来自 `raceMeetings` 的 `poolInvs.investment`）；赔率白名单 query `QUERY_PM_POOLS_ODDS` **不含** `investment`，取不到时为 `null`（永不把池总额写成单马金额）。
 
 ```json
 {
@@ -625,7 +632,9 @@ curl -s -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/v1/admin/subscribers/
 }
 ```
 
-#### `odds_update`（兼容快照）
+#### `odds_update`（兼容快照，门控推送）
+
+仅在首次快照 / `pool_status` 变化 / 每场至多每 `PUSH_FULL_SNAPSHOT_INTERVAL_SEC`，或作为赛日/非赛日 keepalive（可与心跳合并）时推送。信封形状不变：
 
 ```json
 {
@@ -667,7 +676,7 @@ curl -s -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/v1/admin/subscribers/
 
 #### `no_update`（1.1 心跳）
 
-无赔率变化时由 MeetingPoller 发出；`last_change_seq` / `last_change_at` 区分「无变化」与「漏收」。
+赛日高频窗口内、无赔率变化且本心跳周期内无其它推送、且全量快照尚未到期时由 MeetingPoller 发出；`last_change_seq` / `last_change_at` 区分「无变化」与「漏收」。窗口外优先发合并后的 `odds_update` keepalive，而不是单独的 `no_update`。
 
 ```json
 {
@@ -950,6 +959,11 @@ app.post("/hook", express.raw({ type: "application/json" }), (req, res) => {
 | `PUSH_RATE_PER_SUB_PER_SEC` | var | `2` | 每订阅者每秒最大 HTTP 投递数；超额 delay 不丢弃 |
 | `PUSH_BACKLOG_COALESCE_MIN` | var | `2` | 每订阅者 pending 达到此数时合并为 `backlog_replay` |
 | `PUSH_BACKLOG_MAX_CHANGES` | var | `200` | 单个 `backlog_replay` 最多包含的 odds change 行数 |
+| `PUSH_FULL_SNAPSHOT_INTERVAL_SEC` | var | `300` | 每场全量 `odds_update` 最短间隔（另：首次 / pool_status 变） |
+| `PUSH_COALESCE_MS` | var | `2000` | 同会议多次赔率变更合并为一条 `odds_delta` 的窗口 |
+| `HEARTBEAT_INTERVAL_SEC` | var | `300` | 赛日高频窗口内空闲 keepalive 间隔 |
+| `OFFDAY_HEARTBEAT_INTERVAL_SEC` | var | `1800` | 窗口外 / 非赛日 keepalive（与全量快照合并） |
+| `RACEDAY_WINDOW_BEFORE_SEC` | var | `7200` | 高频窗口：第一场 post 前多少秒开启（至末场 dividends） |
 | `POLLER_STALE_MS` | var | `600000` | cron watchdog 判定 MeetingPoller 过期并重武装 |
 
 `wrangler.toml` 已配置自定义域名：
@@ -1087,7 +1101,7 @@ npx wrangler secret put LIVE_PUSH_ENABLED   # 设为 true
 1. **Meeting tree hash 门控**（DO storage）：对规范化会议树算 content hash；仅 hash 变化时调用 `persistMeetingTree`。  
 2. **Upsert 同值 no-op**：`ON CONFLICT DO UPDATE … WHERE … IS DISTINCT FROM …`，cron/回填路径也不会重写相同行。  
 3. **`last_fetch_at`**：每次 poll 写入 DO storage；**最多每 5 分钟**刷到 D1（`/health` 仍读 D1）。  
-4. **赔率快照**：仍用 `insertOddsSnapshotIfChanged`（hash 去重）；推送语义不变（`odds_update` 仅变赔率；`lock`/`result` 每场一次）。
+4. **赔率快照**：仍用 `insertOddsSnapshotIfChanged`（hash 去重）；推送见 §4.3（`odds_delta` 为主，`odds_update` 门控；`lock`/`result` 每场一次）。
 
 ### 预期写入量（量级）
 

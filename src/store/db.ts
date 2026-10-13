@@ -453,6 +453,28 @@ export async function storeDividendsAsResults(
     .run();
 }
 
+/**
+ * True when any result row for this race has a non-null dividends_json
+ * (final race dividends published → race-day high-freq window can close).
+ */
+export async function raceHasPublishedDividends(
+  db: D1Database,
+  meetingDate: string,
+  venue: string,
+  raceNo: number,
+): Promise<boolean> {
+  const row = await db
+    .prepare(
+      `SELECT 1 AS ok FROM results
+       WHERE meeting_date=? AND venue=? AND race_no=?
+         AND dividends_json IS NOT NULL AND TRIM(dividends_json) NOT IN ('', 'null', '[]')
+       LIMIT 1`,
+    )
+    .bind(meetingDate, venue, raceNo)
+    .first<{ ok: number }>();
+  return row != null;
+}
+
 export async function setMeta(db: D1Database, key: string, value: string): Promise<void> {
   await db
     .prepare(

@@ -31,7 +31,6 @@ import {
 } from "../parse/meeting";
 import { buildRaceOddsSnapshot, poolsByRace } from "../parse/odds";
 import {
-  buildPoolInvestments,
   computeOddsDeltaChanges,
   maxSourceTime,
   type HorseNamePair,
@@ -39,11 +38,18 @@ import {
 import { emitPush } from "../push/emit";
 import { formatHkNow, type PushRace } from "../push/envelope";
 import {
+  decideFullSnapshotRaces,
+  enqueueOddsDeltaBatch,
+  markFullSnapshots,
+  maybeFlushOddsDeltaCoalesce,
+} from "../push/odds-emit";
+import {
   createRetryRunState,
   flushDueRetries,
   piggybackPending,
   type RetryRunState,
 } from "../push/pusher";
+import type { RaceOddsSnapshot } from "../parse/odds";
 import {
   insertOddsSnapshotIfChanged,
   persistMeetingTree,
@@ -262,6 +268,11 @@ export async function ingestOneMeeting(
   const resultRaces: PushRace[] = [];
   const allDeltaChanges: ReturnType<typeof computeOddsDeltaChanges> = [];
   const deltaRaceNos: number[] = [];
+  const changedMeta: Array<{
+    previous: RaceOddsSnapshot | null;
+    next: RaceOddsSnapshot;
+    pushRace: PushRace;
+  }> = [];
   const sourceTimes: Array<string | null> = [];
   let scratched = false;
   const poolInvs = rawMeeting.poolInvs ?? [];
@@ -321,6 +332,11 @@ export async function ingestOneMeeting(
           const pushRace = toPushRace(snap);
           pushRaces.push(pushRace);
           deltaRaceNos.push(race.race_no);
+          changedMeta.push({
+            previous: ins.previous,
+            next: snap,
+            pushRace,
+          });
           allDeltaChanges.push(
             ...computeOddsDeltaChanges({
               prev: ins.previous,
@@ -444,34 +460,54 @@ export async function ingestOneMeeting(
     }
   });
 
-  // Priority pushes: odds / lock / result (enqueue is cheap vs HTTP fan-out)
+  // Priority pushes: odds_delta (coalesced) + gated odds_update / lock / result
   await runStage(env, "pushes", async () => {
-    if (pushRaces.length > 0) {
+    let piggybackOk = false;
+    if (allDeltaChanges.length > 0) {
+      // Ingest is one-shot (no DO buffer): force-flush after enqueue.
+      const buf = await enqueueOddsDeltaBatch(env, null, {
+        meeting_date: meeting.meeting_date,
+        venue: meeting.venue,
+        nowMs,
+        captured_at,
+        sample_interval_s: null,
+        changes: allDeltaChanges,
+        races: pushRaces,
+        race_nos: deltaRaceNos,
+        source_last_updated_at: meetingSourceTime,
+      });
+      const flushed = await maybeFlushOddsDeltaCoalesce(env, buf, {
+        meeting_date: meeting.meeting_date,
+        venue: meeting.venue,
+        poolInvs,
+        nowMs,
+        force: true,
+      });
+      piggybackOk = flushed.flushed;
+    }
+
+    const fullRaces = decideFullSnapshotRaces({
+      env,
+      nowMs,
+      lastFullByRace: {},
+      changed: changedMeta,
+    });
+    if (fullRaces.length > 0) {
       const r = await emitPush(env, {
         event: "odds_update",
         meeting_date: meeting.meeting_date,
         venue: meeting.venue,
-        races: pushRaces,
+        races: fullRaces,
         captured_at,
         source_last_updated_at: meetingSourceTime,
       });
-      if (allDeltaChanges.length > 0) {
-        await emitPush(env, {
-          event: "odds_delta",
-          meeting_date: meeting.meeting_date,
-          venue: meeting.venue,
-          races: pushRaces,
-          changes: allDeltaChanges,
-          pools: buildPoolInvestments(poolInvs, deltaRaceNos),
-          captured_at,
-          source_last_updated_at: meetingSourceTime,
-        });
-      }
-      // last_push_* is updated inside delivery on any success; piggyback only
-      // when at least one subscriber accepted (direct path) or enqueue succeeded.
-      if (r.result.success) {
-        await piggybackPending(env, { retryState });
-      }
+      // Touch mark helper for symmetry (ingest has no persistent lastFull map).
+      markFullSnapshots({}, fullRaces, nowMs);
+      piggybackOk = piggybackOk || r.result.success;
+    }
+
+    if (piggybackOk) {
+      await piggybackPending(env, { retryState });
     }
 
     if (lockRaces.length > 0) {

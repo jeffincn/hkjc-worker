@@ -80,6 +80,13 @@ export interface OddsDeltaChange {
   source_last_updated_at: string | null;
   race_post_time: string | null;
   pool_status: string | null;
+  /**
+   * Present on live-coalesced odds_delta (and backlog_replay): originating
+   * observation time / seq / poll interval for this change row.
+   */
+  captured_at?: string;
+  seq?: number;
+  sample_interval_s?: number | null;
 }
 
 export interface OddsPoolInvestment {
