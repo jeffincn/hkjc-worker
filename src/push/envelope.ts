@@ -26,12 +26,15 @@ export const ODDS_BASIS =
   "HKD total return per $1 unit incl. stake" as const;
 
 export interface PushRunner {
+  /** Stable HKJC horse/runner identity — never cloth number alone. */
+  runner_id?: string;
   horse_no: number;
   horse_name: string | null;
   /** Additive 1.1 field; omitted by older producers. */
   horse_name_ch?: string | null;
   win_odds: number | null;
   place_odds: number | null;
+  /** Declared | Standby preferred; legacy may carry raw HKJC status. */
   status: string | null;
   final_position: number | null;
 }
@@ -43,6 +46,11 @@ export interface PushRace {
   pool_status: string | null;
   /** Per-race pmPools lastUpdateTime (or null when unknown). */
   source_last_updated_at?: string | null;
+  /**
+   * Per-race source timestamp, always Asia/Hong_Kong (`+08:00`) when known.
+   * Same instant as source_last_updated_at when that value is already HK wall time.
+   */
+  source_ts?: string | null;
   runners: PushRunner[];
 }
 
@@ -70,10 +78,21 @@ export type OddsBetType = "WIN" | "PLA";
 
 export interface OddsDeltaChange {
   race_no: number;
+  /** @deprecated Prefer horse_no; kept for 1.1 receivers (= cloth / standby number). */
   runner_no: number;
+  /** Stable runner identity (HKJC horse code / id). */
+  runner_id?: string;
+  /** Cloth or standby number (not unique across Declared vs Standby). */
+  horse_no?: number;
   horse_name_ch: string | null;
   horse_name_en: string | null;
+  /** Convenience alias of horse_name_en for receivers. */
+  horse_name?: string | null;
+  /** Declared | Standby. */
+  status?: string | null;
   bet_type: OddsBetType;
+  /** Same as bet_type (WIN | PLA); explicit pool label for receivers. */
+  pool?: OddsBetType;
   odds_basis: typeof ODDS_BASIS;
   prev_odds: number | null;
   new_odds: number | null;
@@ -92,7 +111,11 @@ export interface OddsDeltaChange {
 export interface OddsPoolInvestment {
   race_no: number;
   bet_type: OddsBetType;
-  /** Pool total turnover from raceMeetings poolInvs.investment; null if unavailable. */
+  /**
+   * Official HKJC WIN/PLA pool **cumulative** turnover (`raceMeetings.poolInvs.investment`),
+   * currency HKD, whole pool (not per-horse, not a delta since last push). Null when the
+   * odds whitelist query has no investment field.
+   */
   investment: number | null;
 }
 

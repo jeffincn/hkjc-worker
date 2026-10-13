@@ -44,6 +44,10 @@ import {
   maybeFlushOddsDeltaCoalesce,
 } from "../push/odds-emit";
 import {
+  buildCompleteSnapshotRaces,
+  snapshotToPushRace,
+} from "../push/snapshot-coverage";
+import {
   createRetryRunState,
   flushDueRetries,
   piggybackPending,
@@ -64,39 +68,19 @@ import { runStage } from "../util/stage";
 import { rearmStalePollers } from "../poll/watchdog";
 import { refreshMeetingHorses } from "./horses";
 
-function namesForRace(
-  meeting: ReturnType<typeof normalizeMeeting>,
-  raceNo: number,
-): Map<number, HorseNamePair> {
-  const map = new Map<number, HorseNamePair>();
-  const race = meeting.races.find((r) => r.race_no === raceNo);
-  for (const r of race?.runners ?? []) {
-    map.set(r.horse_no, {
-      horse_name_en: r.name_en ?? null,
-      horse_name_ch: r.name_ch ?? null,
+function namesForRace(snap: RaceOddsSnapshot): Map<string, HorseNamePair> {
+  const map = new Map<string, HorseNamePair>();
+  for (const r of snap.runners) {
+    map.set(r.runner_id, {
+      horse_name_en: r.horse_name,
+      horse_name_ch: null,
     });
   }
   return map;
 }
 
-function toPushRace(
-  snap: {
-    race_no: number;
-    post_time: string | null;
-    snapshot_time: string;
-    pool_status: string | null;
-    runners: PushRace["runners"];
-    payload?: { last_update: string | null };
-  },
-): PushRace {
-  return {
-    race_no: snap.race_no,
-    post_time: snap.post_time,
-    snapshot_time: snap.snapshot_time,
-    pool_status: snap.pool_status,
-    source_last_updated_at: snap.payload?.last_update ?? null,
-    runners: snap.runners,
-  };
+function toPushRace(snap: RaceOddsSnapshot): PushRace {
+  return snapshotToPushRace(snap);
 }
 
 export async function ingestActiveMeeting(env: Env): Promise<{
@@ -341,7 +325,7 @@ export async function ingestOneMeeting(
             ...computeOddsDeltaChanges({
               prev: ins.previous,
               next: snap,
-              horseNames: namesForRace(meeting, race.race_no),
+              horseNames: namesForRace(snap),
             }),
           );
           if (
@@ -486,23 +470,34 @@ export async function ingestOneMeeting(
       piggybackOk = flushed.flushed;
     }
 
-    const fullRaces = decideFullSnapshotRaces({
+    const dueFull = decideFullSnapshotRaces({
       env,
       nowMs,
       lastFullByRace: {},
       changed: changedMeta,
     });
-    if (fullRaces.length > 0) {
+    if (dueFull.length > 0) {
+      const { races: completeRaces, meta: coverage } =
+        await buildCompleteSnapshotRaces({
+          env,
+          meeting_date: meeting.meeting_date,
+          venue: meeting.venue,
+          expectedRaceNos: meeting.races.map((r) => r.race_no),
+          available: pushRaces.length > 0 ? pushRaces : dueFull,
+        });
       const r = await emitPush(env, {
         event: "odds_update",
         meeting_date: meeting.meeting_date,
         venue: meeting.venue,
-        races: fullRaces,
+        races: completeRaces,
         captured_at,
         source_last_updated_at: meetingSourceTime,
+        meta: {
+          ...coverage,
+          trigger_race_nos: dueFull.map((x) => x.race_no),
+        },
       });
-      // Touch mark helper for symmetry (ingest has no persistent lastFull map).
-      markFullSnapshots({}, fullRaces, nowMs);
+      markFullSnapshots({}, completeRaces, nowMs);
       piggybackOk = piggybackOk || r.result.success;
     }
 
@@ -619,7 +614,16 @@ export async function sendTestPush(env: Env): Promise<unknown> {
     meeting_date = row.meeting_date;
     venue = row.venue;
     source_last_updated_at = data.payload?.last_update ?? null;
-    races = [toPushRace(data)];
+    races = [
+      {
+        race_no: data.race_no,
+        post_time: data.post_time,
+        snapshot_time: data.snapshot_time,
+        pool_status: data.pool_status,
+        source_last_updated_at: data.payload?.last_update ?? null,
+        runners: data.runners,
+      },
+    ];
   }
 
   const { envelope, result } = await emitPush(

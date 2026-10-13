@@ -24,6 +24,8 @@ export interface ActiveMeetingSummary {
 }
 
 export interface RunnerRaw {
+  /** HKJC runner node id (stable within a meeting when present). */
+  id?: string;
   no: string | number;
   standbyNo?: string;
   status?: string;
