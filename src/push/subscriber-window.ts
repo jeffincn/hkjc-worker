@@ -22,6 +22,10 @@ import { finalRaceNo, isInRaceDayHighFreqWindow } from "./odds-policy";
 import { allocatePushSeq, markLastChange } from "./seq";
 import { buildCompleteSnapshotRaces } from "./snapshot-coverage";
 import {
+  gateQuietHours,
+  markSubscriberWasQuiet,
+} from "./quiet-hours";
+import {
   DEFAULT_SUBSCRIBER_WINDOW_BEFORE_SEC,
   type PushSubscriber,
 } from "./subscribers";
@@ -104,52 +108,90 @@ export interface WindowGateResult {
   allowed: boolean;
   /** True when mode is raceday and now is inside the meeting window. */
   in_window: boolean;
+  /** True when HK clock is inside subscriber quiet hours. */
+  in_quiet?: boolean;
+  /** Allowed only because meeting still in progress through quiet hours. */
+  in_progress_exception?: boolean;
   reason?: string;
   context?: MeetingWindowContext;
 }
 
 /**
  * Decide whether this subscriber may receive / be queued for `envelope`.
- * Fallback target (no subscriber row) is treated as `always`.
+ * Fallback target (no subscriber row) is treated as `always` + no quiet hours.
+ *
+ * Order: raceday active_window → quiet hours (with in-progress exception).
  */
 export async function gateSubscriberDelivery(
   env: Env,
-  sub: Pick<PushSubscriber, "active_window" | "window_before_sec"> | null,
+  sub: Pick<
+    PushSubscriber,
+    "id" | "active_window" | "window_before_sec" | "quiet_start" | "quiet_end"
+  > | null,
   envelope: Pick<PushEnvelope, "meeting_date" | "venue" | "event">,
   nowMs: number = Date.now(),
 ): Promise<WindowGateResult> {
   const mode = sub?.active_window ?? "always";
-  if (mode !== "raceday") {
-    return { allowed: true, in_window: true };
+  let context: MeetingWindowContext | undefined;
+  let in_window = true;
+
+  if (mode === "raceday") {
+    const meetingDate = envelope.meeting_date;
+    const venue = envelope.venue;
+    if (!meetingDate || !venue) {
+      return {
+        allowed: false,
+        in_window: false,
+        reason: "raceday subscriber requires meeting_date+venue",
+      };
+    }
+
+    context = await loadMeetingWindowContext(env.DB, meetingDate, venue);
+    const before = sub?.window_before_sec ?? DEFAULT_SUBSCRIBER_WINDOW_BEFORE_SEC;
+    in_window = isInSubscriberRaceDayWindow({
+      nowMs,
+      firstPostMs: context.firstPostMs,
+      finalDividendsPublished: context.finalDividendsPublished,
+      windowBeforeSec: before,
+    });
+    if (!in_window) {
+      return {
+        allowed: false,
+        in_window: false,
+        reason: "outside subscriber raceday window",
+        context,
+      };
+    }
   }
 
-  const meetingDate = envelope.meeting_date;
-  const venue = envelope.venue;
-  if (!meetingDate || !venue) {
-    return {
-      allowed: false,
-      in_window: false,
-      reason: "raceday subscriber requires meeting_date+venue",
-    };
-  }
-
-  const ctx = await loadMeetingWindowContext(env.DB, meetingDate, venue);
-  const before = sub?.window_before_sec ?? DEFAULT_SUBSCRIBER_WINDOW_BEFORE_SEC;
-  const inWindow = isInSubscriberRaceDayWindow({
+  // Quiet hours (00:00–08:00 HKT by default). In-progress meetings exempt.
+  const quiet = await gateQuietHours({
+    env,
+    sub,
+    envelope,
     nowMs,
-    firstPostMs: ctx.firstPostMs,
-    finalDividendsPublished: ctx.finalDividendsPublished,
-    windowBeforeSec: before,
+    context,
   });
-  if (!inWindow) {
+  if (!quiet.allowed) {
+    if (sub?.id != null) {
+      await markSubscriberWasQuiet(env, sub.id);
+    }
     return {
       allowed: false,
-      in_window: false,
-      reason: "outside subscriber raceday window",
-      context: ctx,
+      in_window,
+      in_quiet: true,
+      reason: quiet.reason ?? "subscriber quiet hours",
+      context,
     };
   }
-  return { allowed: true, in_window: true, context: ctx };
+
+  return {
+    allowed: true,
+    in_window,
+    in_quiet: quiet.in_quiet,
+    in_progress_exception: quiet.in_progress_exception,
+    context,
+  };
 }
 
 function windowSnapMetaKey(

@@ -22,6 +22,7 @@ import { getPushEventById } from "./ledger";
 import { enqueueRetry } from "./pending";
 import { reserveDeliverySlot } from "./rate-limit";
 import { getSubscriber } from "./subscribers";
+import { maybeDeliverPostQuietSnapshot } from "./quiet-hours";
 import {
   gateSubscriberDelivery,
   maybeDeliverWindowOpenSnapshot,
@@ -95,6 +96,19 @@ export async function enqueueDeliveries(
         error_message: windowGate.reason ?? "outside active window",
       });
       continue;
+    }
+
+    // After quiet hours: one full snapshot if content changed since last push.
+    if (subRow && envelope.meeting_date && envelope.venue) {
+      await maybeDeliverPostQuietSnapshot({
+        env,
+        subscriber: subRow,
+        target,
+        meeting_date: envelope.meeting_date,
+        venue: envelope.venue,
+        expectedRaceNos: windowGate.context?.expectedRaceNos,
+        fetchImpl,
+      });
     }
 
     // On first in-window delivery for a raceday subscriber, send full snapshot.
@@ -305,6 +319,18 @@ export async function processDeliveryMessage(
   if (!windowGate.allowed) {
     await bumpQueueBacklog(env, -1);
     return { ack: true };
+  }
+
+  if (subRow && envelope.meeting_date && envelope.venue) {
+    await maybeDeliverPostQuietSnapshot({
+      env,
+      subscriber: subRow,
+      target,
+      meeting_date: envelope.meeting_date,
+      venue: envelope.venue,
+      expectedRaceNos: windowGate.context?.expectedRaceNos,
+      fetchImpl: opts?.fetchImpl,
+    });
   }
 
   if (
