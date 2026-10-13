@@ -1,3 +1,4 @@
+import type { Env } from "../env";
 import type { NormalizedMeeting, NormalizedRace, NormalizedRunner } from "../parse/meeting";
 import {
   normalizeStoredSnapshot,
@@ -5,6 +6,7 @@ import {
 } from "../parse/odds";
 import { contentHash } from "../parse/hash";
 import type { ChangeHistoryRaw, PmPoolRaw } from "../graphql/types";
+import { trackD1Result } from "./d1-budget";
 
 /** Payload used to detect meeting-tree changes (excludes change_histories). */
 export function meetingTreeHashPayload(meeting: NormalizedMeeting): unknown {
@@ -240,6 +242,7 @@ export async function insertOddsSnapshotIfChanged(
   snapshot: RaceOddsSnapshot,
   dataSource = "graphql",
   sampleIntervalS: number | null = null,
+  env?: Env,
 ): Promise<SnapshotInsertResult> {
   const hash = await contentHash(snapshot.payload);
   // ORDER BY snapshot_time (not id) so idx_odds_lookup
@@ -266,6 +269,7 @@ export async function insertOddsSnapshotIfChanged(
     }
   }
 
+  // Unchanged content hash: no write.
   if (existingRow?.content_hash === hash) {
     return {
       inserted: false,
@@ -275,7 +279,7 @@ export async function insertOddsSnapshotIfChanged(
     };
   }
 
-  await db
+  const result = await db
     .prepare(
       `INSERT INTO odds_snapshots (meeting_date, venue, race_no, snapshot_time, content_hash, pool_status, raw_json, data_source, created_at, sample_interval_s)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -293,6 +297,7 @@ export async function insertOddsSnapshotIfChanged(
       sampleIntervalS,
     )
     .run();
+  if (env) await trackD1Result(env, result);
 
   return {
     inserted: true,

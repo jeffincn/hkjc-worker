@@ -1,5 +1,6 @@
 import type { Env } from "../env";
 import { fetchGraphQL, SourceBlockedError } from "../graphql/client";
+import { isStorageOrInfraError } from "../util/d1";
 import { QUERY_PM_POOLS_ODDS, QUERY_RACE_MEETINGS_FULL } from "../graphql/queries";
 import type { MeetingRaw, PmPoolsOddsData, RaceMeetingsFullData } from "../graphql/types";
 import {
@@ -79,6 +80,10 @@ const MEETING_TAIL_MS = 30 * 60 * 1000;
 function classifyFetchError(err: unknown): FetchOutcome {
   if (err instanceof SourceBlockedError) return { kind: "blocked", reason: err.kind };
   const message = err instanceof Error ? err.message : String(err);
+  // D1 quota / storage failures must never open HKJC source_block.
+  if (isStorageOrInfraError(err)) {
+    return { kind: "storage", reason: message.slice(0, 200) };
+  }
   return { kind: "error", reason: message.slice(0, 200) };
 }
 
@@ -340,6 +345,7 @@ export class MeetingPoller implements DurableObject {
               snap,
               "graphql",
               sample_interval_s,
+              this.env,
             );
             if (ins.inserted) {
               changed.push(pushRace);

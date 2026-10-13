@@ -96,7 +96,12 @@ export const HEALTHY_BLOCK_STATE: BlockState = {
 export type FetchOutcome =
   | { kind: "ok" }
   | { kind: "blocked"; reason: string }
-  | { kind: "error"; reason: string };
+  | { kind: "error"; reason: string }
+  /**
+   * D1 / Durable Object storage / quota failures — never attributed to HKJC.
+   * Does not open or extend source_block; leaves prior state unchanged.
+   */
+  | { kind: "storage"; reason: string };
 
 export interface BlockTransition {
   state: BlockState;
@@ -108,23 +113,31 @@ export interface BlockTransition {
 
 /**
  * Exponential backoff on 403/429/challenge (immediately) or after N
- * consecutive network errors. Recovery is gradual: each healthy tick drops
- * one level; `recovered` fires when level returns to 0.
+ * consecutive network errors.
+ *
+ * Storage/D1 errors never open source_block. A successful HKJC fetch (`ok`)
+ * clears the block immediately so a prior misclassified D1 quota block heals
+ * as soon as GraphQL succeeds again (`recovered` fires when previously blocked).
  */
 export function nextBlockState(prev: BlockState, outcome: FetchOutcome, nowIso: string): BlockTransition {
+  if (outcome.kind === "storage") {
+    // Ignore — do not count toward HKJC source_block.
+    return { state: prev, becameBlocked: false, recovered: false };
+  }
   if (outcome.kind === "ok") {
-    if (prev.level === 0) {
+    if (prev.level === 0 && !prev.blocked) {
       return { state: { ...HEALTHY_BLOCK_STATE }, becameBlocked: false, recovered: false };
     }
-    const level = prev.level - 1;
-    if (level === 0) {
-      return { state: { ...HEALTHY_BLOCK_STATE }, becameBlocked: false, recovered: prev.blocked };
+    // Successful fetch: clear immediately when previously blocked for any reason
+    // (including legacy misclassified D1 quota blocks).
+    if (prev.blocked || prev.level > 0) {
+      return {
+        state: { ...HEALTHY_BLOCK_STATE },
+        becameBlocked: false,
+        recovered: prev.blocked,
+      };
     }
-    return {
-      state: { ...prev, level, consecutive_failures: 0 },
-      becameBlocked: false,
-      recovered: false,
-    };
+    return { state: { ...HEALTHY_BLOCK_STATE }, becameBlocked: false, recovered: false };
   }
   const failures = prev.consecutive_failures + 1;
   const isBlock = outcome.kind === "blocked" || failures >= NETWORK_FAILURES_BEFORE_BLOCK;

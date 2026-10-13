@@ -1,6 +1,8 @@
 import type { Env } from "../env";
 import { contentHash } from "../parse/hash";
+import { allowD1Write, trackD1Result } from "../store/d1-budget";
 import { setMeta } from "../store/db";
+import { d1Bind } from "../util/d1";
 import {
   allowDeliveryAttempt,
   recordDeliveryFailure,
@@ -194,22 +196,24 @@ async function logPush(
     target?: string;
   },
 ): Promise<void> {
+  // Verbose push_log is non-essential — skip when D1 write budget is degraded.
+  if (!(await allowD1Write(env, "push_log"))) return;
   const hash = await contentHash(envelope);
-  await env.DB.prepare(
-    `INSERT INTO push_log (event_type, target_url, http_status, retry_count, success, payload_hash, error_message, sent_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  )
-    .bind(
-      envelope.event,
-      info.target ?? null,
-      info.http_status ?? null,
-      info.retry_count ?? 0,
-      info.success ? 1 : 0,
-      hash,
-      info.error_message ?? null,
-      formatHkNow(),
-    )
-    .run();
+  const result = await d1Bind(
+    env.DB.prepare(
+      `INSERT INTO push_log (event_type, target_url, http_status, retry_count, success, payload_hash, error_message, sent_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ),
+    envelope.event,
+    info.target ?? null,
+    info.http_status ?? null,
+    info.retry_count ?? 0,
+    info.success ? 1 : 0,
+    hash,
+    info.error_message ?? null,
+    formatHkNow(),
+  ).run();
+  await trackD1Result(env, result);
 }
 
 /** Reflect newest push of any type (not only odds_update). */

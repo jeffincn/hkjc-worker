@@ -211,6 +211,33 @@ async function handleHealth(env: Env): Promise<Response> {
   }
   const dailyBudget = resolveDailyRequestBudget(env);
 
+  const { getD1WriteStats } = await import("../store/d1-budget");
+  let d1_writes: {
+    day: string;
+    today: number;
+    budget: number;
+    remaining: number;
+    degrade: boolean;
+  } = {
+    day: new Date().toISOString().slice(0, 10),
+    today: 0,
+    budget: 40_000_000,
+    remaining: 40_000_000,
+    degrade: false,
+  };
+  try {
+    const stats = await getD1WriteStats(env);
+    d1_writes = {
+      day: stats.day,
+      today: stats.today,
+      budget: stats.budget,
+      remaining: stats.remaining,
+      degrade: stats.degrade,
+    };
+  } catch {
+    // worker_meta / counter may be unavailable
+  }
+
   return jsonOk({
     ok: true,
     service: "hkjc-data-worker",
@@ -222,6 +249,7 @@ async function handleHealth(env: Env): Promise<Response> {
       daily_budget: dailyBudget,
       remaining: Math.max(0, dailyBudget - graphqlToday),
     },
+    d1_writes,
     source_block: sourceBlock,
     timezone: env.TIMEZONE ?? "Asia/Hong_Kong",
     live_push_enabled: env.LIVE_PUSH_ENABLED ?? "false",

@@ -1,5 +1,7 @@
 import type { Env } from "../env";
 import { envBool, envNum } from "../env";
+import { trackD1Result } from "../store/d1-budget";
+import { d1Bind } from "../util/d1";
 import type { PushEnvelope, PushEvent } from "./envelope";
 import { isLivePushEvent } from "./envelope";
 import { getPushEventById } from "./ledger";
@@ -28,6 +30,37 @@ import {
   listEnabledSubscribers,
   type PushSubscriber,
 } from "./subscribers";
+
+/** pending_pushes INSERT with undefined→null binds + write tracking. */
+async function insertPendingPushRow(
+  env: Env,
+  args: {
+    event_type: string;
+    payload_json: string;
+    retry_count: number;
+    next_retry_at: string | null;
+    created_at: string;
+    last_error: string | null;
+    subscriber_id: number | null;
+    event_id: string | null;
+  },
+): Promise<void> {
+  const result = await d1Bind(
+    env.DB.prepare(
+      `INSERT INTO pending_pushes (event_type, payload_json, retry_count, next_retry_at, created_at, last_error, subscriber_id, event_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ),
+    args.event_type,
+    args.payload_json,
+    args.retry_count,
+    args.next_retry_at,
+    args.created_at,
+    args.last_error,
+    args.subscriber_id,
+    args.event_id,
+  ).run();
+  await trackD1Result(env, result);
+}
 
 export { hmacSha256Hex, type SubscriberDelivery } from "./delivery";
 export { enqueueRetry, GAVE_UP, nextBackoffMinutes } from "./pending";
@@ -324,21 +357,17 @@ async function sendOrDeferPending(
   const slot = await reserveDeliverySlot(env, subscriberId);
   if (slot.delaySeconds > 0) {
     const next = new Date(Date.now() + slot.delaySeconds * 1000).toISOString();
-    await env.DB.prepare(
-      `INSERT INTO pending_pushes (event_type, payload_json, retry_count, next_retry_at, created_at, last_error, subscriber_id, event_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    )
-      .bind(
-        envelope.event,
-        JSON.stringify(ensureEventId(envelope)),
-        retryCount,
-        next,
-        new Date().toISOString(),
-        `rate_limit_delay_${slot.delaySeconds}s`,
-        subscriberId,
-        ensureEventId(envelope).event_id || null,
-      )
-      .run();
+    const ensured = ensureEventId(envelope);
+    await insertPendingPushRow(env, {
+      event_type: ensured.event ?? "unknown",
+      payload_json: JSON.stringify(ensured),
+      retry_count: retryCount,
+      next_retry_at: next,
+      created_at: new Date().toISOString(),
+      last_error: `rate_limit_delay_${slot.delaySeconds}s`,
+      subscriber_id: subscriberId,
+      event_id: ensured.event_id || null,
+    });
     return {
       counted: false,
       http_status: null,
@@ -400,39 +429,29 @@ async function flushSubscriberPending(
     for (const delivery of deliveries) {
       if (state.sent >= state.max) {
         // Budget exhausted: park remaining coalesced envelopes as pending.
-        await env.DB.prepare(
-          `INSERT INTO pending_pushes (event_type, payload_json, retry_count, next_retry_at, created_at, last_error, subscriber_id, event_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-          .bind(
-            delivery.envelope.event,
-            JSON.stringify(delivery.envelope),
-            delivery.retry_count,
-            opts.exhausted ? null : new Date().toISOString(),
-            new Date().toISOString(),
-            "deferred_budget",
-            subscriberId,
-            delivery.envelope.event_id,
-          )
-          .run();
+        await insertPendingPushRow(env, {
+          event_type: delivery.envelope.event ?? "unknown",
+          payload_json: JSON.stringify(delivery.envelope),
+          retry_count: delivery.retry_count,
+          next_retry_at: opts.exhausted ? null : new Date().toISOString(),
+          created_at: new Date().toISOString(),
+          last_error: "deferred_budget",
+          subscriber_id: subscriberId,
+          event_id: delivery.envelope.event_id ?? null,
+        });
         continue;
       }
       if (state.rateLimitedSubscribers.has(subKey)) {
-        await env.DB.prepare(
-          `INSERT INTO pending_pushes (event_type, payload_json, retry_count, next_retry_at, created_at, last_error, subscriber_id, event_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-          .bind(
-            delivery.envelope.event,
-            JSON.stringify(delivery.envelope),
-            delivery.retry_count,
-            opts.exhausted ? null : new Date().toISOString(),
-            new Date().toISOString(),
-            "deferred_429_sibling",
-            subscriberId,
-            delivery.envelope.event_id,
-          )
-          .run();
+        await insertPendingPushRow(env, {
+          event_type: delivery.envelope.event ?? "unknown",
+          payload_json: JSON.stringify(delivery.envelope),
+          retry_count: delivery.retry_count,
+          next_retry_at: opts.exhausted ? null : new Date().toISOString(),
+          created_at: new Date().toISOString(),
+          last_error: "deferred_429_sibling",
+          subscriber_id: subscriberId,
+          event_id: delivery.envelope.event_id ?? null,
+        });
         continue;
       }
 
@@ -453,20 +472,16 @@ async function flushSubscriberPending(
       }
       if (!outcome.success && !outcome.skipped) {
         if (opts.exhausted) {
-          await env.DB.prepare(
-            `INSERT INTO pending_pushes (event_type, payload_json, retry_count, next_retry_at, created_at, last_error, subscriber_id, event_id)
-             VALUES (?, ?, ?, NULL, ?, ?, ?, ?)`,
-          )
-            .bind(
-              delivery.envelope.event,
-              JSON.stringify(delivery.envelope),
-              delivery.retry_count,
-              new Date().toISOString(),
-              outcome.error_message ?? "piggyback failed",
-              subscriberId,
-              delivery.envelope.event_id,
-            )
-            .run();
+          await insertPendingPushRow(env, {
+            event_type: delivery.envelope.event ?? "unknown",
+            payload_json: JSON.stringify(delivery.envelope),
+            retry_count: delivery.retry_count,
+            next_retry_at: null,
+            created_at: new Date().toISOString(),
+            last_error: outcome.error_message ?? "piggyback failed",
+            subscriber_id: subscriberId,
+            event_id: delivery.envelope.event_id ?? null,
+          });
         } else {
           await enqueueRetry(
             env,
@@ -505,20 +520,17 @@ async function flushSubscriberPending(
     }
     if (!outcome.success && !outcome.skipped) {
       if (opts.exhausted) {
-        await env.DB.prepare(
-          `INSERT INTO pending_pushes (event_type, payload_json, retry_count, next_retry_at, created_at, last_error, subscriber_id, event_id)
-           VALUES (?, ?, ?, NULL, ?, ?, ?, ?)`,
-        )
-          .bind(
-            envelope.event,
-            JSON.stringify(envelope),
-            row.retry_count ?? 0,
-            new Date().toISOString(),
-            outcome.error_message ?? "piggyback failed",
-            subscriberId,
-            ensureEventId(envelope).event_id || null,
-          )
-          .run();
+        const ensured = ensureEventId(envelope);
+        await insertPendingPushRow(env, {
+          event_type: ensured.event ?? "unknown",
+          payload_json: JSON.stringify(ensured),
+          retry_count: row.retry_count ?? 0,
+          next_retry_at: null,
+          created_at: new Date().toISOString(),
+          last_error: outcome.error_message ?? "piggyback failed",
+          subscriber_id: subscriberId,
+          event_id: ensured.event_id || null,
+        });
       } else {
         await enqueueRetry(
           env,

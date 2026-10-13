@@ -60,6 +60,11 @@ export interface Env {
    * (default 7200). Window ends when the final race's dividends are published.
    */
   RACEDAY_WINDOW_BEFORE_SEC?: string;
+  /**
+   * Soft daily D1 rows-written budget (UTC day). Default 40000000 (~80% of a
+   * paid-plan-scale cap). Above 80% of this value, non-essential writes are skipped.
+   */
+  D1_DAILY_WRITE_BUDGET?: string;
 }
 
 export function envNum(env: Env, key: keyof Env, fallback: number): number {

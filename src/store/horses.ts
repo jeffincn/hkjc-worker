@@ -1,5 +1,7 @@
+import type { Env } from "../env";
 import type { HorseProfile, PastRun, VetRecord } from "../html/horse";
 import { contentHash } from "../parse/hash";
+import { trackD1Result } from "./d1-budget";
 
 export interface StoreResult {
   changed: boolean;
@@ -12,7 +14,7 @@ export async function storeRawDocument(
   docKey: string,
   raw: unknown,
   sourceUrl: string | null,
-  opts?: { hashOf?: unknown },
+  opts?: { hashOf?: unknown; env?: Env },
 ): Promise<StoreResult> {
   // Optional hashOf: hash only the meaningful slice (e.g. dividends arrays)
   // while still persisting the full raw payload for debugging.
@@ -25,28 +27,23 @@ export async function storeRawDocument(
     .first<{ content_hash: string }>();
 
   const changed = last?.content_hash !== hash;
-  const now = new Date().toISOString();
-  if (changed) {
-    await db
-      .prepare(
-        `INSERT INTO raw_documents (doc_type, doc_key, source_url, content_hash, raw_json, changed, fetched_at)
-         VALUES (?, ?, ?, ?, ?, 1, ?)`,
-      )
-      .bind(docType, docKey, sourceUrl, hash, JSON.stringify(raw), now)
-      .run();
-  } else {
-    // Unchanged: only bump fetched_at on the latest matching row (no push, no new payload)
-    await db
-      .prepare(
-        `UPDATE raw_documents SET fetched_at=?, changed=0
-         WHERE id = (
-           SELECT id FROM raw_documents WHERE doc_type=? AND doc_key=? ORDER BY id DESC LIMIT 1
-         )`,
-      )
-      .bind(now, docType, docKey)
-      .run();
+  // Unchanged hash: no D1 write (avoids burning rows_written on every poll).
+  if (!changed) {
+    return { changed: false, content_hash: hash };
   }
-  return { changed, content_hash: hash };
+
+  const now = new Date().toISOString();
+  const result = await db
+    .prepare(
+      `INSERT INTO raw_documents (doc_type, doc_key, source_url, content_hash, raw_json, changed, fetched_at)
+       VALUES (?, ?, ?, ?, ?, 1, ?)`,
+    )
+    .bind(docType, docKey, sourceUrl, hash, JSON.stringify(raw), now)
+    .run();
+  if (opts?.env) {
+    await trackD1Result(opts.env, result);
+  }
+  return { changed: true, content_hash: hash };
 }
 
 export async function upsertHorseProfile(

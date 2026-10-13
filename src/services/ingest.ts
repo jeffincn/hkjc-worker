@@ -127,7 +127,9 @@ export async function ingestActiveMeeting(env: Env): Promise<{
       await setMeta(env.DB, "last_fetch_at", new Date().toISOString());
 
       if (data) {
-        await storeRawDocument(env.DB, "graphql_raceMeetings_full", "active", data, null);
+        await storeRawDocument(env.DB, "graphql_raceMeetings_full", "active", data, null, {
+          env,
+        });
       }
       return { data, whitelist: null as string | null };
     });
@@ -310,6 +312,9 @@ export async function ingestOneMeeting(
           meeting.meeting_date,
           meeting.venue,
           snap,
+          "graphql",
+          null,
+          env,
         );
         if (ins.inserted) {
           changed++;
@@ -373,7 +378,7 @@ export async function ingestOneMeeting(
       `${meeting.meeting_date}_${meeting.venue}`,
       resPools,
       null,
-      { hashOf: dividendsHashPayload(resPools) },
+      { hashOf: dividendsHashPayload(resPools), env },
     );
     const divByRace = new Map<number, typeof resPools>();
     for (const p of resPools) {
@@ -429,6 +434,7 @@ export async function ingestOneMeeting(
           `${meeting.meeting_date}_${meeting.venue}`,
           m.changeHistories ?? [],
           null,
+          { env },
         );
         if (chDoc.changed && n > 0) {
           await emitPush(env, {

@@ -146,18 +146,47 @@ describe("source block backoff", () => {
     const t = nextBlockState(s, { kind: "error", reason: "ECONNRESET" }, iso);
     expect(t.becameBlocked).toBe(true);
   });
-  it("recovers gradually, one level per healthy tick, then emits recovered", () => {
+  it("clears source_block immediately on successful fetch (incl. misclassified D1)", () => {
     let s: BlockState = { ...HEALTHY_BLOCK_STATE };
     for (let i = 0; i < 3; i++) s = nextBlockState(s, { kind: "blocked", reason: "http_403" }, iso).state;
+    expect(s.blocked).toBe(true);
     expect(backoffIntervalMs(3000, s)).toBe(24_000);
-    let t = nextBlockState(s, { kind: "ok" }, iso);
-    expect(backoffIntervalMs(3000, t.state)).toBe(12_000);
-    expect(t.recovered).toBe(false);
-    t = nextBlockState(t.state, { kind: "ok" }, iso);
-    expect(backoffIntervalMs(3000, t.state)).toBe(6000);
-    t = nextBlockState(t.state, { kind: "ok" }, iso);
+    const t = nextBlockState(s, { kind: "ok" }, iso);
     expect(t.recovered).toBe(true);
     expect(t.state).toEqual(HEALTHY_BLOCK_STATE);
+    expect(backoffIntervalMs(3000, t.state)).toBe(3000);
+  });
+  it("storage/D1 errors never open or extend source_block", () => {
+    let s: BlockState = { ...HEALTHY_BLOCK_STATE };
+    const t1 = nextBlockState(
+      s,
+      { kind: "storage", reason: "D1 free tier daily row write limit exceeded" },
+      iso,
+    );
+    expect(t1.state.blocked).toBe(false);
+    expect(t1.becameBlocked).toBe(false);
+    expect(t1.state).toEqual(HEALTHY_BLOCK_STATE);
+
+    // Even while already blocked for HKJC reasons, storage does not change state.
+    s = nextBlockState(s, { kind: "blocked", reason: "http_429" }, iso).state;
+    const prev = { ...s };
+    const t2 = nextBlockState(s, { kind: "storage", reason: "D1_TYPE_ERROR" }, iso);
+    expect(t2.state).toEqual(prev);
+    expect(t2.becameBlocked).toBe(false);
+    expect(t2.recovered).toBe(false);
+
+    // After a D1-misclassified legacy block, success clears immediately.
+    const legacy: BlockState = {
+      blocked: true,
+      level: 2,
+      consecutive_failures: 5,
+      reason: "D1 free tier daily row write limit",
+      since: iso,
+      last_error_at: iso,
+    };
+    const cleared = nextBlockState(legacy, { kind: "ok" }, iso);
+    expect(cleared.recovered).toBe(true);
+    expect(cleared.state).toEqual(HEALTHY_BLOCK_STATE);
   });
   it("effective interval is the max of schedule/throttle/backoff", () => {
     expect(effectiveIntervalMs({ scheduleMs: 3000, throttleMs: 5000, backoffMs: 12_000 })).toBe(
