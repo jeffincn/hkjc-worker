@@ -30,6 +30,7 @@ import {
   listEnabledSubscribers,
   type PushSubscriber,
 } from "./subscribers";
+import { maybeDeliverPostQuietSnapshot } from "./quiet-hours";
 import {
   gateSubscriberDelivery,
   maybeDeliverWindowOpenSnapshot,
@@ -329,6 +330,18 @@ export async function sendPushToSubscriber(
         },
       ],
     };
+  }
+
+  if (sub && envelope.meeting_date && envelope.venue) {
+    await maybeDeliverPostQuietSnapshot({
+      env,
+      subscriber: sub,
+      target,
+      meeting_date: envelope.meeting_date,
+      venue: envelope.venue,
+      expectedRaceNos: windowGate.context?.expectedRaceNos,
+      fetchImpl: opts?.fetchImpl,
+    });
   }
 
   if (

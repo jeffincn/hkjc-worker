@@ -284,6 +284,8 @@ describe("admin subscribers API", () => {
       enabled: true,
       active_window: "always",
       window_before_sec: 10800,
+      quiet_start: "00:00",
+      quiet_end: "08:00",
       created_at: "",
       updated_at: "",
     }).has_secret).toBe(true);

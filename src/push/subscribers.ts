@@ -10,6 +10,12 @@ export const WEBHOOK_SITE_URL =
 /** Default: 3 hours before first race post. */
 export const DEFAULT_SUBSCRIBER_WINDOW_BEFORE_SEC = 10_800;
 
+/** Default quiet window: midnight → 08:00 Asia/Hong_Kong. */
+export const DEFAULT_QUIET_START = "00:00";
+export const DEFAULT_QUIET_END = "08:00";
+
+const HHMM_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
+
 export type ActiveWindowMode = "always" | "raceday";
 
 export function parseActiveWindow(raw: unknown): ActiveWindowMode {
@@ -23,6 +29,20 @@ export function parseWindowBeforeSec(raw: unknown): number {
   return Math.floor(n);
 }
 
+/** Parse HH:MM; empty/null → null (cleared). Invalid → throws. */
+export function parseQuietHhMm(raw: unknown): string | null {
+  if (raw === null || raw === undefined || raw === "") return null;
+  if (typeof raw !== "string") {
+    throw new Error("quiet_start/quiet_end must be HH:MM strings or null");
+  }
+  const s = raw.trim();
+  if (s === "") return null;
+  if (!HHMM_RE.test(s)) {
+    throw new Error("quiet_start/quiet_end must be HH:MM (Asia/Hong_Kong)");
+  }
+  return s;
+}
+
 export interface PushSubscriber {
   id: number;
   url: string;
@@ -32,6 +52,12 @@ export interface PushSubscriber {
   active_window: ActiveWindowMode;
   /** Seconds before first race post when raceday window opens (default 10800). */
   window_before_sec: number;
+  /**
+   * Quiet hours start/end as HH:MM Asia/Hong_Kong (nullable).
+   * Both set → quiet in that span (overnight wrap ok). Both null → no quiet.
+   */
+  quiet_start: string | null;
+  quiet_end: string | null;
   created_at: string;
   updated_at: string;
   consecutive_failures?: number;
@@ -52,6 +78,8 @@ export interface PushSubscriberPublic {
   has_secret: boolean;
   active_window: ActiveWindowMode;
   window_before_sec: number;
+  quiet_start: string | null;
+  quiet_end: string | null;
   created_at: string;
   updated_at: string;
   circuit_state: string;
@@ -72,6 +100,8 @@ export function toPublicSubscriber(row: PushSubscriber): PushSubscriberPublic {
     has_secret: !!(row.secret && row.secret.length > 0),
     active_window: row.active_window,
     window_before_sec: row.window_before_sec,
+    quiet_start: row.quiet_start,
+    quiet_end: row.quiet_end,
     created_at: row.created_at,
     updated_at: row.updated_at,
     circuit_state: row.circuit_state ?? "closed",
@@ -112,6 +142,8 @@ function mapSubscriberRow(r: {
   enabled: number;
   active_window?: string | null;
   window_before_sec?: number | null;
+  quiet_start?: string | null;
+  quiet_end?: string | null;
   created_at: string;
   updated_at: string;
   consecutive_failures?: number | null;
@@ -132,6 +164,8 @@ function mapSubscriberRow(r: {
     window_before_sec: parseWindowBeforeSec(
       r.window_before_sec ?? DEFAULT_SUBSCRIBER_WINDOW_BEFORE_SEC,
     ),
+    quiet_start: r.quiet_start ?? null,
+    quiet_end: r.quiet_end ?? null,
     created_at: r.created_at,
     updated_at: r.updated_at,
     consecutive_failures: r.consecutive_failures ?? 0,
@@ -148,6 +182,7 @@ function mapSubscriberRow(r: {
 const SUBSCRIBER_SELECT = `SELECT id, url, secret, enabled, created_at, updated_at,
        IFNULL(active_window, 'always') AS active_window,
        IFNULL(window_before_sec, ${DEFAULT_SUBSCRIBER_WINDOW_BEFORE_SEC}) AS window_before_sec,
+       quiet_start, quiet_end,
        IFNULL(consecutive_failures, 0) AS consecutive_failures,
        IFNULL(consecutive_429s, 0) AS consecutive_429s,
        IFNULL(circuit_state, 'closed') AS circuit_state,
@@ -165,6 +200,8 @@ export async function listSubscribers(env: Env): Promise<PushSubscriber[]> {
     enabled: number;
     active_window: string;
     window_before_sec: number;
+    quiet_start: string | null;
+    quiet_end: string | null;
     created_at: string;
     updated_at: string;
     consecutive_failures: number;
@@ -206,6 +243,8 @@ export async function getSubscriber(
       enabled: number;
       active_window: string;
       window_before_sec: number;
+      quiet_start: string | null;
+      quiet_end: string | null;
       created_at: string;
       updated_at: string;
       consecutive_failures: number;
@@ -227,6 +266,9 @@ export interface SubscriberWriteInput {
   enabled?: boolean;
   active_window?: ActiveWindowMode | string;
   window_before_sec?: number;
+  /** HH:MM or null. Omit on create → null (no quiet); migration sets existing to 00:00–08:00. */
+  quiet_start?: string | null;
+  quiet_end?: string | null;
 }
 
 export interface SubscriberPatch {
@@ -235,6 +277,9 @@ export interface SubscriberPatch {
   enabled?: boolean;
   active_window?: ActiveWindowMode | string;
   window_before_sec?: number;
+  /** HH:MM or null/"" to clear quiet hours. */
+  quiet_start?: string | null;
+  quiet_end?: string | null;
 }
 
 function normalizeWindowFields(input: {
@@ -284,12 +329,31 @@ export async function createSubscriber(
     active_window: input.active_window ?? "always",
     window_before_sec: input.window_before_sec,
   });
+  // Omit → null (no quiet). Migration 0009 sets existing rows to 00:00–08:00;
+  // pass quiet_start/quiet_end explicitly to opt in on create.
+  const quiet_start =
+    input.quiet_start !== undefined
+      ? parseQuietHhMm(input.quiet_start)
+      : null;
+  const quiet_end =
+    input.quiet_end !== undefined ? parseQuietHhMm(input.quiet_end) : null;
 
   const result = await env.DB.prepare(
-    `INSERT INTO push_subscribers (url, secret, enabled, active_window, window_before_sec, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO push_subscribers
+      (url, secret, enabled, active_window, window_before_sec, quiet_start, quiet_end, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
-    .bind(url, secret, enabled, active_window, window_before_sec, ts, ts)
+    .bind(
+      url,
+      secret,
+      enabled,
+      active_window,
+      window_before_sec,
+      quiet_start,
+      quiet_end,
+      ts,
+      ts,
+    )
     .run();
 
   const id = result.meta.last_row_id;
@@ -344,14 +408,38 @@ export async function updateSubscriber(
     window_before_sec = normalized.window_before_sec;
   }
 
+  let quiet_start = existing.quiet_start;
+  let quiet_end = existing.quiet_end;
+  if (patch.quiet_start !== undefined || patch.quiet_end !== undefined) {
+    quiet_start =
+      patch.quiet_start !== undefined
+        ? parseQuietHhMm(patch.quiet_start)
+        : existing.quiet_start;
+    quiet_end =
+      patch.quiet_end !== undefined
+        ? parseQuietHhMm(patch.quiet_end)
+        : existing.quiet_end;
+  }
+
   const ts = nowIso();
 
   await env.DB.prepare(
     `UPDATE push_subscribers
-     SET url = ?, secret = ?, enabled = ?, active_window = ?, window_before_sec = ?, updated_at = ?
+     SET url = ?, secret = ?, enabled = ?, active_window = ?, window_before_sec = ?,
+         quiet_start = ?, quiet_end = ?, updated_at = ?
      WHERE id = ?`,
   )
-    .bind(url, secret, enabled, active_window, window_before_sec, ts, id)
+    .bind(
+      url,
+      secret,
+      enabled,
+      active_window,
+      window_before_sec,
+      quiet_start,
+      quiet_end,
+      ts,
+      id,
+    )
     .run();
 
   return getSubscriber(env, id);

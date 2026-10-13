@@ -464,6 +464,8 @@ async function createPushSubscriber(request: Request, env: Env): Promise<Respons
     enabled?: boolean;
     active_window?: string;
     window_before_sec?: number;
+    quiet_start?: string | null;
+    quiet_end?: string | null;
   } | null;
   if (!body || typeof body.url !== "string") {
     return jsonError(400, "url is required");
@@ -475,6 +477,8 @@ async function createPushSubscriber(request: Request, env: Env): Promise<Respons
       enabled: body.enabled,
       active_window: body.active_window,
       window_before_sec: body.window_before_sec,
+      quiet_start: body.quiet_start,
+      quiet_end: body.quiet_end,
     });
     return jsonOk({ subscriber: toPublicSubscriber(row) }, 201);
   } catch (err) {
@@ -501,6 +505,8 @@ async function updatePushSubscriber(
     enabled?: boolean;
     active_window?: string;
     window_before_sec?: number;
+    quiet_start?: string | null;
+    quiet_end?: string | null;
   } | null;
   if (!body || typeof body !== "object") {
     return jsonError(400, "JSON body required");

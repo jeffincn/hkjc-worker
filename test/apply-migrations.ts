@@ -126,6 +126,8 @@ CREATE TABLE IF NOT EXISTS push_subscribers (
   enabled INTEGER NOT NULL DEFAULT 1,
   active_window TEXT NOT NULL DEFAULT 'always',
   window_before_sec INTEGER NOT NULL DEFAULT 10800,
+  quiet_start TEXT,
+  quiet_end TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   consecutive_failures INTEGER NOT NULL DEFAULT 0,
