@@ -202,15 +202,13 @@ describe("gateSubscriberDelivery + fan-out", () => {
       active_window: "raceday",
       window_before_sec: 10800,
     });
-    // First post far in the future → still outside 3h window.
+    // All posts far in the future → firstPost is outside the 3h window.
+    // (Must update every race: firstPostMs = MIN(post_time) across the meeting.)
+    const farPost = new Date(Date.now() + 10 * 3600_000).toISOString();
     await env.DB.prepare(
-      `UPDATE races SET post_time=? WHERE meeting_date=? AND venue=? AND race_no=1`,
+      `UPDATE races SET post_time=? WHERE meeting_date=? AND venue=?`,
     )
-      .bind(
-        new Date(Date.now() + 10 * 3600_000).toISOString(),
-        MEETING,
-        VENUE,
-      )
+      .bind(farPost, MEETING, VENUE)
       .run();
 
     const urls: string[] = [];

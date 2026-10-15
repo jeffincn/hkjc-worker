@@ -116,7 +116,9 @@ describe("D1 write budget", () => {
   });
 
   it("degrades non-essential writes above 80% of budget", async () => {
-    const now = Date.parse("2026-10-13T12:00:00.000Z");
+    // allowD1Write → isD1WriteDegraded uses Date.now() for the UTC day key,
+    // so track/flush must use the same calendar day (not a fixed fixture date).
+    const now = Date.now();
     const testEnv = e({ D1_DAILY_WRITE_BUDGET: "1000" });
     // 80% of 1000 = 800
     await trackD1RowsWritten(testEnv, 800, now);
