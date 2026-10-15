@@ -12,13 +12,21 @@ import {
   storeDividendsAsResults,
 } from "../src/store/db";
 
-function officialWinPools(winComb: string, status = "OFFICIAL"): PmPoolRaw[] {
+function officialWinPools(
+  winCombs: string | string[],
+  status = "OFFICIAL",
+): PmPoolRaw[] {
+  const combs = Array.isArray(winCombs) ? winCombs : [winCombs];
   return [
     {
       oddsType: "WIN",
       status,
       leg: { number: 1, races: [1] },
-      dividends: [{ winComb, div: "42", status: "OFFICIAL" }],
+      dividends: combs.map((winComb, i) => ({
+        winComb,
+        div: i === 0 ? "42" : "42",
+        status: "OFFICIAL",
+      })),
     },
     {
       oddsType: "PLA",
@@ -26,7 +34,7 @@ function officialWinPools(winComb: string, status = "OFFICIAL"): PmPoolRaw[] {
       leg: { number: 1, races: [1] },
       dividends: [
         { winComb: "11", div: "18.5" },
-        { winComb, div: "13.0" },
+        { winComb: combs[0]!, div: "13.0" },
         { winComb: "12", div: "22.0" },
       ],
     },
@@ -46,6 +54,7 @@ describe("WIN winComb → final_position fallback (issue #29)", () => {
     const runners = Array.from({ length: 12 }, (_, i) => ({
       horse_no: i + 1,
       final_position: 0 as number | null,
+      dead_heat: null as boolean | null,
     }));
     // Simulate normalizeRunner coercing 0 → null
     for (const r of runners) {
@@ -60,10 +69,37 @@ describe("WIN winComb → final_position fallback (issue #29)", () => {
     const result = applyWinCombWinnerFallback({ runners, pools });
     expect(result.applied).toBe(true);
     expect(result.winners).toEqual([1]);
+    expect(result.dead_heat).toBe(false);
     expect(runners.find((r) => r.horse_no === 1)?.final_position).toBe(1);
+    expect(runners.find((r) => r.horse_no === 1)?.dead_heat).toBeNull();
     expect(runners.filter((r) => r.horse_no !== 1).every((r) => r.final_position == null)).toBe(
       true,
     );
+  });
+
+  it("multi WIN winComb (dead heat) → each winner final_position=1 and dead_heat=true", () => {
+    const runners = [1, 2, 3, 7].map((horse_no) => ({
+      horse_no,
+      final_position: null as number | null,
+      dead_heat: null as boolean | null,
+    }));
+    const pools = officialWinPools(["3", "7"]);
+    expect(winCombWinnerHorseNos(pools)).toEqual([3, 7]);
+
+    const result = applyWinCombWinnerFallback({ runners, pools });
+    expect(result.applied).toBe(true);
+    expect(result.winners).toEqual([3, 7]);
+    expect(result.dead_heat).toBe(true);
+    expect(runners.find((r) => r.horse_no === 3)).toMatchObject({
+      final_position: 1,
+      dead_heat: true,
+    });
+    expect(runners.find((r) => r.horse_no === 7)).toMatchObject({
+      final_position: 1,
+      dead_heat: true,
+    });
+    expect(runners.find((r) => r.horse_no === 1)?.final_position).toBeNull();
+    expect(runners.find((r) => r.horse_no === 1)?.dead_heat).toBeNull();
   });
 
   it("A3: official positions present → do not use dividends fallback (R3)", () => {
@@ -151,12 +187,13 @@ describe("WIN winComb → final_position fallback (issue #29)", () => {
     );
 
     const winner = await env.DB.prepare(
-      `SELECT final_position FROM results
+      `SELECT final_position, dead_heat FROM results
        WHERE meeting_date=? AND venue=? AND race_no=? AND horse_no=1`,
     )
       .bind("2026-10-14", "HV", 1)
-      .first<{ final_position: number | null }>();
+      .first<{ final_position: number | null; dead_heat: number | null }>();
     expect(winner?.final_position).toBe(1);
+    expect(winner?.dead_heat == null || winner?.dead_heat === 0).toBe(true);
 
     const others = await env.DB.prepare(
       `SELECT horse_no, final_position FROM results
@@ -169,6 +206,43 @@ describe("WIN winComb → final_position fallback (issue #29)", () => {
         (r) => r.final_position == null || r.final_position === 0,
       ),
     ).toBe(true);
+  });
+
+  it("storeDividendsAsResults multi winComb sets dead_heat=1 on each winner", async () => {
+    const now = new Date().toISOString();
+    for (const horse of [3, 5, 7]) {
+      await env.DB.prepare(
+        `INSERT INTO results (meeting_date, venue, race_no, horse_no, final_position, dead_heat, win_odds, place_odds, dividends_json, data_source, updated_at)
+         VALUES ('2026-10-14', 'HV', 1, ?, 0, NULL, NULL, NULL, NULL, 'graphql', ?)`,
+      )
+        .bind(horse, now)
+        .run();
+    }
+
+    await storeDividendsAsResults(
+      env.DB,
+      "2026-10-14",
+      "HV",
+      1,
+      officialWinPools(["3", "7"]),
+      "graphql",
+    );
+
+    const { results } = await env.DB.prepare(
+      `SELECT horse_no, final_position, dead_heat FROM results
+       WHERE meeting_date=? AND venue=? AND race_no=?
+       ORDER BY horse_no`,
+    )
+      .bind("2026-10-14", "HV", 1)
+      .all<{ horse_no: number; final_position: number | null; dead_heat: number | null }>();
+
+    const byNo = new Map((results ?? []).map((r) => [r.horse_no, r]));
+    expect(byNo.get(3)).toMatchObject({ final_position: 1, dead_heat: 1 });
+    expect(byNo.get(7)).toMatchObject({ final_position: 1, dead_heat: 1 });
+    expect(byNo.get(5)?.final_position === 0 || byNo.get(5)?.final_position == null).toBe(
+      true,
+    );
+    expect(byNo.get(5)?.dead_heat == null || byNo.get(5)?.dead_heat === 0).toBe(true);
   });
 
   it("does not overwrite an existing official winner with a different winComb", async () => {

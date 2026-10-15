@@ -517,9 +517,9 @@ export async function storeDividendsAsResults(
 
 /**
  * When every result row for the race has final_position null/≤0, set horses
- * listed in OFFICIAL WIN winComb to final_position=1 (R1). Official placings
- * (>0) are never overwritten (R3). Warns when still unresolved with no WIN
- * data (R2).
+ * listed in OFFICIAL WIN winComb to final_position=1 (R1). Multiple winComb
+ * → dead_heat=1; sole winner → dead_heat NULL. Official placings (>0) are
+ * never overwritten (R3). Warns when still unresolved with no WIN data (R2).
  */
 export async function applyWinCombPositionFallback(
   db: D1Database,
@@ -557,19 +557,22 @@ export async function applyWinCombPositionFallback(
     return { applied: false, winners: [] };
   }
 
+  // Multiple WIN winComb rows = dead heat → mark dead_heat=1; sole winner → NULL.
+  const deadHeat = winners.length > 1 ? 1 : null;
   const now = new Date().toISOString();
   for (const horseNo of winners) {
     await db
       .prepare(
         `INSERT INTO results (meeting_date, venue, race_no, horse_no, final_position, dead_heat, win_odds, place_odds, dividends_json, data_source, updated_at)
-         VALUES (?, ?, ?, ?, 1, NULL, NULL, NULL, NULL, ?, ?)
+         VALUES (?, ?, ?, ?, 1, ?, NULL, NULL, NULL, ?, ?)
          ON CONFLICT(meeting_date, venue, race_no, horse_no) DO UPDATE SET
            final_position=1,
+           dead_heat=excluded.dead_heat,
            data_source=excluded.data_source,
            updated_at=excluded.updated_at
          WHERE results.final_position IS NULL OR results.final_position <= 0`,
       )
-      .bind(meetingDate, venue, raceNo, horseNo, dataSource, now)
+      .bind(meetingDate, venue, raceNo, horseNo, deadHeat, dataSource, now)
       .run();
   }
   return { applied: true, winners };

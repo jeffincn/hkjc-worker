@@ -345,7 +345,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 回填来源行可能 `final_position` / `win_odds` / `place_odds` 为 `null`，但 `dividends` 可能有值。`horse_code` 优先取 `results` 列，否则 JOIN `runners`。
 
-**名次 fallback（issue #29）**：当 GraphQL 名次全为未解析（`0` / `null`）且 WIN 派彩已 OFFICIAL 时，用 `winComb` 反推头马 `final_position=1`；有官方名次时仍以官方为准。无可用派彩则保持 0/`null` 并打 warning。修好后下次 `/v1/admin/ingest`（或回填）写入派彩时自动生效。若要补修历史例（如 `2026-10-14` HV R1），在赛日仍可被 GraphQL 拉到时执行：
+**名次 fallback（issue #29）**：当 GraphQL 名次全为未解析（`0` / `null`）且 WIN 派彩已 OFFICIAL 时，用 `winComb` 反推头马 `final_position=1`；有官方名次时仍以官方为准。无可用派彩则保持 0/`null` 并打 warning。若 WIN 出现多个 `winComb`（平头），每个头马额外写 `dead_heat=1`；单一头马则 `dead_heat` 保持 `null`。修好后下次 `/v1/admin/ingest`（或回填）写入派彩时自动生效。若要补修历史例（如 `2026-10-14` HV R1），在赛日仍可被 GraphQL 拉到时执行：
 
 ```bash
 curl -s -X POST -H "Authorization: Bearer $TOKEN" "$BASE/v1/admin/ingest" | jq .

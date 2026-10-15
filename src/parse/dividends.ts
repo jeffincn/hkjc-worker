@@ -55,16 +55,23 @@ export interface WinCombFallbackResult {
   /** True when at least one runner was set to final_position=1. */
   applied: boolean;
   winners: number[];
+  /** True when WIN winComb listed 2+ horses (dead heat). */
+  dead_heat: boolean;
   /** Why fallback was skipped / needed. */
   reason: "official_positions_present" | "applied" | "no_win_dividends";
 }
 
 /**
  * R1/R3: when all final_positions are unresolved, set WIN winComb horses to 1.
+ * Multiple winComb → dead_heat=true on each winner; single winner → dead_heat=null.
  * Mutates `runners` in place. Does nothing when any official position (>0) exists.
  */
 export function applyWinCombWinnerFallback(args: {
-  runners: Array<{ horse_no: number; final_position: number | null }>;
+  runners: Array<{
+    horse_no: number;
+    final_position: number | null;
+    dead_heat?: boolean | null;
+  }>;
   pools: PmPoolRaw[];
 }): WinCombFallbackResult {
   const positions = args.runners.map((r) => r.final_position);
@@ -72,27 +79,40 @@ export function applyWinCombWinnerFallback(args: {
     return {
       applied: false,
       winners: [],
+      dead_heat: false,
       reason: "official_positions_present",
     };
   }
   const winners = winCombWinnerHorseNos(args.pools);
   if (winners.length === 0) {
-    return { applied: false, winners: [], reason: "no_win_dividends" };
+    return {
+      applied: false,
+      winners: [],
+      dead_heat: false,
+      reason: "no_win_dividends",
+    };
   }
+  const deadHeat = winners.length > 1;
   const winnerSet = new Set(winners);
   let applied = false;
   for (const r of args.runners) {
     if (winnerSet.has(r.horse_no)) {
       r.final_position = 1;
+      r.dead_heat = deadHeat ? true : null;
       applied = true;
     }
   }
   // Winner present in dividends but not yet in runners list — still "applied"
   // for callers that will upsert by horse_no.
   if (!applied && winners.length > 0) {
-    return { applied: true, winners, reason: "applied" };
+    return { applied: true, winners, dead_heat: deadHeat, reason: "applied" };
   }
-  return { applied, winners, reason: applied ? "applied" : "no_win_dividends" };
+  return {
+    applied,
+    winners,
+    dead_heat: deadHeat,
+    reason: applied ? "applied" : "no_win_dividends",
+  };
 }
 
 /**
