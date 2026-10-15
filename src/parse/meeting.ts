@@ -86,7 +86,13 @@ export function normalizeRunner(r: RunnerRaw): NormalizedRunner {
     jockey_en: r.jockey?.name_en ?? null,
     trainer_en: r.trainer?.name_en ?? null,
     last6run: r.last6run ?? null,
-    final_position: r.finalPosition ?? null,
+    // GraphQL sometimes returns finalPosition=0 when unparsed; 0 is not a
+    // valid placing — treat as missing so dividends WIN winComb can fill (R1).
+    final_position: (() => {
+      const p = r.finalPosition ?? null;
+      if (p == null) return null;
+      return p > 0 ? p : null;
+    })(),
     dead_heat: r.deadHeat ?? null,
     win_odds: parseOddsValue(r.winOdds),
   };

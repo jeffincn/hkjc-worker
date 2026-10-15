@@ -6,6 +6,10 @@ import {
 } from "../parse/odds";
 import { contentHash } from "../parse/hash";
 import type { ChangeHistoryRaw, PmPoolRaw } from "../graphql/types";
+import {
+  positionsUnresolved,
+  winCombWinnerHorseNos,
+} from "../parse/dividends";
 import { trackD1Result } from "./d1-budget";
 
 /** Payload used to detect meeting-tree changes (excludes change_histories). */
@@ -499,6 +503,76 @@ export async function storeDividendsAsResults(
     )
     .bind(json, new Date().toISOString(), meetingDate, venue, raceNo, json)
     .run();
+
+  // Issue #29: if GraphQL left all final_position 0/null, set WIN winComb → 1.
+  await applyWinCombPositionFallback(
+    db,
+    meetingDate,
+    venue,
+    raceNo,
+    pools,
+    dataSource,
+  );
+}
+
+/**
+ * When every result row for the race has final_position null/≤0, set horses
+ * listed in OFFICIAL WIN winComb to final_position=1 (R1). Official placings
+ * (>0) are never overwritten (R3). Warns when still unresolved with no WIN
+ * data (R2).
+ */
+export async function applyWinCombPositionFallback(
+  db: D1Database,
+  meetingDate: string,
+  venue: string,
+  raceNo: number,
+  pools: PmPoolRaw[],
+  dataSource: string,
+): Promise<{ applied: boolean; winners: number[] }> {
+  const { results } = await db
+    .prepare(
+      `SELECT horse_no, final_position FROM results
+       WHERE meeting_date=? AND venue=? AND race_no=?`,
+    )
+    .bind(meetingDate, venue, raceNo)
+    .all<{ horse_no: number; final_position: number | null }>();
+  const rows = results ?? [];
+  const unresolved = positionsUnresolved(rows.map((r) => r.final_position));
+  if (!unresolved && rows.length > 0) {
+    return { applied: false, winners: [] };
+  }
+
+  const winners = winCombWinnerHorseNos(pools);
+  if (winners.length === 0) {
+    // R2: do not silently leave all-zero / missing positions.
+    console.warn(
+      "[results] final_position unresolved and no usable WIN winComb fallback",
+      JSON.stringify({
+        meeting_date: meetingDate,
+        venue,
+        race_no: raceNo,
+        runners: rows.length,
+      }),
+    );
+    return { applied: false, winners: [] };
+  }
+
+  const now = new Date().toISOString();
+  for (const horseNo of winners) {
+    await db
+      .prepare(
+        `INSERT INTO results (meeting_date, venue, race_no, horse_no, final_position, dead_heat, win_odds, place_odds, dividends_json, data_source, updated_at)
+         VALUES (?, ?, ?, ?, 1, NULL, NULL, NULL, NULL, ?, ?)
+         ON CONFLICT(meeting_date, venue, race_no, horse_no) DO UPDATE SET
+           final_position=1,
+           data_source=excluded.data_source,
+           updated_at=excluded.updated_at
+         WHERE results.final_position IS NULL OR results.final_position <= 0`,
+      )
+      .bind(meetingDate, venue, raceNo, horseNo, dataSource, now)
+      .run();
+  }
+  return { applied: true, winners };
 }
 
 /**
