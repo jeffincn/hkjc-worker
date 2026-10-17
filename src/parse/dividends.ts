@@ -51,6 +51,28 @@ export function positionsUnresolved(
   return positions.every((p) => p == null || p <= 0);
 }
 
+/** True when any runner already holds final_position === 1. */
+export function hasFinalPositionOne(
+  positions: Array<number | null | undefined>,
+): boolean {
+  return positions.some((p) => p != null && p === 1);
+}
+
+/**
+ * Shared gate for WIN winComb → final_position=1 fallback (issue #31 R1/R4).
+ *
+ * Fires when position-1 is missing:
+ * - (a) all positions unresolved (null/≤0), or
+ * - (b) some official placings exist but none is 1 (e.g. [null,null,2..11]).
+ *
+ * Callers still require usable WIN winComb to apply; missing winComb → warn (R5).
+ */
+export function shouldApplyWinCombFallback(
+  positions: Array<number | null | undefined>,
+): boolean {
+  return !hasFinalPositionOne(positions);
+}
+
 export interface WinCombFallbackResult {
   /** True when at least one runner was set to final_position=1. */
   applied: boolean;
@@ -58,13 +80,19 @@ export interface WinCombFallbackResult {
   /** True when WIN winComb listed 2+ horses (dead heat). */
   dead_heat: boolean;
   /** Why fallback was skipped / needed. */
-  reason: "official_positions_present" | "applied" | "no_win_dividends";
+  reason:
+    | "winner_already_present"
+    | "applied"
+    | "no_win_dividends"
+    /** @deprecated alias of winner_already_present (pre-#31). */
+    | "official_positions_present";
 }
 
 /**
- * R1/R3: when all final_positions are unresolved, set WIN winComb horses to 1.
- * Multiple winComb → dead_heat=true on each winner; single winner → dead_heat=null.
- * Mutates `runners` in place. Does nothing when any official position (>0) exists.
+ * When position-1 is missing, set WIN winComb horses to final_position=1
+ * where currently null/≤0 (R1/R2). Never overwrites any official >0 placing.
+ * Multiple winComb → dead_heat=true; sole winner → dead_heat=null (R3).
+ * Mutates `runners` in place.
  */
 export function applyWinCombWinnerFallback(args: {
   runners: Array<{
@@ -75,12 +103,12 @@ export function applyWinCombWinnerFallback(args: {
   pools: PmPoolRaw[];
 }): WinCombFallbackResult {
   const positions = args.runners.map((r) => r.final_position);
-  if (!positionsUnresolved(positions)) {
+  if (!shouldApplyWinCombFallback(positions)) {
     return {
       applied: false,
       winners: [],
       dead_heat: false,
-      reason: "official_positions_present",
+      reason: "winner_already_present",
     };
   }
   const winners = winCombWinnerHorseNos(args.pools);
@@ -96,11 +124,12 @@ export function applyWinCombWinnerFallback(args: {
   const winnerSet = new Set(winners);
   let applied = false;
   for (const r of args.runners) {
-    if (winnerSet.has(r.horse_no)) {
-      r.final_position = 1;
-      r.dead_heat = deadHeat ? true : null;
-      applied = true;
-    }
+    if (!winnerSet.has(r.horse_no)) continue;
+    // R2: never overwrite any official placing >0.
+    if (r.final_position != null && r.final_position > 0) continue;
+    r.final_position = 1;
+    r.dead_heat = deadHeat ? true : null;
+    applied = true;
   }
   // Winner present in dividends but not yet in runners list — still "applied"
   // for callers that will upsert by horse_no.
