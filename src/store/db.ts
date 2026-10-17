@@ -7,7 +7,7 @@ import {
 import { contentHash } from "../parse/hash";
 import type { ChangeHistoryRaw, PmPoolRaw } from "../graphql/types";
 import {
-  positionsUnresolved,
+  shouldApplyWinCombFallback,
   winCombWinnerHorseNos,
 } from "../parse/dividends";
 import { trackD1Result } from "./d1-budget";
@@ -504,7 +504,7 @@ export async function storeDividendsAsResults(
     .bind(json, new Date().toISOString(), meetingDate, venue, raceNo, json)
     .run();
 
-  // Issue #29: if GraphQL left all final_position 0/null, set WIN winComb → 1.
+  // Issue #29/#31: if position-1 missing, set WIN winComb → 1 (null/≤0 only).
   await applyWinCombPositionFallback(
     db,
     meetingDate,
@@ -516,10 +516,11 @@ export async function storeDividendsAsResults(
 }
 
 /**
- * When every result row for the race has final_position null/≤0, set horses
- * listed in OFFICIAL WIN winComb to final_position=1 (R1). Multiple winComb
- * → dead_heat=1; sole winner → dead_heat NULL. Official placings (>0) are
- * never overwritten (R3). Warns when still unresolved with no WIN data (R2).
+ * When position-1 is missing (all-unresolved or partial — issue #31 R1), set
+ * OFFICIAL WIN winComb horses to final_position=1 where currently null/≤0 (R2).
+ * Multiple winComb → dead_heat=1; sole winner → dead_heat NULL (R3).
+ * Shares shouldApplyWinCombFallback with the parse path (R4). Warns when
+ * position-1 is missing and no usable WIN winComb (R5).
  */
 export async function applyWinCombPositionFallback(
   db: D1Database,
@@ -537,23 +538,25 @@ export async function applyWinCombPositionFallback(
     .bind(meetingDate, venue, raceNo)
     .all<{ horse_no: number; final_position: number | null }>();
   const rows = results ?? [];
-  const unresolved = positionsUnresolved(rows.map((r) => r.final_position));
-  if (!unresolved && rows.length > 0) {
+  const positions = rows.map((r) => r.final_position);
+  if (!shouldApplyWinCombFallback(positions) && rows.length > 0) {
     return { applied: false, winners: [] };
   }
 
   const winners = winCombWinnerHorseNos(pools);
   if (winners.length === 0) {
-    // R2: do not silently leave all-zero / missing positions.
-    console.warn(
-      "[results] final_position unresolved and no usable WIN winComb fallback",
-      JSON.stringify({
-        meeting_date: meetingDate,
-        venue,
-        race_no: raceNo,
-        runners: rows.length,
-      }),
-    );
+    // R5: position-1 missing and no usable WIN winComb — do not stay silent.
+    if (shouldApplyWinCombFallback(positions)) {
+      console.warn(
+        "[results] final_position=1 missing and no usable WIN winComb fallback",
+        JSON.stringify({
+          meeting_date: meetingDate,
+          venue,
+          race_no: raceNo,
+          runners: rows.length,
+        }),
+      );
+    }
     return { applied: false, winners: [] };
   }
 
