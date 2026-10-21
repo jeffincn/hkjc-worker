@@ -13,6 +13,9 @@ import {
 import {
   BARRIER_INTEGRITY_META_KEY,
   checkBarrierIntegrity,
+  sortBarrierViolations,
+  violationFromIntegrity,
+  type BarrierRunnerView,
   type BarrierViolationRecord,
 } from "../parse/barrier-integrity";
 import { trackD1Result } from "./d1-budget";
@@ -410,15 +413,79 @@ export async function ensureHorseStub(
     .run();
 }
 
+/**
+ * Replace one meeting's barrier violation entries in worker_meta so /health
+ * matches live /v1/races checks (issue #33 follow-up).
+ */
+export async function replaceMeetingBarrierViolations(
+  db: D1Database,
+  meetingDate: string,
+  venue: string,
+  meetingViolations: BarrierViolationRecord[],
+): Promise<BarrierViolationRecord[]> {
+  let existing: BarrierViolationRecord[] = [];
+  try {
+    const rawMeta = await getMeta(db, BARRIER_INTEGRITY_META_KEY);
+    if (rawMeta) {
+      const parsed = JSON.parse(rawMeta) as unknown;
+      if (Array.isArray(parsed)) existing = parsed as BarrierViolationRecord[];
+    }
+  } catch {
+    existing = [];
+  }
+  const retained = existing.filter(
+    (v) => !(v.meeting_date === meetingDate && v.venue === venue),
+  );
+  const next = sortBarrierViolations([...retained, ...meetingViolations]);
+  await setMeta(db, BARRIER_INTEGRITY_META_KEY, JSON.stringify(next));
+  return next;
+}
+
+/** Evaluate races and persist violations for one meeting into worker_meta. */
+export async function syncBarrierIntegrityForMeeting(
+  db: D1Database,
+  meetingDate: string,
+  venue: string,
+  races: Array<{ race_no: number; runners: BarrierRunnerView[] }>,
+): Promise<BarrierViolationRecord[]> {
+  const meetingViolations: BarrierViolationRecord[] = [];
+  for (const race of races) {
+    const integrity = checkBarrierIntegrity(race.runners);
+    if (integrity.ok) continue;
+    console.warn(
+      "[barrier_integrity] duplicate / out_of_range / null barrier",
+      JSON.stringify({
+        meeting_date: meetingDate,
+        venue,
+        race_no: race.race_no,
+        field_size: integrity.field_size,
+        draw_size: integrity.draw_size,
+        barriers: integrity.barriers,
+        duplicates: integrity.duplicates,
+        out_of_range: integrity.out_of_range,
+        null_barrier_horse_nos: integrity.null_barrier_horse_nos,
+        origin: integrity.origin,
+      }),
+    );
+    const rec = violationFromIntegrity(
+      meetingDate,
+      venue,
+      race.race_no,
+      integrity,
+    );
+    if (rec) meetingViolations.push(rec);
+  }
+  return replaceMeetingBarrierViolations(db, meetingDate, venue, meetingViolations);
+}
+
 export async function persistMeetingTree(
   db: D1Database,
   meeting: NormalizedMeeting,
   raw?: unknown,
 ): Promise<void> {
   await upsertMeeting(db, meeting, raw);
-  const meetingViolations: BarrierViolationRecord[] = [];
   // rbc backfill omits barrierDrawNumber (always null) — do not overwrite
-  // live-poll integrity state with false "all missing" from null payloads.
+  // live-poll integrity state with false null-barrier noise from that payload.
   const runBarrierIntegrity = meeting.data_source !== "graphql_rbc";
   for (const race of meeting.races) {
     await upsertRace(db, meeting.meeting_date, meeting.venue, race, meeting.data_source);
@@ -443,63 +510,16 @@ export async function persistMeetingTree(
         );
       }
     }
-
-    if (!runBarrierIntegrity) continue;
-
-    const integrity = checkBarrierIntegrity(race.runners);
-    if (!integrity.ok) {
-      console.warn(
-        "[barrier_integrity] set != {1..field_size}",
-        JSON.stringify({
-          meeting_date: meeting.meeting_date,
-          venue: meeting.venue,
-          race_no: race.race_no,
-          field_size: integrity.field_size,
-          barriers: integrity.barriers,
-          duplicates: integrity.duplicates,
-          missing: integrity.missing,
-          origin: integrity.origin,
-        }),
-      );
-      meetingViolations.push({
-        meeting_date: meeting.meeting_date,
-        venue: meeting.venue,
-        race_no: race.race_no,
-        field_size: integrity.field_size,
-        duplicates: integrity.duplicates,
-        missing: integrity.missing,
-        raw_evidence: integrity.raw_evidence,
-        origin: integrity.origin,
-        updated_at: new Date().toISOString(),
-      });
-    }
   }
 
   if (!runBarrierIntegrity) return;
 
-  // Replace this meeting's entries in the global violations list (issue #33).
-  let existing: BarrierViolationRecord[] = [];
-  try {
-    const rawMeta = await getMeta(db, BARRIER_INTEGRITY_META_KEY);
-    if (rawMeta) {
-      const parsed = JSON.parse(rawMeta) as unknown;
-      if (Array.isArray(parsed)) existing = parsed as BarrierViolationRecord[];
-    }
-  } catch {
-    existing = [];
-  }
-  const retained = existing.filter(
-    (v) =>
-      !(v.meeting_date === meeting.meeting_date && v.venue === meeting.venue),
+  await syncBarrierIntegrityForMeeting(
+    db,
+    meeting.meeting_date,
+    meeting.venue,
+    meeting.races.map((r) => ({ race_no: r.race_no, runners: r.runners })),
   );
-  const next = [...retained, ...meetingViolations].sort((a, b) => {
-    const d = a.meeting_date.localeCompare(b.meeting_date);
-    if (d !== 0) return d;
-    const v = a.venue.localeCompare(b.venue);
-    if (v !== 0) return v;
-    return a.race_no - b.race_no;
-  });
-  await setMeta(db, BARRIER_INTEGRITY_META_KEY, JSON.stringify(next));
 }
 
 
