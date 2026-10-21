@@ -231,6 +231,8 @@ describe("persistMeetingTree barrier integrity + scratch clear", () => {
   it("rbc backfill null barriers do not wipe live draws for declared runners", async () => {
     const meeting = issue33Meeting();
     await persistMeetingTree(env.DB, meeting);
+    const metaBefore = await getMeta(env.DB, BARRIER_INTEGRITY_META_KEY);
+    expect(JSON.parse(metaBefore ?? "[]")).toHaveLength(1);
 
     const backfill: NormalizedMeeting = {
       ...meeting,
@@ -256,6 +258,10 @@ describe("persistMeetingTree barrier integrity + scratch clear", () => {
       .bind("2026-10-21", "HV", 1, 2)
       .first<{ barrier: number | null }>();
     expect(row?.barrier).toBe(3);
+
+    // rbc must not clobber live-poll integrity meta with false "all missing".
+    const metaAfter = await getMeta(env.DB, BARRIER_INTEGRITY_META_KEY);
+    expect(JSON.parse(metaAfter ?? "[]")).toHaveLength(1);
   });
 });
 

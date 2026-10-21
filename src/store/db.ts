@@ -417,6 +417,9 @@ export async function persistMeetingTree(
 ): Promise<void> {
   await upsertMeeting(db, meeting, raw);
   const meetingViolations: BarrierViolationRecord[] = [];
+  // rbc backfill omits barrierDrawNumber (always null) — do not overwrite
+  // live-poll integrity state with false "all missing" from null payloads.
+  const runBarrierIntegrity = meeting.data_source !== "graphql_rbc";
   for (const race of meeting.races) {
     await upsertRace(db, meeting.meeting_date, meeting.venue, race, meeting.data_source);
     for (const runner of race.runners) {
@@ -440,6 +443,8 @@ export async function persistMeetingTree(
         );
       }
     }
+
+    if (!runBarrierIntegrity) continue;
 
     const integrity = checkBarrierIntegrity(race.runners);
     if (!integrity.ok) {
@@ -469,6 +474,8 @@ export async function persistMeetingTree(
       });
     }
   }
+
+  if (!runBarrierIntegrity) return;
 
   // Replace this meeting's entries in the global violations list (issue #33).
   let existing: BarrierViolationRecord[] = [];
