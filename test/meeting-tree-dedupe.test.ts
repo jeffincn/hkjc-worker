@@ -34,7 +34,7 @@ function sampleMeeting(overrides?: Partial<NormalizedMeeting>): NormalizedMeetin
             name_en: "Alpha",
             name_ch: null,
             status: "Declared",
-            barrier: 3,
+            barrier: 1,
             handicap_weight: 126,
             jockey_en: "Jockey A",
             trainer_en: "Trainer A",

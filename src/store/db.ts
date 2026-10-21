@@ -10,6 +10,11 @@ import {
   shouldApplyWinCombFallback,
   winCombWinnerHorseNos,
 } from "../parse/dividends";
+import {
+  BARRIER_INTEGRITY_META_KEY,
+  checkBarrierIntegrity,
+  type BarrierViolationRecord,
+} from "../parse/barrier-integrity";
 import { trackD1Result } from "./d1-budget";
 
 /** Payload used to detect meeting-tree changes (excludes change_histories). */
@@ -111,6 +116,19 @@ export async function upsertRace(
     .run();
 }
 
+/**
+ * Barrier update expression (issue #33).
+ * Scratched/withdrawn: take source barrier as-is (usually null) so we do not
+ * retain a stale draw via COALESCE after HKJC clears barrierDrawNumber.
+ * Otherwise: COALESCE so rbc backfill (null barriers) does not wipe live draws.
+ */
+const RUNNER_BARRIER_EXPR = `CASE
+  WHEN UPPER(COALESCE(excluded.status, '')) LIKE '%SCRATCH%'
+    OR UPPER(COALESCE(excluded.status, '')) = 'WITHDRAWN'
+  THEN excluded.barrier
+  ELSE COALESCE(excluded.barrier, runners.barrier)
+END`;
+
 export async function upsertRunner(
   db: D1Database,
   meetingDate: string,
@@ -128,7 +146,7 @@ export async function upsertRunner(
          name_en=COALESCE(excluded.name_en, runners.name_en),
          name_ch=COALESCE(excluded.name_ch, runners.name_ch),
          status=COALESCE(excluded.status, runners.status),
-         barrier=COALESCE(excluded.barrier, runners.barrier),
+         barrier=${RUNNER_BARRIER_EXPR},
          handicap_weight=COALESCE(excluded.handicap_weight, runners.handicap_weight),
          jockey_en=COALESCE(excluded.jockey_en, runners.jockey_en),
          trainer_en=COALESCE(excluded.trainer_en, runners.trainer_en),
@@ -139,7 +157,7 @@ export async function upsertRunner(
           OR runners.name_en IS DISTINCT FROM COALESCE(excluded.name_en, runners.name_en)
           OR runners.name_ch IS DISTINCT FROM COALESCE(excluded.name_ch, runners.name_ch)
           OR runners.status IS DISTINCT FROM COALESCE(excluded.status, runners.status)
-          OR runners.barrier IS DISTINCT FROM COALESCE(excluded.barrier, runners.barrier)
+          OR runners.barrier IS DISTINCT FROM (${RUNNER_BARRIER_EXPR})
           OR runners.handicap_weight IS DISTINCT FROM COALESCE(excluded.handicap_weight, runners.handicap_weight)
           OR runners.jockey_en IS DISTINCT FROM COALESCE(excluded.jockey_en, runners.jockey_en)
           OR runners.trainer_en IS DISTINCT FROM COALESCE(excluded.trainer_en, runners.trainer_en)
@@ -398,6 +416,10 @@ export async function persistMeetingTree(
   raw?: unknown,
 ): Promise<void> {
   await upsertMeeting(db, meeting, raw);
+  const meetingViolations: BarrierViolationRecord[] = [];
+  // rbc backfill omits barrierDrawNumber (always null) — do not overwrite
+  // live-poll integrity state with false "all missing" from null payloads.
+  const runBarrierIntegrity = meeting.data_source !== "graphql_rbc";
   for (const race of meeting.races) {
     await upsertRace(db, meeting.meeting_date, meeting.venue, race, meeting.data_source);
     for (const runner of race.runners) {
@@ -421,7 +443,63 @@ export async function persistMeetingTree(
         );
       }
     }
+
+    if (!runBarrierIntegrity) continue;
+
+    const integrity = checkBarrierIntegrity(race.runners);
+    if (!integrity.ok) {
+      console.warn(
+        "[barrier_integrity] set != {1..field_size}",
+        JSON.stringify({
+          meeting_date: meeting.meeting_date,
+          venue: meeting.venue,
+          race_no: race.race_no,
+          field_size: integrity.field_size,
+          barriers: integrity.barriers,
+          duplicates: integrity.duplicates,
+          missing: integrity.missing,
+          origin: integrity.origin,
+        }),
+      );
+      meetingViolations.push({
+        meeting_date: meeting.meeting_date,
+        venue: meeting.venue,
+        race_no: race.race_no,
+        field_size: integrity.field_size,
+        duplicates: integrity.duplicates,
+        missing: integrity.missing,
+        raw_evidence: integrity.raw_evidence,
+        origin: integrity.origin,
+        updated_at: new Date().toISOString(),
+      });
+    }
   }
+
+  if (!runBarrierIntegrity) return;
+
+  // Replace this meeting's entries in the global violations list (issue #33).
+  let existing: BarrierViolationRecord[] = [];
+  try {
+    const rawMeta = await getMeta(db, BARRIER_INTEGRITY_META_KEY);
+    if (rawMeta) {
+      const parsed = JSON.parse(rawMeta) as unknown;
+      if (Array.isArray(parsed)) existing = parsed as BarrierViolationRecord[];
+    }
+  } catch {
+    existing = [];
+  }
+  const retained = existing.filter(
+    (v) =>
+      !(v.meeting_date === meeting.meeting_date && v.venue === meeting.venue),
+  );
+  const next = [...retained, ...meetingViolations].sort((a, b) => {
+    const d = a.meeting_date.localeCompare(b.meeting_date);
+    if (d !== 0) return d;
+    const v = a.venue.localeCompare(b.venue);
+    if (v !== 0) return v;
+    return a.race_no - b.race_no;
+  });
+  await setMeta(db, BARRIER_INTEGRITY_META_KEY, JSON.stringify(next));
 }
 
 
