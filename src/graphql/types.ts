@@ -50,6 +50,8 @@ export interface RaceRaw {
   raceName_ch?: string | null;
   postTime?: string | null;
   distance?: number | null;
+  /** Original wagering field size (incl. scratched when GraphQL still tracks it). */
+  wageringFieldSize?: number | null;
   go_en?: string | null;
   go_ch?: string | null;
   raceTrack?: { description_en?: string | null; description_ch?: string | null } | null;

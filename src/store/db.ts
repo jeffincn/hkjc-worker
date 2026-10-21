@@ -446,11 +446,17 @@ export async function syncBarrierIntegrityForMeeting(
   db: D1Database,
   meetingDate: string,
   venue: string,
-  races: Array<{ race_no: number; runners: BarrierRunnerView[] }>,
+  races: Array<{
+    race_no: number;
+    runners: BarrierRunnerView[];
+    wageringFieldSize?: number | null;
+  }>,
 ): Promise<BarrierViolationRecord[]> {
   const meetingViolations: BarrierViolationRecord[] = [];
   for (const race of races) {
-    const integrity = checkBarrierIntegrity(race.runners);
+    const integrity = checkBarrierIntegrity(race.runners, {
+      wageringFieldSize: race.wageringFieldSize,
+    });
     if (integrity.ok) continue;
     console.warn(
       "[barrier_integrity] duplicate / out_of_range / null barrier",
@@ -518,7 +524,11 @@ export async function persistMeetingTree(
     db,
     meeting.meeting_date,
     meeting.venue,
-    meeting.races.map((r) => ({ race_no: r.race_no, runners: r.runners })),
+    meeting.races.map((r) => ({
+      race_no: r.race_no,
+      runners: r.runners,
+      wageringFieldSize: r.wagering_field_size,
+    })),
   );
 }
 

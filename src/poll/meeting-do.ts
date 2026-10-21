@@ -276,6 +276,7 @@ export class MeetingPoller implements DurableObject {
             meeting.races.map((r) => ({
               race_no: r.race_no,
               runners: r.runners,
+              wageringFieldSize: r.wagering_field_size,
             })),
           );
         }
