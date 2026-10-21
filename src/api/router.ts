@@ -1,4 +1,8 @@
 import type { Env } from "../env";
+import {
+  BARRIER_INTEGRITY_META_KEY,
+  checkBarrierIntegrity,
+} from "../parse/barrier-integrity";
 import { horseCodeFromRunnerFields } from "../parse/horse-code";
 import { getMeta } from "../store/db";
 import { jsonError, jsonOk, requireBearer } from "./auth";
@@ -297,6 +301,15 @@ async function handleHealth(env: Env): Promise<Response> {
     // ignore
   }
 
+  // Barrier integrity violations (issue #33) — cheap meta read.
+  let barrier_integrity_violations: unknown = [];
+  try {
+    const raw = await getMeta(env.DB, BARRIER_INTEGRITY_META_KEY);
+    if (raw) barrier_integrity_violations = JSON.parse(raw);
+  } catch {
+    barrier_integrity_violations = [];
+  }
+
   return jsonOk({
     ok: true,
     service: "hkjc-data-worker",
@@ -346,10 +359,13 @@ async function handleHealth(env: Env): Promise<Response> {
       /** Live poll presence gaps from poll_ticks (issue #26). */
       odds_coverage_threshold_ms: POLL_GAP_THRESHOLD_MS,
       odds_coverage: odds_coverage_gap,
+      /** Barrier set ≠ {1..field_size} races (issue #33). */
+      barrier_integrity_violations,
     },
     alerts: {
       whitelist_error: whitelistAlert,
       odds_coverage_gap,
+      barrier_integrity_violations,
     },
   });
 }
@@ -474,21 +490,37 @@ async function listRaces(env: Env, url: URL): Promise<Response> {
   return jsonOk({
     date,
     venue,
-    races: (races ?? []).map((race) => ({
-      ...race,
-      runners: (byRace.get((race as { race_no: number }).race_no) ?? []).map((r) => ({
-        horse_no: r.horse_no,
-        horse_code: r.horse_code,
-        name_en: r.name_en,
-        name_ch: r.name_ch,
-        status: r.status,
-        barrier: r.barrier,
-        handicap_weight: r.handicap_weight,
-        jockey_en: r.jockey_en,
-        trainer_en: r.trainer_en,
-        last6run: r.last6run,
-      })),
-    })),
+    races: (races ?? []).map((race) => {
+      const raceNo = (race as { race_no: number }).race_no;
+      const raceRunners = byRace.get(raceNo) ?? [];
+      const integrity = checkBarrierIntegrity(raceRunners);
+      return {
+        ...race,
+        /** True when barrier set ≠ {1..field_size} among declared runners (issue #33). */
+        barrier_unreliable: integrity.barrier_unreliable,
+        barrier_integrity: {
+          ok: integrity.ok,
+          field_size: integrity.field_size,
+          barriers: integrity.barriers,
+          duplicates: integrity.duplicates,
+          missing: integrity.missing,
+          origin: integrity.origin,
+          raw_evidence: integrity.raw_evidence,
+        },
+        runners: raceRunners.map((r) => ({
+          horse_no: r.horse_no,
+          horse_code: r.horse_code,
+          name_en: r.name_en,
+          name_ch: r.name_ch,
+          status: r.status,
+          barrier: r.barrier,
+          handicap_weight: r.handicap_weight,
+          jockey_en: r.jockey_en,
+          trainer_en: r.trainer_en,
+          last6run: r.last6run,
+        })),
+      };
+    }),
   });
 }
 
