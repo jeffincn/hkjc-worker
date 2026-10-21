@@ -29,6 +29,8 @@ export interface NormalizedRace {
   course_desc: string | null;
   course_code: string | null;
   race_class: string | null;
+  /** GraphQL wageringFieldSize — preferred draw_size hint (issue #33). */
+  wagering_field_size?: number | null;
   runners: NormalizedRunner[];
 }
 
@@ -99,6 +101,7 @@ export function normalizeRunner(r: RunnerRaw): NormalizedRunner {
 }
 
 export function normalizeRace(race: RaceRaw): NormalizedRace {
+  const wfs = race.wageringFieldSize;
   return {
     race_no: race.no,
     post_time: race.postTime ?? null,
@@ -108,6 +111,8 @@ export function normalizeRace(race: RaceRaw): NormalizedRace {
     course_desc: race.raceCourse?.description_en ?? null,
     course_code: race.raceCourse?.displayCode ?? null,
     race_class: race.raceClass_en ?? null,
+    wagering_field_size:
+      wfs != null && Number.isFinite(wfs) && wfs > 0 ? Number(wfs) : null,
     runners: (race.runners ?? []).map(normalizeRunner),
   };
 }

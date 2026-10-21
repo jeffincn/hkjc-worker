@@ -4,6 +4,7 @@ import worker from "../src/index";
 import {
   BARRIER_INTEGRITY_META_KEY,
   checkBarrierIntegrity,
+  inferDrawSize,
   upsertBarrierViolation,
 } from "../src/parse/barrier-integrity";
 import { normalizeMeeting, type NormalizedMeeting } from "../src/parse/meeting";
@@ -77,11 +78,52 @@ function issue33Meeting(): NormalizedMeeting {
 }
 
 /**
- * Production false-positive shape (HV R2-like): original 12, two scratches
- * leave gaps; declared keep original draws including barrier 12.
+ * Production false-positive (2026-10-21 HV R2 after #35): scratched horses 1 & 2
+ * are completely absent from the payload. 10 declared runners remain; original
+ * barrier 12 is kept → old logic set draw_size=10 and flagged out_of_range=[12].
+ *
+ * Shape mirrors the live report: field_size=10, barriers include 12, duplicates=[].
  */
+const HV_R2_ABSENT_SCRATCH_BARRIERS: Array<[number, number]> = [
+  [1, 3],
+  [2, 4],
+  [3, 5],
+  [4, 6],
+  [5, 7],
+  [6, 8],
+  [7, 9],
+  [8, 10],
+  [9, 11],
+  [10, 12], // cloth may be renumbered in store; barrier 12 is the original draw
+];
+
+function hvR2AbsentScratchMeeting(): NormalizedMeeting {
+  return {
+    meeting_date: "2026-10-21",
+    venue: "HV",
+    total_races: 1,
+    status: "DEFINED",
+    data_source: "graphql",
+    change_histories: [],
+    races: [
+      {
+        race_no: 2,
+        post_time: "2026-10-21T19:45:00+08:00",
+        status: "DEFINED",
+        distance: 1200,
+        going: "GOOD",
+        course_desc: null,
+        course_code: "A",
+        race_class: "Class 4",
+        wagering_field_size: 12,
+        runners: HV_R2_ABSENT_SCRATCH_BARRIERS.map(([n, b]) => runner(n, b)),
+      },
+    ],
+  };
+}
+
+/** Same race when scratched cloths stay in the payload as Scratched rows. */
 function scratchGapMeeting(): NormalizedMeeting {
-  // Barriers among declared: 1,2,3,5,6,7,9,10,11,12 (gaps 4,8 from scratches)
   const declared: Array<[number, number]> = [
     [1, 1],
     [2, 2],
@@ -111,6 +153,7 @@ function scratchGapMeeting(): NormalizedMeeting {
         course_desc: null,
         course_code: "A",
         race_class: "Class 4",
+        wagering_field_size: 12,
         runners: [
           ...declared.map(([n, b]) => runner(n, b)),
           runner(4, null, "Scratched"),
@@ -163,7 +206,7 @@ describe("checkBarrierIntegrity", () => {
     );
   });
 
-  it("does NOT flag scratch-induced gaps (HV R2-like: field 10, barrier 12 kept)", () => {
+  it("does NOT flag scratch-induced gaps when scratched rows remain", () => {
     const runners = [
       { horse_no: 1, status: "Declared", barrier: 1 },
       { horse_no: 2, status: "Declared", barrier: 2 },
@@ -182,7 +225,28 @@ describe("checkBarrierIntegrity", () => {
     expect(r.field_size).toBe(10);
     expect(r.draw_size).toBe(12);
     expect(r.barriers).toContain(12);
-    expect(r.missing).toEqual([4, 8]); // informational scratch gaps
+    expect(r.missing).toEqual([4, 8]);
+    expect(r.duplicates).toEqual([]);
+    expect(r.out_of_range).toEqual([]);
+    expect(r.ok).toBe(true);
+    expect(r.barrier_unreliable).toBe(false);
+  });
+
+  it("2026-10-21 HV R2: scratched horses absent — barrier 12 not out_of_range", () => {
+    // Production after #35: draw_size was wrongly 10, out_of_range=[12].
+    const runners = HV_R2_ABSENT_SCRATCH_BARRIERS.map(([horse_no, barrier]) => ({
+      horse_no,
+      status: "Declared",
+      barrier,
+    }));
+    expect(runners).toHaveLength(10);
+    expect(inferDrawSize(runners)).toBe(12); // max(barrier)=12, not present count
+    expect(inferDrawSize(runners, { wageringFieldSize: 12 })).toBe(12);
+
+    const r = checkBarrierIntegrity(runners);
+    expect(r.field_size).toBe(10);
+    expect(r.draw_size).toBe(12);
+    expect(r.barriers).toContain(12);
     expect(r.duplicates).toEqual([]);
     expect(r.out_of_range).toEqual([]);
     expect(r.null_barrier_horse_nos).toEqual([]);
@@ -190,13 +254,27 @@ describe("checkBarrierIntegrity", () => {
     expect(r.barrier_unreliable).toBe(false);
   });
 
-  it("flags barrier outside 1..draw_size", () => {
+  it("infers draw_size from max(horse_no) when scratched cloths absent", () => {
+    const runners = [3, 4, 5, 6, 7, 8, 9, 10, 11, 12].map((horse_no) => ({
+      horse_no,
+      status: "Declared",
+      barrier: horse_no, // includes barrier 12
+    }));
+    expect(inferDrawSize(runners)).toBe(12);
+    const r = checkBarrierIntegrity(runners);
+    expect(r.ok).toBe(true);
+    expect(r.out_of_range).toEqual([]);
+  });
+
+  it("flags barrier outside 1..draw_size (corrupt >14 ignored for infer)", () => {
     const runners = [
       { horse_no: 1, status: "Declared", barrier: 1 },
       { horse_no: 2, status: "Declared", barrier: 2 },
       { horse_no: 3, status: "Declared", barrier: 15 },
       { horse_no: 4, status: "Scratched", barrier: null },
     ];
+    // 15 must not inflate draw_size past present/max horse_no.
+    expect(inferDrawSize(runners)).toBe(4);
     const r = checkBarrierIntegrity(runners);
     expect(r.draw_size).toBe(4);
     expect(r.out_of_range).toEqual([15]);
@@ -323,6 +401,12 @@ describe("persistMeetingTree barrier integrity + scratch clear", () => {
 
   it("does not record scratch-gap races as violations", async () => {
     await persistMeetingTree(env.DB, scratchGapMeeting());
+    const meta = await getMeta(env.DB, BARRIER_INTEGRITY_META_KEY);
+    expect(JSON.parse(meta ?? "[]")).toEqual([]);
+  });
+
+  it("does not record HV R2 absent-scratch shape as violations", async () => {
+    await persistMeetingTree(env.DB, hvR2AbsentScratchMeeting());
     const meta = await getMeta(env.DB, BARRIER_INTEGRITY_META_KEY);
     expect(JSON.parse(meta ?? "[]")).toEqual([]);
   });
@@ -456,6 +540,7 @@ describe("/v1/races + /health barrier integrity surface", () => {
           field_size: number;
           draw_size: number;
           duplicates: number[];
+          out_of_range: number[];
           missing: number[];
         };
       }>;
@@ -466,7 +551,39 @@ describe("/v1/races + /health barrier integrity surface", () => {
     expect(r2.barrier_integrity.field_size).toBe(10);
     expect(r2.barrier_integrity.draw_size).toBe(12);
     expect(r2.barrier_integrity.duplicates).toEqual([]);
+    expect(r2.barrier_integrity.out_of_range).toEqual([]);
     expect(r2.barrier_integrity.missing).toEqual([4, 8]);
+  });
+
+  it("does not flag 2026-10-21 HV R2 absent-scratch shape on /v1/races", async () => {
+    await persistMeetingTree(env.DB, hvR2AbsentScratchMeeting());
+
+    const ctx = createExecutionContext();
+    const res = await worker.fetch(
+      new Request("http://localhost/v1/races?date=2026-10-21&venue=HV", {
+        headers: AUTH,
+      }),
+      env,
+      ctx,
+    );
+    await waitOnExecutionContext(ctx);
+    const body = (await res.json()) as {
+      races: Array<{
+        race_no: number;
+        barrier_unreliable: boolean;
+        barrier_integrity: {
+          ok: boolean;
+          field_size: number;
+          draw_size: number;
+          out_of_range: number[];
+        };
+      }>;
+    };
+    const r2 = body.races.find((r) => r.race_no === 2)!;
+    expect(r2.barrier_unreliable).toBe(false);
+    expect(r2.barrier_integrity.field_size).toBe(10);
+    expect(r2.barrier_integrity.draw_size).toBe(12);
+    expect(r2.barrier_integrity.out_of_range).toEqual([]);
   });
 
   it("keeps /health violations in sync with /v1/races (even if meta was empty)", async () => {
