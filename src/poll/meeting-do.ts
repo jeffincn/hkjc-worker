@@ -46,6 +46,7 @@ import {
   raceHadOpenOddsSnapshot,
   raceHasPublishedDividends,
   setMeta,
+  syncBarrierIntegrityForMeeting,
 } from "../store/db";
 import {
   evaluateAndAlertCoverageGaps,
@@ -265,6 +266,18 @@ export class MeetingPoller implements DurableObject {
         if (treeHash !== prevHash) {
           await persistMeetingTree(this.env.DB, meeting, found);
           await this.state.storage.put("meeting_tree_hash", treeHash);
+        } else {
+          // Tree unchanged → persist skipped, but still refresh barrier meta
+          // so /health matches live /v1/races (issue #33).
+          await syncBarrierIntegrityForMeeting(
+            this.env.DB,
+            meeting.meeting_date,
+            meeting.venue,
+            meeting.races.map((r) => ({
+              race_no: r.race_no,
+              runners: r.runners,
+            })),
+          );
         }
 
         await this.touchLastFetchAt();

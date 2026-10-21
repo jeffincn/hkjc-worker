@@ -1,10 +1,11 @@
 import type { Env } from "../env";
 import {
   BARRIER_INTEGRITY_META_KEY,
+  barrierIntegrityPayload,
   checkBarrierIntegrity,
 } from "../parse/barrier-integrity";
 import { horseCodeFromRunnerFields } from "../parse/horse-code";
-import { getMeta } from "../store/db";
+import { getMeta, syncBarrierIntegrityForMeeting } from "../store/db";
 import { jsonError, jsonOk, requireBearer } from "./auth";
 
 export async function handleApi(request: Request, env: Env): Promise<Response> {
@@ -302,6 +303,7 @@ async function handleHealth(env: Env): Promise<Response> {
   }
 
   // Barrier integrity violations (issue #33) — cheap meta read.
+  // Kept in sync by persistMeetingTree, live poll hash-no-op sync, and /v1/races.
   let barrier_integrity_violations: unknown = [];
   try {
     const raw = await getMeta(env.DB, BARRIER_INTEGRITY_META_KEY);
@@ -359,7 +361,7 @@ async function handleHealth(env: Env): Promise<Response> {
       /** Live poll presence gaps from poll_ticks (issue #26). */
       odds_coverage_threshold_ms: POLL_GAP_THRESHOLD_MS,
       odds_coverage: odds_coverage_gap,
-      /** Barrier set ≠ {1..field_size} races (issue #33). */
+      /** Barrier duplicate / OOB / null among declared (issue #33). */
       barrier_integrity_violations,
     },
     alerts: {
@@ -487,40 +489,55 @@ async function listRaces(env: Env, url: URL): Promise<Response> {
     list.push(r);
     byRace.set(r.race_no, list);
   }
+
+  const raceViews = (races ?? []).map((race) => {
+    const raceNo = (race as { race_no: number }).race_no;
+    const raceRunners = byRace.get(raceNo) ?? [];
+    const integrity = checkBarrierIntegrity(raceRunners);
+    return {
+      race,
+      raceNo,
+      raceRunners,
+      integrity,
+    };
+  });
+
+  // Keep /health meta aligned with this live check (tree-hash may skip persist).
+  try {
+    await syncBarrierIntegrityForMeeting(
+      env.DB,
+      date,
+      venue,
+      raceViews.map((r) => ({
+        race_no: r.raceNo,
+        runners: r.raceRunners,
+      })),
+    );
+  } catch {
+    // meta sync must not break the races query
+  }
+
   return jsonOk({
     date,
     venue,
-    races: (races ?? []).map((race) => {
-      const raceNo = (race as { race_no: number }).race_no;
-      const raceRunners = byRace.get(raceNo) ?? [];
-      const integrity = checkBarrierIntegrity(raceRunners);
-      return {
-        ...race,
-        /** True when barrier set ≠ {1..field_size} among declared runners (issue #33). */
-        barrier_unreliable: integrity.barrier_unreliable,
-        barrier_integrity: {
-          ok: integrity.ok,
-          field_size: integrity.field_size,
-          barriers: integrity.barriers,
-          duplicates: integrity.duplicates,
-          missing: integrity.missing,
-          origin: integrity.origin,
-          raw_evidence: integrity.raw_evidence,
-        },
-        runners: raceRunners.map((r) => ({
-          horse_no: r.horse_no,
-          horse_code: r.horse_code,
-          name_en: r.name_en,
-          name_ch: r.name_ch,
-          status: r.status,
-          barrier: r.barrier,
-          handicap_weight: r.handicap_weight,
-          jockey_en: r.jockey_en,
-          trainer_en: r.trainer_en,
-          last6run: r.last6run,
-        })),
-      };
-    }),
+    races: raceViews.map(({ race, raceRunners, integrity }) => ({
+      ...race,
+      /** True on duplicate / out-of-range / null barrier among declared (issue #33). */
+      barrier_unreliable: integrity.barrier_unreliable,
+      barrier_integrity: barrierIntegrityPayload(integrity),
+      runners: raceRunners.map((r) => ({
+        horse_no: r.horse_no,
+        horse_code: r.horse_code,
+        name_en: r.name_en,
+        name_ch: r.name_ch,
+        status: r.status,
+        barrier: r.barrier,
+        handicap_weight: r.handicap_weight,
+        jockey_en: r.jockey_en,
+        trainer_en: r.trainer_en,
+        last6run: r.last6run,
+      })),
+    })),
   });
 }
 

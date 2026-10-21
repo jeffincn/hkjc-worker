@@ -8,7 +8,7 @@ import {
 } from "../src/parse/barrier-integrity";
 import { normalizeMeeting, type NormalizedMeeting } from "../src/parse/meeting";
 import type { MeetingRaw } from "../src/graphql/types";
-import { getMeta, persistMeetingTree } from "../src/store/db";
+import { getMeta, persistMeetingTree, setMeta } from "../src/store/db";
 
 const AUTH = { Authorization: "Bearer test-api-token" };
 
@@ -26,6 +26,29 @@ const ISSUE33_BARRIERS: Array<[number, number]> = [
   [10, 8],
   [11, 2],
 ];
+
+function runner(
+  horse_no: number,
+  barrier: number | null,
+  status = "Declared",
+): NormalizedMeeting["races"][0]["runners"][0] {
+  return {
+    horse_no,
+    horse_code: `H${String(Math.abs(horse_no)).padStart(3, "0")}`,
+    horse_id: null,
+    name_en: `Horse ${horse_no}`,
+    name_ch: null,
+    status,
+    barrier,
+    handicap_weight: 126,
+    jockey_en: null,
+    trainer_en: null,
+    last6run: null,
+    final_position: null,
+    dead_heat: null,
+    win_odds: null,
+  };
+}
 
 function issue33Meeting(): NormalizedMeeting {
   return {
@@ -45,22 +68,54 @@ function issue33Meeting(): NormalizedMeeting {
         course_desc: null,
         course_code: "A",
         race_class: "Class 4",
-        runners: ISSUE33_BARRIERS.map(([horse_no, barrier]) => ({
-          horse_no,
-          horse_code: `H${String(horse_no).padStart(3, "0")}`,
-          horse_id: null,
-          name_en: `Horse ${horse_no}`,
-          name_ch: null,
-          status: "Declared",
-          barrier,
-          handicap_weight: 126,
-          jockey_en: null,
-          trainer_en: null,
-          last6run: null,
-          final_position: null,
-          dead_heat: null,
-          win_odds: null,
-        })),
+        runners: ISSUE33_BARRIERS.map(([horse_no, barrier]) =>
+          runner(horse_no, barrier),
+        ),
+      },
+    ],
+  };
+}
+
+/**
+ * Production false-positive shape (HV R2-like): original 12, two scratches
+ * leave gaps; declared keep original draws including barrier 12.
+ */
+function scratchGapMeeting(): NormalizedMeeting {
+  // Barriers among declared: 1,2,3,5,6,7,9,10,11,12 (gaps 4,8 from scratches)
+  const declared: Array<[number, number]> = [
+    [1, 1],
+    [2, 2],
+    [3, 3],
+    [5, 5],
+    [6, 6],
+    [7, 7],
+    [9, 9],
+    [10, 10],
+    [11, 11],
+    [12, 12],
+  ];
+  return {
+    meeting_date: "2026-10-21",
+    venue: "HV",
+    total_races: 1,
+    status: "DEFINED",
+    data_source: "graphql",
+    change_histories: [],
+    races: [
+      {
+        race_no: 2,
+        post_time: "2026-10-21T19:45:00+08:00",
+        status: "DEFINED",
+        distance: 1200,
+        going: "GOOD",
+        course_desc: null,
+        course_code: "A",
+        race_class: "Class 4",
+        runners: [
+          ...declared.map(([n, b]) => runner(n, b)),
+          runner(4, null, "Scratched"),
+          runner(8, null, "Scratched"),
+        ],
       },
     ],
   };
@@ -77,11 +132,13 @@ describe("checkBarrierIntegrity", () => {
     expect(r.ok).toBe(true);
     expect(r.barrier_unreliable).toBe(false);
     expect(r.field_size).toBe(4);
+    expect(r.draw_size).toBe(4);
     expect(r.duplicates).toEqual([]);
-    expect(r.missing).toEqual([]);
+    expect(r.out_of_range).toEqual([]);
+    expect(r.null_barrier_horse_nos).toEqual([]);
   });
 
-  it("flags issue #33 HV R1: barrier 3 twice, 11 missing", () => {
+  it("flags issue #33 HV R1: duplicate barrier 3 (source-side)", () => {
     const runners = ISSUE33_BARRIERS.map(([horse_no, barrier]) => ({
       horse_no,
       status: "Declared",
@@ -93,23 +150,83 @@ describe("checkBarrierIntegrity", () => {
     expect(r.ok).toBe(false);
     expect(r.barrier_unreliable).toBe(true);
     expect(r.field_size).toBe(11);
+    expect(r.draw_size).toBe(11);
     expect(r.duplicates).toEqual([3]);
-    expect(r.missing).toEqual([11]);
+    expect(r.out_of_range).toEqual([]);
+    expect(r.null_barrier_horse_nos).toEqual([]);
+    // Gap at 11 is informational (consequence of dup), not the sole rule.
+    expect(r.missing).toContain(11);
     expect(r.origin).toBe("hkjc_graphql_barrierDrawNumber");
     expect(r.raw_evidence).toHaveLength(11);
-    expect(r.raw_evidence.find((e) => e.horse_no === 9)?.barrierDrawNumber).toBe("3");
+    expect(r.raw_evidence.find((e) => e.horse_no === 9)?.barrierDrawNumber).toBe(
+      "3",
+    );
   });
 
-  it("excludes scratched and standby from field_size", () => {
+  it("does NOT flag scratch-induced gaps (HV R2-like: field 10, barrier 12 kept)", () => {
     const runners = [
       { horse_no: 1, status: "Declared", barrier: 1 },
       { horse_no: 2, status: "Declared", barrier: 2 },
-      { horse_no: 3, status: "Scratched", barrier: 3 },
+      { horse_no: 3, status: "Declared", barrier: 3 },
+      { horse_no: 4, status: "Scratched", barrier: null },
+      { horse_no: 5, status: "Declared", barrier: 5 },
+      { horse_no: 6, status: "Declared", barrier: 6 },
+      { horse_no: 7, status: "Declared", barrier: 7 },
+      { horse_no: 8, status: "Scratched", barrier: null },
+      { horse_no: 9, status: "Declared", barrier: 9 },
+      { horse_no: 10, status: "Declared", barrier: 10 },
+      { horse_no: 11, status: "Declared", barrier: 11 },
+      { horse_no: 12, status: "Declared", barrier: 12 },
+    ];
+    const r = checkBarrierIntegrity(runners);
+    expect(r.field_size).toBe(10);
+    expect(r.draw_size).toBe(12);
+    expect(r.barriers).toContain(12);
+    expect(r.missing).toEqual([4, 8]); // informational scratch gaps
+    expect(r.duplicates).toEqual([]);
+    expect(r.out_of_range).toEqual([]);
+    expect(r.null_barrier_horse_nos).toEqual([]);
+    expect(r.ok).toBe(true);
+    expect(r.barrier_unreliable).toBe(false);
+  });
+
+  it("flags barrier outside 1..draw_size", () => {
+    const runners = [
+      { horse_no: 1, status: "Declared", barrier: 1 },
+      { horse_no: 2, status: "Declared", barrier: 2 },
+      { horse_no: 3, status: "Declared", barrier: 15 },
+      { horse_no: 4, status: "Scratched", barrier: null },
+    ];
+    const r = checkBarrierIntegrity(runners);
+    expect(r.draw_size).toBe(4);
+    expect(r.out_of_range).toEqual([15]);
+    expect(r.ok).toBe(false);
+    expect(r.barrier_unreliable).toBe(true);
+  });
+
+  it("flags declared runner with null barrier", () => {
+    const runners = [
+      { horse_no: 1, status: "Declared", barrier: 1 },
+      { horse_no: 2, status: "Declared", barrier: null },
+      { horse_no: 3, status: "Declared", barrier: 3 },
+    ];
+    const r = checkBarrierIntegrity(runners);
+    expect(r.null_barrier_horse_nos).toEqual([2]);
+    expect(r.ok).toBe(false);
+    expect(r.barrier_unreliable).toBe(true);
+  });
+
+  it("excludes standby from draw_size and field_size", () => {
+    const runners = [
+      { horse_no: 1, status: "Declared", barrier: 1 },
+      { horse_no: 2, status: "Declared", barrier: 2 },
+      { horse_no: 3, status: "Scratched", barrier: null },
       { horse_no: 4, status: "Standby", barrier: null },
     ];
     const r = checkBarrierIntegrity(runners);
     expect(r.ok).toBe(true);
     expect(r.field_size).toBe(2);
+    expect(r.draw_size).toBe(3);
     expect(r.barriers).toEqual([1, 2]);
   });
 
@@ -119,7 +236,10 @@ describe("checkBarrierIntegrity", () => {
       venue: "HV",
       race_no: 1,
       field_size: 11,
+      draw_size: 11,
       duplicates: [3],
+      out_of_range: [] as number[],
+      null_barrier_horse_nos: [] as number[],
       missing: [11],
       raw_evidence: [],
       origin: "hkjc_graphql_barrierDrawNumber" as const,
@@ -155,7 +275,6 @@ describe("barrier passthrough (source-side, no remapping)", () => {
     const m = normalizeMeeting(raw);
     const barriers = m.races[0]!.runners.map((r) => r.barrier);
     expect(barriers).toEqual(ISSUE33_BARRIERS.map(([, b]) => b));
-    // Worker must NOT invent a corrected 1..11 permutation.
     expect(new Set(barriers).size).toBe(10);
     expect(barriers.filter((b) => b === 3)).toHaveLength(2);
     expect(barriers.includes(11)).toBe(false);
@@ -169,7 +288,7 @@ describe("persistMeetingTree barrier integrity + scratch clear", () => {
     }
   });
 
-  it("records violations in worker_meta and does not invent barriers", async () => {
+  it("records R1 duplicate violation in worker_meta without inventing barriers", async () => {
     const meeting = issue33Meeting();
     await persistMeetingTree(env.DB, meeting, { source: "test" });
 
@@ -190,7 +309,7 @@ describe("persistMeetingTree barrier integrity + scratch clear", () => {
       venue: string;
       race_no: number;
       duplicates: number[];
-      missing: number[];
+      out_of_range: number[];
     }>;
     expect(violations).toHaveLength(1);
     expect(violations[0]).toMatchObject({
@@ -198,15 +317,20 @@ describe("persistMeetingTree barrier integrity + scratch clear", () => {
       venue: "HV",
       race_no: 1,
       duplicates: [3],
-      missing: [11],
+      out_of_range: [],
     });
+  });
+
+  it("does not record scratch-gap races as violations", async () => {
+    await persistMeetingTree(env.DB, scratchGapMeeting());
+    const meta = await getMeta(env.DB, BARRIER_INTEGRITY_META_KEY);
+    expect(JSON.parse(meta ?? "[]")).toEqual([]);
   });
 
   it("clears stale barrier when runner becomes Scratched with null draw", async () => {
     const meeting = issue33Meeting();
     await persistMeetingTree(env.DB, meeting);
 
-    // Horse 9 scratches; HKJC clears barrierDrawNumber → null.
     const scratched = structuredClone(meeting);
     const horse9 = scratched.races[0]!.runners.find((r) => r.horse_no === 9)!;
     horse9.status = "Scratched";
@@ -222,7 +346,7 @@ describe("persistMeetingTree barrier integrity + scratch clear", () => {
     expect(row?.status).toBe("Scratched");
     expect(row?.barrier).toBeNull();
 
-    // Field is now 10 declared with barriers 1..10 (no duplicate 3 among field).
+    // After scratch: no duplicate among declared; gap at 3's mate is OK.
     const meta = await getMeta(env.DB, BARRIER_INTEGRITY_META_KEY);
     const violations = JSON.parse(meta ?? "[]") as unknown[];
     expect(violations).toEqual([]);
@@ -259,7 +383,6 @@ describe("persistMeetingTree barrier integrity + scratch clear", () => {
       .first<{ barrier: number | null }>();
     expect(row?.barrier).toBe(3);
 
-    // rbc must not clobber live-poll integrity meta with false "all missing".
     const metaAfter = await getMeta(env.DB, BARRIER_INTEGRITY_META_KEY);
     expect(JSON.parse(metaAfter ?? "[]")).toHaveLength(1);
   });
@@ -272,7 +395,7 @@ describe("/v1/races + /health barrier integrity surface", () => {
     }
   });
 
-  it("flags barrier_unreliable with raw_evidence on /v1/races", async () => {
+  it("flags R1 duplicate on /v1/races with raw_evidence", async () => {
     await persistMeetingTree(env.DB, issue33Meeting());
 
     const ctx = createExecutionContext();
@@ -291,8 +414,10 @@ describe("/v1/races + /health barrier integrity surface", () => {
         barrier_unreliable: boolean;
         barrier_integrity: {
           ok: boolean;
+          draw_size: number;
           duplicates: number[];
-          missing: number[];
+          out_of_range: number[];
+          null_barrier_horse_nos: number[];
           origin: string;
           raw_evidence: Array<{ horse_no: number; barrier: number | null }>;
         };
@@ -303,27 +428,124 @@ describe("/v1/races + /health barrier integrity surface", () => {
     expect(r1.barrier_unreliable).toBe(true);
     expect(r1.barrier_integrity.ok).toBe(false);
     expect(r1.barrier_integrity.duplicates).toEqual([3]);
-    expect(r1.barrier_integrity.missing).toEqual([11]);
+    expect(r1.barrier_integrity.out_of_range).toEqual([]);
+    expect(r1.barrier_integrity.draw_size).toBe(11);
     expect(r1.barrier_integrity.origin).toBe("hkjc_graphql_barrierDrawNumber");
-    expect(r1.barrier_integrity.raw_evidence).toHaveLength(11);
-    // Raw barriers preserved — no invented correction.
     expect(r1.runners.find((x) => x.horse_no === 9)?.barrier).toBe(3);
     expect(r1.runners.find((x) => x.horse_no === 2)?.barrier).toBe(3);
   });
 
-  it("exposes barrier_integrity_violations on /health", async () => {
-    await persistMeetingTree(env.DB, issue33Meeting());
+  it("does not flag scratch-gap race on /v1/races", async () => {
+    await persistMeetingTree(env.DB, scratchGapMeeting());
 
     const ctx = createExecutionContext();
-    const res = await worker.fetch(new Request("http://localhost/health"), env, ctx);
+    const res = await worker.fetch(
+      new Request("http://localhost/v1/races?date=2026-10-21&venue=HV", {
+        headers: AUTH,
+      }),
+      env,
+      ctx,
+    );
     await waitOnExecutionContext(ctx);
-    expect(res.status).toBe(200);
     const body = (await res.json()) as {
-      alerts: { barrier_integrity_violations: Array<{ race_no: number }> };
-      gaps: { barrier_integrity_violations: Array<{ race_no: number }> };
+      races: Array<{
+        race_no: number;
+        barrier_unreliable: boolean;
+        barrier_integrity: {
+          ok: boolean;
+          field_size: number;
+          draw_size: number;
+          duplicates: number[];
+          missing: number[];
+        };
+      }>;
     };
-    expect(body.alerts.barrier_integrity_violations).toHaveLength(1);
-    expect(body.alerts.barrier_integrity_violations[0]!.race_no).toBe(1);
-    expect(body.gaps.barrier_integrity_violations).toHaveLength(1);
+    const r2 = body.races.find((r) => r.race_no === 2)!;
+    expect(r2.barrier_unreliable).toBe(false);
+    expect(r2.barrier_integrity.ok).toBe(true);
+    expect(r2.barrier_integrity.field_size).toBe(10);
+    expect(r2.barrier_integrity.draw_size).toBe(12);
+    expect(r2.barrier_integrity.duplicates).toEqual([]);
+    expect(r2.barrier_integrity.missing).toEqual([4, 8]);
+  });
+
+  it("keeps /health violations in sync with /v1/races (even if meta was empty)", async () => {
+    // Simulate post-deploy: runners in D1, meta never written (tree-hash skip).
+    await persistMeetingTree(env.DB, issue33Meeting());
+    await setMeta(env.DB, BARRIER_INTEGRITY_META_KEY, "[]");
+    expect(JSON.parse((await getMeta(env.DB, BARRIER_INTEGRITY_META_KEY))!)).toEqual(
+      [],
+    );
+
+    const racesCtx = createExecutionContext();
+    const racesRes = await worker.fetch(
+      new Request("http://localhost/v1/races?date=2026-10-21&venue=HV", {
+        headers: AUTH,
+      }),
+      env,
+      racesCtx,
+    );
+    await waitOnExecutionContext(racesCtx);
+    const racesBody = (await racesRes.json()) as {
+      races: Array<{ race_no: number; barrier_unreliable: boolean }>;
+    };
+    expect(racesBody.races[0]!.barrier_unreliable).toBe(true);
+
+    const healthCtx = createExecutionContext();
+    const healthRes = await worker.fetch(
+      new Request("http://localhost/health"),
+      env,
+      healthCtx,
+    );
+    await waitOnExecutionContext(healthCtx);
+    const health = (await healthRes.json()) as {
+      alerts: {
+        barrier_integrity_violations: Array<{
+          race_no: number;
+          duplicates: number[];
+        }>;
+      };
+      gaps: { barrier_integrity_violations: unknown[] };
+    };
+    expect(health.alerts.barrier_integrity_violations).toHaveLength(1);
+    expect(health.alerts.barrier_integrity_violations[0]).toMatchObject({
+      race_no: 1,
+      duplicates: [3],
+    });
+    expect(health.gaps.barrier_integrity_violations).toHaveLength(1);
+  });
+
+  it("clears health violations when only scratch-gap races remain", async () => {
+    await persistMeetingTree(env.DB, issue33Meeting());
+    expect(
+      JSON.parse((await getMeta(env.DB, BARRIER_INTEGRITY_META_KEY))!),
+    ).toHaveLength(1);
+
+    // Replace meeting with scratch-gap-only race 2.
+    await env.DB.prepare(`DELETE FROM runners`).run();
+    await env.DB.prepare(`DELETE FROM races`).run();
+    await persistMeetingTree(env.DB, scratchGapMeeting());
+
+    const ctx = createExecutionContext();
+    await worker.fetch(
+      new Request("http://localhost/v1/races?date=2026-10-21&venue=HV", {
+        headers: AUTH,
+      }),
+      env,
+      ctx,
+    );
+    await waitOnExecutionContext(ctx);
+
+    const healthCtx = createExecutionContext();
+    const healthRes = await worker.fetch(
+      new Request("http://localhost/health"),
+      env,
+      healthCtx,
+    );
+    await waitOnExecutionContext(healthCtx);
+    const health = (await healthRes.json()) as {
+      alerts: { barrier_integrity_violations: unknown[] };
+    };
+    expect(health.alerts.barrier_integrity_violations).toEqual([]);
   });
 });
