@@ -13,6 +13,11 @@ export const DEFAULT_PUSH_COALESCE_MS = 2000;
  */
 export const DEFAULT_PUSH_OFFWINDOW_COALESCE_SEC = 300;
 /**
+ * Force flush when the oldest buffered captured_at exceeds this many seconds
+ * (default 20). Prevents off-window coalesce from holding deltas for ~300s.
+ */
+export const DEFAULT_PUSH_COALESCE_MAX_AGE_SEC = 20;
+/**
  * Heartbeat inside the race-day high-frequency window (default 300s).
  * Env key remains HEARTBEAT_INTERVAL_SEC for raceday cadence.
  */
@@ -40,6 +45,13 @@ export function pushOffwindowCoalesceSec(env: Env): number {
   return Math.max(
     0,
     envNum(env, "PUSH_OFFWINDOW_COALESCE_SEC", DEFAULT_PUSH_OFFWINDOW_COALESCE_SEC),
+  );
+}
+
+export function pushCoalesceMaxAgeSec(env: Env): number {
+  return Math.max(
+    0,
+    envNum(env, "PUSH_COALESCE_MAX_AGE_SEC", DEFAULT_PUSH_COALESCE_MAX_AGE_SEC),
   );
 }
 
@@ -213,8 +225,11 @@ export type AnnotatedOddsChange = OddsDeltaChange & {
 export interface CoalesceBatch {
   captured_at: string;
   sample_interval_s: number | null;
-  /** Provisional seq assigned when the batch was observed (monotonic per meeting). */
-  seq: number;
+  /**
+   * Optional legacy / test provisional seq. Live enqueue no longer allocates;
+   * flush stamps the single emitPush seq onto all changes.
+   */
+  seq?: number;
   changes: OddsDeltaChange[];
   races: PushRace[];
   race_nos: number[];
@@ -248,9 +263,49 @@ export function coalesceWindowElapsed(
   return nowMs - buffer.opened_at_ms >= coalesceMs;
 }
 
+/** Earliest batch captured_at as epoch ms; falls back to opened_at_ms. */
+export function coalesceOldestCapturedAtMs(buffer: CoalesceBuffer): number {
+  let oldest = Infinity;
+  for (const b of buffer.batches) {
+    const ms = Date.parse(b.captured_at);
+    if (Number.isFinite(ms)) oldest = Math.min(oldest, ms);
+  }
+  return Number.isFinite(oldest) ? oldest : buffer.opened_at_ms;
+}
+
+/**
+ * True when the oldest buffered observation is older than maxAgeSec.
+ * maxAgeSec <= 0 disables the check.
+ */
+export function coalesceMaxAgeElapsed(
+  buffer: CoalesceBuffer | null,
+  nowMs: number,
+  maxAgeSec: number,
+): boolean {
+  if (!buffer || buffer.batches.length === 0) return false;
+  if (maxAgeSec <= 0) return false;
+  return nowMs - coalesceOldestCapturedAtMs(buffer) >= maxAgeSec * 1000;
+}
+
+/**
+ * Next wake deadline for an open coalesce buffer: min(window end, max-age end).
+ */
+export function coalesceFlushDeadlineMs(
+  buffer: CoalesceBuffer,
+  coalesceMs: number,
+  maxAgeSec: number,
+): number {
+  const windowDeadline =
+    coalesceMs > 0 ? buffer.opened_at_ms + coalesceMs : buffer.opened_at_ms;
+  if (maxAgeSec <= 0) return windowDeadline;
+  const ageDeadline = coalesceOldestCapturedAtMs(buffer) + maxAgeSec * 1000;
+  return Math.min(windowDeadline, ageDeadline);
+}
+
 /**
  * Flatten buffered batches into one odds_delta payload.
- * Each change keeps its originating captured_at / seq / sample_interval_s.
+ * Each change keeps its originating captured_at / sample_interval_s.
+ * Seq is stamped at flush (single allocatePushSeq via emitPush).
  */
 export function flattenCoalesceBuffer(buffer: CoalesceBuffer): {
   changes: AnnotatedOddsChange[];
@@ -273,15 +328,18 @@ export function flattenCoalesceBuffer(buffer: CoalesceBuffer): {
   let lastSample: number | null = buffer.batches[0]?.sample_interval_s ?? null;
 
   for (const batch of buffer.batches) {
-    coveredFrom = Math.min(coveredFrom, batch.seq);
-    coveredTo = Math.max(coveredTo, batch.seq);
+    if (batch.seq != null && Number.isFinite(batch.seq)) {
+      coveredFrom = Math.min(coveredFrom, batch.seq);
+      coveredTo = Math.max(coveredTo, batch.seq);
+    }
     lastCaptured = batch.captured_at;
     lastSample = batch.sample_interval_s;
     for (const c of batch.changes) {
       changes.push({
         ...c,
         captured_at: batch.captured_at,
-        seq: batch.seq,
+        // Provisional / legacy only; flush overwrites with the emit seq.
+        seq: batch.seq ?? 0,
         sample_interval_s: batch.sample_interval_s,
       });
     }

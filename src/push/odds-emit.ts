@@ -17,9 +17,11 @@ import type { OddsDeltaChange, PushRace } from "./envelope";
 import type { PmPoolRaw } from "../graphql/types";
 import {
   appendCoalesceBatch,
+  coalesceMaxAgeElapsed,
   coalesceWindowElapsed,
   flattenCoalesceBuffer,
   preferSnapshotOverHeartbeat,
+  pushCoalesceMaxAgeSec,
   resolveCoalesceMs,
   pushFullSnapshotIntervalSec,
   resolveEffectiveHeartbeatIntervalMs,
@@ -128,13 +130,13 @@ export async function enqueueOddsDeltaBatch(
     source_last_updated_at: string | null;
   },
 ): Promise<CoalesceBuffer | null> {
-  // Never buffer an empty changes[] payload.
+  // Never buffer an empty changes[] payload. Do not allocate seq here —
+  // flushOddsDeltaCoalesce allocates once via emitPush (hkjc-agent-runner#10).
+  void env;
   if (args.changes.length === 0) return buffer;
-  const seq = await allocatePushSeq(env, args.meeting_date, args.venue);
   const batch: CoalesceBatch = {
     captured_at: args.captured_at,
     sample_interval_s: args.sample_interval_s,
-    seq,
     changes: args.changes,
     races: args.races,
     race_nos: args.race_nos,
@@ -156,6 +158,7 @@ export async function flushOddsDeltaCoalesce(
   if (flat.changes.length === 0) return false;
 
   // Re-filter against last-pushed at flush time (state may have advanced).
+  // If nothing remains, do not allocate / burn a seq number.
   const gated = await filterDeltaForPush(
     env,
     args.meeting_date,
@@ -164,12 +167,17 @@ export async function flushOddsDeltaCoalesce(
   );
   if (!gated) return false;
 
+  // Single seq for the merged odds_delta (payload shape unchanged).
+  const seq = await allocatePushSeq(env, args.meeting_date, args.venue);
+  const changes = gated.changes.map((c) => ({ ...c, seq }));
+
   await emitPush(env, {
     event: "odds_delta",
     meeting_date: args.meeting_date,
     venue: args.venue,
+    seq,
     races: flat.races,
-    changes: gated.changes,
+    changes,
     pools: buildPoolInvestments(args.poolInvs, flat.race_nos),
     captured_at: flat.captured_at,
     sample_interval_s: flat.sample_interval_s,
@@ -178,8 +186,8 @@ export async function flushOddsDeltaCoalesce(
       buffer.batches.length > 1
         ? {
             coalesced_batches: buffer.batches.length,
-            covered_seq_from: flat.covered_seq_from,
-            covered_seq_to: flat.covered_seq_to,
+            covered_seq_from: seq,
+            covered_seq_to: seq,
           }
         : undefined,
   });
@@ -188,8 +196,8 @@ export async function flushOddsDeltaCoalesce(
 }
 
 /**
- * Flush when the coalesce window has elapsed, or coalesceMs is 0 (immediate).
- * Returns the remaining buffer (null if flushed).
+ * Flush when the coalesce window has elapsed, max-age is exceeded, or
+ * coalesceMs is 0 (immediate). Returns the remaining buffer (null if flushed).
  */
 export async function maybeFlushOddsDeltaCoalesce(
   env: Env,
@@ -205,6 +213,8 @@ export async function maybeFlushOddsDeltaCoalesce(
     inHighFreqWindow?: boolean;
     /** Override coalesce length (ms). */
     coalesceMs?: number;
+    /** Override max age (sec). Race-day / off-window both capped. */
+    maxAgeSec?: number;
   },
 ): Promise<{ buffer: CoalesceBuffer | null; flushed: boolean }> {
   if (!buffer || buffer.batches.length === 0) {
@@ -213,10 +223,16 @@ export async function maybeFlushOddsDeltaCoalesce(
   const coalesceMs =
     args.coalesceMs ??
     resolveCoalesceMs(env, args.inHighFreqWindow !== false);
+  const maxAgeSec =
+    args.maxAgeSec ?? pushCoalesceMaxAgeSec(env);
+  // Cap buffer age so off-window 300s coalesce cannot hold stale captured_at
+  // (jeffincn/hkjc-agent-runner#10). Applies whenever a buffer is open.
+  const maxAgeDue = coalesceMaxAgeElapsed(buffer, args.nowMs, maxAgeSec);
   const due =
     args.force === true ||
     coalesceMs <= 0 ||
-    coalesceWindowElapsed(buffer, args.nowMs, coalesceMs);
+    coalesceWindowElapsed(buffer, args.nowMs, coalesceMs) ||
+    maxAgeDue;
   if (!due) return { buffer, flushed: false };
   const ok = await flushOddsDeltaCoalesce(env, buffer, args);
   return { buffer: null, flushed: ok };

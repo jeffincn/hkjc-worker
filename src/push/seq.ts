@@ -17,6 +17,9 @@ export function seqKey(
 /**
  * Atomically allocate the next monotonic seq for meeting_date+venue.
  * Increments once per event (not per subscriber).
+ *
+ * Uses INSERT … ON CONFLICT DO UPDATE … RETURNING so concurrent allocators
+ * cannot both read the same next_seq (jeffincn/hkjc-agent-runner#10).
  */
 export async function allocatePushSeq(
   env: Env,
@@ -24,30 +27,22 @@ export async function allocatePushSeq(
   venue: string | null | undefined,
 ): Promise<number> {
   const key = seqKey(meeting_date, venue);
-  // D1 has no true UPSERT-RETURNING race-free counter across workers, but
-  // MeetingPoller is single-threaded per meeting DO and cron is coarse.
-  // Use read-modify-write within a batch where possible.
-  const existing = await env.DB.prepare(
-    `SELECT next_seq FROM push_seq WHERE meeting_date = ? AND venue = ?`,
+  const row = await env.DB.prepare(
+    `INSERT INTO push_seq (meeting_date, venue, next_seq)
+     VALUES (?, ?, 1)
+     ON CONFLICT(meeting_date, venue) DO UPDATE SET
+       next_seq = push_seq.next_seq + 1
+     RETURNING next_seq`,
   )
     .bind(key.meeting_date, key.venue)
     .first<{ next_seq: number }>();
 
-  const next = (existing?.next_seq ?? 0) + 1;
-  if (existing == null) {
-    await env.DB.prepare(
-      `INSERT INTO push_seq (meeting_date, venue, next_seq) VALUES (?, ?, ?)`,
-    )
-      .bind(key.meeting_date, key.venue, next)
-      .run();
-  } else {
-    await env.DB.prepare(
-      `UPDATE push_seq SET next_seq = ? WHERE meeting_date = ? AND venue = ?`,
-    )
-      .bind(next, key.meeting_date, key.venue)
-      .run();
+  if (row == null || !Number.isFinite(row.next_seq)) {
+    throw new Error(
+      `allocatePushSeq: RETURNING next_seq failed for ${key.meeting_date}/${key.venue}`,
+    );
   }
-  return next;
+  return row.next_seq;
 }
 
 export async function markLastChange(

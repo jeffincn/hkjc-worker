@@ -3,15 +3,20 @@ import type { Env } from "../src/env";
 import type { RaceOddsSnapshot } from "../src/parse/odds";
 import {
   appendCoalesceBatch,
+  coalesceFlushDeadlineMs,
+  coalesceMaxAgeElapsed,
+  coalesceOldestCapturedAtMs,
   coalesceWindowElapsed,
   DEFAULT_HEARTBEAT_INTERVAL_SEC,
   DEFAULT_OFFDAY_HEARTBEAT_INTERVAL_SEC,
+  DEFAULT_PUSH_COALESCE_MAX_AGE_SEC,
   DEFAULT_RACEDAY_WINDOW_BEFORE_SEC,
   finalRaceNo,
   firstRacePostMs,
   flattenCoalesceBuffer,
   isInRaceDayHighFreqWindow,
   preferSnapshotOverHeartbeat,
+  pushCoalesceMaxAgeSec,
   resolveCoalesceMs,
   resolveEffectiveHeartbeatIntervalMs,
   shouldEmitHeartbeat,
@@ -124,11 +129,10 @@ describe("shouldPushFullSnapshot", () => {
 });
 
 describe("live coalesce buffer", () => {
-  it("merges batches with per-change captured_at/seq/sample_interval_s", () => {
+  it("merges batches with per-change captured_at/sample_interval_s (seq optional)", () => {
     const b1: CoalesceBatch = {
       captured_at: "2026-10-07T19:00:00+08:00",
       sample_interval_s: 3,
-      seq: 10,
       changes: [change(1)],
       races: [pushRace(1)],
       race_nos: [1],
@@ -137,7 +141,6 @@ describe("live coalesce buffer", () => {
     const b2: CoalesceBatch = {
       captured_at: "2026-10-07T19:00:02+08:00",
       sample_interval_s: 3,
-      seq: 11,
       changes: [change(2)],
       races: [pushRace(2)],
       race_nos: [2],
@@ -153,19 +156,55 @@ describe("live coalesce buffer", () => {
     expect(flat.changes).toHaveLength(2);
     expect(flat.changes[0]).toMatchObject({
       race_no: 1,
-      seq: 10,
       captured_at: "2026-10-07T19:00:00+08:00",
       sample_interval_s: 3,
     });
     expect(flat.changes[1]).toMatchObject({
       race_no: 2,
-      seq: 11,
       captured_at: "2026-10-07T19:00:02+08:00",
       sample_interval_s: 3,
     });
-    expect(flat.covered_seq_from).toBe(10);
-    expect(flat.covered_seq_to).toBe(11);
+    // Live path stamps seq at flush; without provisional seq covered range is 0.
+    expect(flat.covered_seq_from).toBe(0);
+    expect(flat.covered_seq_to).toBe(0);
     expect(flat.race_nos).toEqual([1, 2]);
+  });
+
+  it("force-flushes when oldest captured_at exceeds PUSH_COALESCE_MAX_AGE_SEC", () => {
+    expect(DEFAULT_PUSH_COALESCE_MAX_AGE_SEC).toBe(20);
+    expect(pushCoalesceMaxAgeSec(env({}))).toBe(20);
+    expect(pushCoalesceMaxAgeSec(env({ PUSH_COALESCE_MAX_AGE_SEC: "15" }))).toBe(
+      15,
+    );
+
+    const opened = Date.parse("2026-10-21T18:00:00+08:00");
+    const b1: CoalesceBatch = {
+      captured_at: "2026-10-21T18:00:00+08:00",
+      sample_interval_s: 3,
+      changes: [change(1)],
+      races: [pushRace(1)],
+      race_nos: [1],
+      source_last_updated_at: null,
+    };
+    const b2: CoalesceBatch = {
+      captured_at: "2026-10-21T18:00:10+08:00",
+      sample_interval_s: 3,
+      changes: [change(2)],
+      races: [pushRace(2)],
+      race_nos: [2],
+      source_last_updated_at: null,
+    };
+    let buf = appendCoalesceBatch(null, b1, opened);
+    buf = appendCoalesceBatch(buf, b2, opened + 10_000);
+
+    expect(coalesceOldestCapturedAtMs(buf)).toBe(opened);
+    // Off-window coalesce 300s not elapsed, but max-age 20s is.
+    expect(coalesceWindowElapsed(buf, opened + 25_000, 300_000)).toBe(false);
+    expect(coalesceMaxAgeElapsed(buf, opened + 19_999, 20)).toBe(false);
+    expect(coalesceMaxAgeElapsed(buf, opened + 20_000, 20)).toBe(true);
+
+    const deadline = coalesceFlushDeadlineMs(buf, 300_000, 20);
+    expect(deadline).toBe(opened + 20_000);
   });
 });
 

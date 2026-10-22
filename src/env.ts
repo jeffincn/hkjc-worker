@@ -51,6 +51,11 @@ export interface Env {
    */
   PUSH_OFFWINDOW_COALESCE_SEC?: string;
   /**
+   * Force-flush odds_delta coalesce when the oldest batch captured_at is older
+   * than this many seconds (default 20). Caps off-window 300s coalesce latency.
+   */
+  PUSH_COALESCE_MAX_AGE_SEC?: string;
+  /**
    * Race-day high-freq keepalive (default 300). When a periodic full snapshot
    * is also due, emit one odds_update instead of no_update.
    */
