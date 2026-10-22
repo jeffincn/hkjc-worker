@@ -32,9 +32,11 @@ import {
 } from "../push/odds-emit";
 import { buildCompleteSnapshotRaces, snapshotToPushRace } from "../push/snapshot-coverage";
 import {
+  coalesceFlushDeadlineMs,
   finalRaceNo,
   firstRacePostMs,
   isInRaceDayHighFreqWindow,
+  pushCoalesceMaxAgeSec,
   resolveCoalesceMs,
   racedayWindowBeforeSec,
   type CoalesceBuffer,
@@ -635,11 +637,13 @@ export class MeetingPoller implements DurableObject {
         }
         if (coalesceBuf && coalesceBuf.batches.length > 0) {
           await this.state.storage.put("odds_coalesce_buffer", coalesceBuf);
-          // Wake before next poll if coalesce deadline is sooner.
-          if (coalesceMs > 0) {
-            const deadline = coalesceBuf.opened_at_ms + coalesceMs;
-            await this.state.storage.put("odds_coalesce_deadline_ms", deadline);
-          }
+          // Wake at min(coalesce window, max-age on oldest captured_at).
+          const deadline = coalesceFlushDeadlineMs(
+            coalesceBuf,
+            coalesceMs,
+            pushCoalesceMaxAgeSec(this.env),
+          );
+          await this.state.storage.put("odds_coalesce_deadline_ms", deadline);
         } else {
           await this.state.storage.delete("odds_coalesce_buffer");
           await this.state.storage.delete("odds_coalesce_deadline_ms");
