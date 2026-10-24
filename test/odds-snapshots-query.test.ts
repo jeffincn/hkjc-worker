@@ -135,6 +135,23 @@ describe("byte-page helpers (A2)", () => {
     expect(packed.items.length).toBeLessThan(items.length);
     expect(packed.truncated_by_bytes).toBe(true);
   });
+
+  it("packItemsUnderBudget meters uncompressed UTF-8 bytes (not .length)", () => {
+    // Each item JSON is mostly CJK: 40 chars × 3 UTF-8 bytes ≫ 40 code units.
+    const items = Array.from({ length: 5 }, (_, i) => ({
+      id: i + 1,
+      name: "馬".repeat(40),
+    }));
+    const packed = packItemsUnderBudget({
+      items,
+      maxBytes: 200,
+      envelopeOverheadBytes: 20,
+      encodeOne: (i) => JSON.stringify(i),
+    });
+    expect(packed.truncated_by_bytes).toBe(true);
+    expect(packed.items.length).toBeGreaterThanOrEqual(1);
+    expect(packed.items.length).toBeLessThan(items.length);
+  });
 });
 
 describe("GET /v1/odds/snapshots (issue #38 P1 R5)", () => {

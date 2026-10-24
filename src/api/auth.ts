@@ -65,16 +65,26 @@ export function requireBearer(request: Request, env: Env): Response | null {
   return requireWriteBearer(request, env);
 }
 
+/** Shared headers for all /v1/* (and /health) JSON responses. */
+export const JSON_RESPONSE_HEADERS = {
+  "Content-Type": "application/json",
+  /**
+   * Advertise that representation may vary by Accept-Encoding so caches
+   * do not mix gzip/br/identity bodies (hkjc-model #41).
+   */
+  Vary: "Accept-Encoding",
+} as const;
+
 export function jsonError(status: number, message: string): Response {
   return new Response(JSON.stringify({ error: message }), {
     status,
-    headers: { "Content-Type": "application/json" },
+    headers: { ...JSON_RESPONSE_HEADERS },
   });
 }
 
 export function jsonOk(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { "Content-Type": "application/json" },
+    headers: { ...JSON_RESPONSE_HEADERS },
   });
 }

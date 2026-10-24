@@ -46,6 +46,8 @@ Cloudflare Worker：从马会官方 GraphQL + 官网马匹页拉取赛马数据 
 | Fallback | `https://hkjc-data-worker.<account>.workers.dev`（部署后由 Cloudflare 分配） |
 | 本地 | `http://127.0.0.1:8787` |
 
+JSON 响应头：`Content-Type: application/json`，以及 **`Vary: Accept-Encoding`**（所有 `/v1/*` 成功／错误 JSON，含 `/health`）。
+
 除 **`GET /health`** 外，所有接口需要 Bearer：
 
 ```http
@@ -398,7 +400,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 | `since_id` | 否 | 游标，只返回 `id > since_id`（类似 `/v1/events?since_seq=`；默认 `0`） |
 | `as_of` | 否 | ISO 截止时点；只返回 `created_at <= as_of` 的行 |
 | `limit` | 否 | 默认 50，最大 200 |
-| `max_bytes` | 否 | 响应软上限，**默认与上限均为 1,200,000**；超额提前截断（至少 1 条）并设 `truncated_by_bytes`（issue #38 A2） |
+| `max_bytes` | 否 | 响应软上限，**默认与上限均为 1,200,000**；超额提前截断（至少 1 条）并设 `truncated_by_bytes`（issue #38 A2）。**按未压缩原始 JSON 的 UTF-8 字节计**（`TextEncoder`／响应体在任何 `Content-Encoding` 之前），不是 gzip 后大小，也不是 JS 字符串 `.length`。 |
 
 ```bash
 # 截止时点 t 之前已入库的快照（第一页）
@@ -494,9 +496,11 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 | `venue` | 是 | `ST` / `HV` |
 | `since_seq` | 否 | 只返回 `seq > since_seq`（默认 `0`） |
 | `limit` | 否 | 默认 100，最大 500 |
-| `max_bytes` | 否 | 响应软上限，**默认与上限均为 1,200,000**（issue #38 A2）。累计超过则提前停（**至少返回 1 条**），设 `truncated_by_bytes=true`，并用 `next_since_seq` 继续翻页。 |
+| `max_bytes` | 否 | 响应软上限，**默认与上限均为 1,200,000**（issue #38 A2）。累计超过则提前停（**至少返回 1 条**），设 `truncated_by_bytes=true`，并用 `next_since_seq` 继续翻页。**按未压缩原始 JSON 的 UTF-8 字节计**（gzip／br 之前的原始 body），与 runner 的 1.5MB／1.2MB 上限对齐。 |
 
 **不改**事件正文、`seq` 语义与既有字段；仅新增 `max_bytes` / `next_since_seq` / `truncated_by_bytes` / `has_more`。
+
+所有 `/v1/*` JSON 响应（含错误体）带 `Vary: Accept-Encoding`，避免缓存混用压缩／未压缩表示。
 
 ```bash
 curl -s -H "Authorization: Bearer $TOKEN" \
