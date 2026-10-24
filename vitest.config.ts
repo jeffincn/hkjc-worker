@@ -10,6 +10,7 @@ export default defineWorkersConfig({
         miniflare: {
           bindings: {
             API_TOKEN: "test-api-token",
+            READ_API_TOKEN: "test-read-token,test-read-token-2",
             LIVE_PUSH_ENABLED: "false",
             BACKFILL_DAYS: "60",
             BACKFILL_SOURCE: "graphql",

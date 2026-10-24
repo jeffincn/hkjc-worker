@@ -46,13 +46,34 @@ Cloudflare Worker：从马会官方 GraphQL + 官网马匹页拉取赛马数据 
 | Fallback | `https://hkjc-data-worker.<account>.workers.dev`（部署后由 Cloudflare 分配） |
 | 本地 | `http://127.0.0.1:8787` |
 
-除 **`GET /health`** 外，所有接口需要：
+除 **`GET /health`** 外，所有接口需要 Bearer：
 
 ```http
-Authorization: Bearer <API_TOKEN>
+Authorization: Bearer <token>
 ```
 
-`API_TOKEN` 通过 `wrangler secret put API_TOKEN` 配置，**不要写进代码或提交到 git**。
+| Secret | 用途 |
+|---|---|
+| `API_TOKEN` | **写 + 读**。可逗号分隔多个。授权全部查询 `GET /v1/*`，以及 admin / subscriber / test-push 等写接口。 |
+| `READ_API_TOKEN` | **只读**（issue #38）。可逗号分隔多个。仅授权查询 `GET /v1/*`（meetings、races、odds、results、events、changes、horses…）。**不能**调用 `/v1/admin/*`、`/v1/admin/subscribers`、`/v1/admin/test-push`。 |
+
+配置（**不要**把真实 token 写进代码、issue 或聊天）：
+
+```bash
+npx wrangler secret put API_TOKEN
+npx wrangler secret put READ_API_TOKEN
+```
+
+分析消费端应优先使用 `READ_API_TOKEN`。未配置 `READ_API_TOKEN` 时，查询仍可用 `API_TOKEN`。
+
+### 配额与 429 / 重试约定（查询 API）
+
+| 项 | 约定 |
+|---|---|
+| 查询 API 配额 | **当前无**按客户端的硬配额或主动 `429`。Worker 不按 Bearer 限流查询接口。 |
+| 上游 GraphQL 预算 | `DAILY_REQUEST_BUDGET`（默认 30000）约束 **HKJC 抓取**，不影响已入库数据的读路径。 |
+| 客户端重试 | 对 `5xx` / 网络错误建议指数退避（如 1s→2s→4s，上限约 30s），最多 3–5 次；`401`/`400`/`404` **不要**重试。 |
+| `429` | 查询路径正常情况下 **不会**返回 `429`。若将来网关层出现 `429`，请尊重 `Retry-After`（若有），否则退避 ≥5s 再试。推送侧熔断的 `429` 计数仅针对 **出站 webhook**，与读 API 无关。 |
 
 ### 错误码
 
@@ -79,7 +100,8 @@ Authorization: Bearer <API_TOKEN>
 
 ```bash
 export BASE=https://hkjc.cf-connect.top
-export TOKEN='your-api-token'
+# 分析端优先用只读 token；也可用 API_TOKEN
+export TOKEN='your-read-api-token'
 ```
 
 ### 3.1 `GET /health`（无需鉴权）
@@ -216,6 +238,17 @@ curl -s -H "Authorization: Bearer $TOKEN" \
       "course_code": "C+3",
       "race_class": "Class 5",
       "data_source": "graphql",
+      "observation": {
+        "returned_at": "2026-10-07T10:45:00.000Z",
+        "sample_interval_s": 3,
+        "last_successful_poll_at": "2026-10-07T10:44:57.000Z",
+        "last_content_change_at": "2026-10-07T10:40:00.000Z",
+        "collection_failure_threshold_ms": 600000,
+        "pools": {
+          "WIN": { "last_successful_poll_at": "…", "last_content_change_at": "…", "source_updated_at": null, "sell_status": null, "pool_status": null, "returned_at": "…", "sample_interval_s": 3 },
+          "PLA": { "last_successful_poll_at": "…", "last_content_change_at": "…", "source_updated_at": null, "sell_status": null, "pool_status": null, "returned_at": "…", "sample_interval_s": 3 }
+        }
+      },
       "runners": [
         {
           "horse_no": 1,
@@ -236,6 +269,8 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 ```
 
 每场 `runners[]` 含 HKJC 品牌号 `horse_code`（如 `H087`；回填/rbc 缺口时可为 `null`）。
+
+`observation` 为 **新增字段**（issue #38），不改动既有 `runners[]` / 赛程字段。列表路径通常不附带最新快照的 `pool_meta`，故 `pools.*.source_updated_at` / `sell_status` 常为 `null`；按场完整 WIN/PLA 源时间请用 §3.4 `odds/latest`。语义见下表。
 
 ---
 
@@ -276,11 +311,54 @@ curl -s -H "Authorization: Bearer $TOKEN" \
         }
       ]
     }
+  },
+  "observation": {
+    "returned_at": "2026-10-07T10:45:01.000Z",
+    "sample_interval_s": 3,
+    "last_successful_poll_at": "2026-10-07T10:45:00.000Z",
+    "last_content_change_at": "2026-10-07T10:40:00.000Z",
+    "collection_failure_threshold_ms": 600000,
+    "pools": {
+      "WIN": {
+        "last_successful_poll_at": "2026-10-07T10:45:00.000Z",
+        "last_content_change_at": "2026-10-07T10:40:00.000Z",
+        "source_updated_at": "2026-10-07T18:40:00+08:00",
+        "sell_status": "START_SELL",
+        "pool_status": "START_SELL",
+        "returned_at": "2026-10-07T10:45:01.000Z",
+        "sample_interval_s": 3
+      },
+      "PLA": {
+        "last_successful_poll_at": "2026-10-07T10:45:00.000Z",
+        "last_content_change_at": "2026-10-07T10:40:00.000Z",
+        "source_updated_at": null,
+        "sell_status": "START_SELL",
+        "pool_status": "START_SELL",
+        "returned_at": "2026-10-07T10:45:01.000Z",
+        "sample_interval_s": 3
+      }
+    }
   }
 }
 ```
 
-无快照时 `snapshot` 为 `null`。`runners[].horse_code` 在入库时写入；读路径也会用 `runners` 表按马号补齐旧快照。
+无快照时 `snapshot` 为 `null`，但仍返回 `observation`（可仅有 poll 时钟）。`runners[].horse_code` 在入库时写入；读路径也会用 `runners` 表按马号补齐旧快照。
+
+#### `observation` 字段精确语义（issue #38）
+
+| 字段 | 语义 |
+|---|---|
+| `last_successful_poll_at` | 该场最近一次 **成功写入** `poll_ticks` 的 `tick_time`（不论赔率内容是否变化）。价格静止数分钟时此字段仍会前进——**不能**仅凭变价时间判 stale。 |
+| `last_content_change_at` | 该场最近一次 `poll_ticks.changed=1`（即内容 hash 变化、写入新 `odds_snapshots`）的时间。可远早于 `last_successful_poll_at`。 |
+| `source_updated_at` | 官方 GraphQL `pmPools.lastUpdateTime`（按 WIN/PLA 分别）。官方省略时为 **`null`**，**从不**用本地时钟冒充。 |
+| `returned_at` | 本 API 响应构建时的墙钟（ISO）。卡片可用 `returned_at - last_successful_poll_at` 看观测年龄。 |
+| `sample_interval_s` | 配置的实时轮询间隔（秒），来自 `POLL_INTERVAL_MS`（或该快照入库时记录的 `sample_interval_s`）。 |
+| `sell_status` / `pool_status` | 该彩池官方 `sellStatus`（二者同值；旧快照无 `pool_meta` 时可能回退到场级 `pool_status`）。 |
+| `collection_failure_threshold_ms` | **600000（10 分钟）**——与 issue #26 `COLLECTION_FAILURE` / `MISSING` 一致。卡片仍应自行用 30s/60s 观测年龄告警，**不要**等到满 10 分钟才判不可用。 |
+
+**验收要点**：连续成功轮询且价格 5 分钟不变 → `last_successful_poll_at` 仍新、`last_content_change_at` 旧（案例 A）；最后 >30s 无成功观测 → 即使 `snapshot` 仍有价格，也能从 `last_successful_poll_at` 看出真实年龄（案例 B）。脱敏 fixture：`test/fixtures/observation-case-a.json` / `observation-case-b.json`。
+
+**不改动** webhook / push payload 格式。
 
 ---
 
@@ -1106,7 +1184,8 @@ app.post("/hook", express.raw({ type: "application/json" }), (req, res) => {
 | 变量 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `PUSH_TARGET_URL` | Secret | — | **仅当订阅者表为空时**兜底 Webhook；有订阅者行则忽略 |
-| `API_TOKEN` | Secret | — | Bearer（查询 + Admin） |
+| `API_TOKEN` | Secret | — | Bearer（查询 + Admin）；可逗号分隔多个 |
+| `READ_API_TOKEN` | Secret 可选 | — | 只读 Bearer（仅 `GET /v1/*`）；可逗号分隔多个。issue #38 |
 | `PUSH_SECRET` | Secret 可选 | — | 写入 agent 订阅者 secret（若该行尚无 secret）；兜底 URL 时也用于 HMAC |
 | `POLL_INTERVAL_MS` | var | `3000` | 实时赔率轮询间隔（毫秒）：任一未完赛场次 WIN/PLA 开售中、或距开跑 ≤30 分钟时使用（clamp 1000–600000）。见 §11 |
 | `DAILY_REQUEST_BUDGET` | var | `30000` | 每个 HKT 自然日 HKJC GraphQL 请求上限（含重试），接近时自动降频 3s→5s→10s→30s→60s，用尽后 300s |

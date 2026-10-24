@@ -6,7 +6,18 @@ import {
 } from "../parse/barrier-integrity";
 import { horseCodeFromRunnerFields } from "../parse/horse-code";
 import { getMeta, syncBarrierIntegrityForMeeting } from "../store/db";
-import { jsonError, jsonOk, requireBearer } from "./auth";
+import {
+  jsonError,
+  jsonOk,
+  requireReadBearer,
+  requireWriteBearer,
+} from "./auth";
+import {
+  buildRaceObservation,
+  loadMeetingPollTimes,
+  loadRacePollTimes,
+} from "./observation";
+import { normalizeStoredSnapshot } from "../parse/odds";
 
 export async function handleApi(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
@@ -16,9 +27,9 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
     return handleHealth(env);
   }
 
-  // Admin/control endpoints (also Bearer-protected)
+  // Admin/control endpoints — write token only (API_TOKEN)
   if (request.method === "POST" && path === "/v1/admin/ingest") {
-    const authErr = requireBearer(request, env);
+    const authErr = requireWriteBearer(request, env);
     if (authErr) return authErr;
     const { ingestActiveMeeting } = await import("../services/ingest");
     const result = await ingestActiveMeeting(env);
@@ -26,7 +37,7 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
   }
 
   if (request.method === "POST" && path === "/v1/admin/backfill") {
-    const authErr = requireBearer(request, env);
+    const authErr = requireWriteBearer(request, env);
     if (authErr) return authErr;
     const { runBackfillStep } = await import("../backfill/runner");
     const body = (await request.json().catch(() => ({}))) as { limit?: number };
@@ -35,7 +46,7 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
   }
 
   if (request.method === "POST" && path === "/v1/admin/backfill-horse-codes") {
-    const authErr = requireBearer(request, env);
+    const authErr = requireWriteBearer(request, env);
     if (authErr) return authErr;
     const { runHorseCodeBackfill } = await import("../services/horse-code-backfill");
     const body = (await request.json().catch(() => ({}))) as {
@@ -59,7 +70,7 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
   }
 
   if (request.method === "POST" && path === "/v1/admin/reset-ambiguous-horse-codes") {
-    const authErr = requireBearer(request, env);
+    const authErr = requireWriteBearer(request, env);
     if (authErr) return authErr;
     const { resetAmbiguousHorseCodes } = await import("../services/horse-code-backfill");
     const body = (await request.json().catch(() => ({}))) as {
@@ -74,16 +85,16 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
   }
 
   if (request.method === "POST" && path === "/v1/admin/test-push") {
-    const authErr = requireBearer(request, env);
+    const authErr = requireWriteBearer(request, env);
     if (authErr) return authErr;
     const { sendTestPush } = await import("../services/ingest");
     const result = await sendTestPush(env);
     return jsonOk(result);
   }
 
-  // Subscriber admin CRUD
+  // Subscriber admin CRUD — write token only (even GET list)
   if (path === "/v1/admin/subscribers") {
-    const authErr = requireBearer(request, env);
+    const authErr = requireWriteBearer(request, env);
     if (authErr) return authErr;
     if (request.method === "GET") return listPushSubscribers(env);
     if (request.method === "POST") return createPushSubscriber(request, env);
@@ -92,7 +103,7 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
 
   const subscriberMatch = /^\/v1\/admin\/subscribers\/(\d+)$/.exec(path);
   if (subscriberMatch) {
-    const authErr = requireBearer(request, env);
+    const authErr = requireWriteBearer(request, env);
     if (authErr) return authErr;
     const id = Number(subscriberMatch[1]);
     if (request.method === "PATCH") return updatePushSubscriber(request, env, id);
@@ -104,7 +115,8 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
     return jsonError(405, "Method not allowed");
   }
 
-  const authErr = requireBearer(request, env);
+  // Query APIs — API_TOKEN or READ_API_TOKEN
+  const authErr = requireReadBearer(request, env);
   if (authErr) return authErr;
 
   // Resolve brand code by meeting placement (before /v1/horses/:code)
@@ -517,14 +529,26 @@ async function listRaces(env: Env, url: URL): Promise<Response> {
     // meta sync must not break the races query
   }
 
+  const pollByRace = await loadMeetingPollTimes(env.DB, date, venue);
+  const returned_at = new Date().toISOString();
+
   return jsonOk({
     date,
     venue,
-    races: raceViews.map(({ race, raceRunners, integrity }) => ({
+    races: raceViews.map(({ race, raceRunners, integrity, raceNo }) => ({
       ...race,
       /** True on duplicate / out-of-range / null barrier among declared (issue #33). */
       barrier_unreliable: integrity.barrier_unreliable,
       barrier_integrity: barrierIntegrityPayload(integrity),
+      /** Additive observation clocks (issue #38); does not alter runners[]. */
+      observation: buildRaceObservation({
+        env,
+        poll: pollByRace.get(raceNo) ?? {
+          last_successful_poll_at: null,
+          last_content_change_at: null,
+        },
+        returned_at,
+      }),
       runners: raceRunners.map((r) => ({
         horse_no: r.horse_no,
         horse_code: r.horse_code,
@@ -548,7 +572,7 @@ async function latestOdds(env: Env, url: URL): Promise<Response> {
   if (!date || !venue || !raceNo) return jsonError(400, "date, venue, race_no required");
   const n = Number(raceNo);
   const row = await env.DB.prepare(
-    `SELECT snapshot_time, content_hash, pool_status, raw_json, data_source, created_at
+    `SELECT snapshot_time, content_hash, pool_status, raw_json, data_source, created_at, sample_interval_s
      FROM odds_snapshots WHERE meeting_date=? AND venue=? AND race_no=?
      ORDER BY id DESC LIMIT 1`,
   )
@@ -560,9 +584,31 @@ async function latestOdds(env: Env, url: URL): Promise<Response> {
       raw_json: string;
       data_source: string;
       created_at: string;
+      sample_interval_s: number | null;
     }>();
-  if (!row) return jsonOk({ date, venue, race_no: n, snapshot: null });
+  const poll = await loadRacePollTimes(env.DB, date, venue, n);
+  const returned_at = new Date().toISOString();
+  if (!row) {
+    return jsonOk({
+      date,
+      venue,
+      race_no: n,
+      snapshot: null,
+      observation: buildRaceObservation({
+        env,
+        poll,
+        snapshot: null,
+        returned_at,
+      }),
+    });
+  }
   const codeByCloth = await horseCodeByCloth(env, date, venue, n);
+  let snap = null as ReturnType<typeof normalizeStoredSnapshot> | null;
+  try {
+    snap = normalizeStoredSnapshot(JSON.parse(row.raw_json));
+  } catch {
+    snap = null;
+  }
   return jsonOk({
     date,
     venue,
@@ -575,6 +621,14 @@ async function latestOdds(env: Env, url: URL): Promise<Response> {
       created_at: row.created_at,
       data: enrichOddsDataRunners(JSON.parse(row.raw_json), codeByCloth),
     },
+    /** Additive observation clocks (issue #38 P0). */
+    observation: buildRaceObservation({
+      env,
+      poll,
+      snapshot: snap,
+      sample_interval_s: row.sample_interval_s,
+      returned_at,
+    }),
   });
 }
 
