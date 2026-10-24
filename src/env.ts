@@ -4,7 +4,13 @@ export interface Env {
   /** Optional: Cloudflare Queue for per-subscriber push delivery. */
   PUSH_QUEUE?: Queue;
   PUSH_TARGET_URL?: string;
+  /** Write + read Bearer token(s); comma-separated allowed. */
   API_TOKEN?: string;
+  /**
+   * Read-only Bearer token(s) for GET /v1/* query APIs (issue #38).
+   * Comma-separated. Does not authorize admin / subscriber / test-push.
+   */
+  READ_API_TOKEN?: string;
   PUSH_SECRET?: string;
   /** Live odds poll interval in ms while betting is open / race window (default 3000). */
   POLL_INTERVAL_MS?: string;

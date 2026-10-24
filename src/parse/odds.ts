@@ -24,12 +24,27 @@ export interface RunnerOdds {
   final_position: number | null;
 }
 
+/** Per-pool official metadata (additive; not part of content hash payload). */
+export interface OddsPoolMeta {
+  sell_status: string | null;
+  /** Official lastUpdateTime; null when HKJC omitted it. */
+  source_updated_at: string | null;
+}
+
 export interface RaceOddsSnapshot {
   race_no: number;
   post_time: string | null;
   snapshot_time: string;
   pool_status: string | null;
   runners: RunnerOdds[];
+  /**
+   * WIN/PLA sellStatus + lastUpdateTime from GraphQL (issue #38).
+   * Outside `payload` so content-hash dedupe is unchanged.
+   */
+  pool_meta?: {
+    WIN?: OddsPoolMeta;
+    PLA?: OddsPoolMeta;
+  };
   /** Canonical payload used for hashing / storage */
   payload: {
     race_no: number;
@@ -257,6 +272,16 @@ export function buildRaceOddsSnapshot(args: {
     snapshot_time,
     pool_status,
     runners,
+    pool_meta: {
+      WIN: {
+        sell_status: winPool?.sellStatus ?? null,
+        source_updated_at: nonEmptyTime(winPool?.lastUpdateTime),
+      },
+      PLA: {
+        sell_status: plaPool?.sellStatus ?? null,
+        source_updated_at: nonEmptyTime(plaPool?.lastUpdateTime),
+      },
+    },
     payload: {
       race_no: race.no,
       pool_status,

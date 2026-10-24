@@ -1,0 +1,53 @@
+{
+  "_comment": "Desensitized fixture for issue #38 acceptance B: last successful poll 45s ago (>30s). Snapshot still has prices, but observation.last_successful_poll_at reveals real data age — must not claim T-0 freshness.",
+  "meeting_date": "2026-10-25",
+  "venue": "ST",
+  "race_no": 5,
+  "now": "2026-10-25T05:10:45.000Z",
+  "poll_ticks": [
+    { "tick_time": "2026-10-25T05:09:00.000Z", "changed": 1 },
+    { "tick_time": "2026-10-25T05:09:30.000Z", "changed": 0 },
+    { "tick_time": "2026-10-25T05:10:00.000Z", "changed": 0 }
+  ],
+  "snapshot": {
+    "race_no": 5,
+    "post_time": "2026-10-25T06:45:00+08:00",
+    "snapshot_time": "2026-10-25T13:09:00+08:00",
+    "pool_status": "START_SELL",
+    "pool_meta": {
+      "WIN": {
+        "sell_status": "START_SELL",
+        "source_updated_at": "2026-10-25T13:09:00+08:00"
+      },
+      "PLA": {
+        "sell_status": "START_SELL",
+        "source_updated_at": null
+      }
+    },
+    "runners": [
+      {
+        "runner_id": "H010",
+        "horse_no": 1,
+        "horse_code": "H010",
+        "horse_name": "GAMMA",
+        "win_odds": 3.2,
+        "place_odds": 1.5,
+        "status": "Declared",
+        "raw_status": "Declared",
+        "final_position": null
+      }
+    ],
+    "payload": {
+      "race_no": 5,
+      "pool_status": "START_SELL",
+      "win": { "1": 3.2 },
+      "pla": { "1": 1.5 },
+      "last_update": "2026-10-25T13:09:00+08:00"
+    }
+  },
+  "expect": {
+    "last_successful_poll_at": "2026-10-25T05:10:00.000Z",
+    "observation_age_ms_at_now": 45000,
+    "pla_source_updated_at": null
+  }
+}

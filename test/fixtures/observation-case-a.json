@@ -1,0 +1,67 @@
+{
+  "_comment": "Desensitized fixture for issue #38 acceptance A: continuous successful polls, WIN/PLA prices unchanged for 5 minutes. last_successful_poll_at advances; last_content_change_at stays at first change. Names/odds anonymized.",
+  "meeting_date": "2026-10-25",
+  "venue": "ST",
+  "race_no": 3,
+  "poll_ticks": [
+    { "tick_time": "2026-10-25T05:00:00.000Z", "changed": 1 },
+    { "tick_time": "2026-10-25T05:00:03.000Z", "changed": 0 },
+    { "tick_time": "2026-10-25T05:01:00.000Z", "changed": 0 },
+    { "tick_time": "2026-10-25T05:02:00.000Z", "changed": 0 },
+    { "tick_time": "2026-10-25T05:03:00.000Z", "changed": 0 },
+    { "tick_time": "2026-10-25T05:04:00.000Z", "changed": 0 },
+    { "tick_time": "2026-10-25T05:05:00.000Z", "changed": 0 }
+  ],
+  "snapshot": {
+    "race_no": 3,
+    "post_time": "2026-10-25T06:15:00+08:00",
+    "snapshot_time": "2026-10-25T13:00:00+08:00",
+    "pool_status": "START_SELL",
+    "pool_meta": {
+      "WIN": {
+        "sell_status": "START_SELL",
+        "source_updated_at": "2026-10-25T13:00:00+08:00"
+      },
+      "PLA": {
+        "sell_status": "START_SELL",
+        "source_updated_at": "2026-10-25T13:00:00+08:00"
+      }
+    },
+    "runners": [
+      {
+        "runner_id": "H001",
+        "horse_no": 1,
+        "horse_code": "H001",
+        "horse_name": "ALPHA",
+        "win_odds": 4.5,
+        "place_odds": 1.8,
+        "status": "Declared",
+        "raw_status": "Declared",
+        "final_position": null
+      },
+      {
+        "runner_id": "H002",
+        "horse_no": 2,
+        "horse_code": "H002",
+        "horse_name": "BETA",
+        "win_odds": 8.0,
+        "place_odds": 2.5,
+        "status": "Declared",
+        "raw_status": "Declared",
+        "final_position": null
+      }
+    ],
+    "payload": {
+      "race_no": 3,
+      "pool_status": "START_SELL",
+      "win": { "1": 4.5, "2": 8.0 },
+      "pla": { "1": 1.8, "2": 2.5 },
+      "last_update": "2026-10-25T13:00:00+08:00"
+    }
+  },
+  "expect": {
+    "last_successful_poll_at": "2026-10-25T05:05:00.000Z",
+    "last_content_change_at": "2026-10-25T05:00:00.000Z",
+    "price_unchanged_for_ms": 300000
+  }
+}

@@ -1,4 +1,6 @@
 API_TOKEN=dev-local-token-change-me
+# Optional read-only Bearer for GET /v1/* only (comma-separated ok). Issue #38.
+# READ_API_TOKEN=dev-read-token-change-me
 # Prefer managing receivers via /v1/admin/subscribers.
 # PUSH_TARGET_URL is only a fallback when the subscribers table is empty.
 # PUSH_TARGET_URL=
