@@ -17,6 +17,11 @@ import {
   loadMeetingPollTimes,
   loadRacePollTimes,
 } from "./observation";
+import { clampMaxBytes, packItemsUnderBudget } from "./byte-page";
+import {
+  clampOddsSnapshotsLimit,
+  queryOddsSnapshotsPage,
+} from "./odds-query";
 import { normalizeStoredSnapshot } from "../parse/odds";
 
 export async function handleApi(request: Request, env: Env): Promise<Response> {
@@ -149,6 +154,8 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
       return latestOdds(env, url);
     case "/v1/odds/history":
       return oddsHistory(env, url);
+    case "/v1/odds/snapshots":
+      return oddsSnapshotsQuery(env, url);
     case "/v1/odds/coverage":
       return oddsCoverage(env, url);
     case "/v1/results":
@@ -707,6 +714,132 @@ async function oddsHistory(env: Env, url: URL): Promise<Response> {
   });
 }
 
+/**
+ * Paginated WIN/PLA odds snapshots with cursor + as_of (issue #38 P1 R5).
+ * Cutoff uses persisted `created_at`, not official source time.
+ * Does not change /v1/odds/history.
+ */
+async function oddsSnapshotsQuery(env: Env, url: URL): Promise<Response> {
+  const date = url.searchParams.get("date");
+  const venue = url.searchParams.get("venue");
+  const raceNo = url.searchParams.get("race_no");
+  if (!date || !venue || !raceNo) {
+    return jsonError(400, "date, venue, race_no required");
+  }
+  const n = Number(raceNo);
+  if (!Number.isFinite(n) || n <= 0) {
+    return jsonError(400, "race_no must be a positive number");
+  }
+
+  const sinceRaw = url.searchParams.get("since_id");
+  const since_id =
+    sinceRaw != null && sinceRaw !== "" ? Number(sinceRaw) : 0;
+  if (!Number.isFinite(since_id) || since_id < 0) {
+    return jsonError(400, "since_id must be a non-negative number");
+  }
+
+  const as_of_raw = url.searchParams.get("as_of");
+  let as_of: string | null = null;
+  if (as_of_raw != null && as_of_raw !== "") {
+    const ms = Date.parse(as_of_raw);
+    if (!Number.isFinite(ms)) {
+      return jsonError(400, "as_of must be a valid ISO timestamp");
+    }
+    // Normalize to ISO so lexical compare with stored created_at (ISO) is safe
+    // when both are UTC Z forms; stored rows use toISOString() at insert.
+    as_of = new Date(ms).toISOString();
+  }
+
+  const limitRaw = url.searchParams.get("limit");
+  const limit = clampOddsSnapshotsLimit(
+    limitRaw != null && limitRaw !== "" ? Number(limitRaw) : null,
+  );
+  if (limitRaw != null && limitRaw !== "" && !Number.isFinite(Number(limitRaw))) {
+    return jsonError(400, "limit must be a positive number");
+  }
+
+  const maxBytesRaw = url.searchParams.get("max_bytes");
+  if (
+    maxBytesRaw != null &&
+    maxBytesRaw !== "" &&
+    !Number.isFinite(Number(maxBytesRaw))
+  ) {
+    return jsonError(400, "max_bytes must be a positive number");
+  }
+  const max_bytes = clampMaxBytes(
+    maxBytesRaw != null && maxBytesRaw !== "" ? Number(maxBytesRaw) : null,
+  );
+
+  const started = Date.now();
+  const page = await queryOddsSnapshotsPage(env.DB, {
+    meeting_date: date,
+    venue,
+    race_no: n,
+    since_id,
+    as_of,
+    limit,
+  });
+  const overflow = page.length > limit;
+  const candidates = overflow ? page.slice(0, limit) : page;
+
+  const codeByCloth = await horseCodeByCloth(env, date, venue, n);
+  type OutSnap = {
+    id: number;
+    snapshot_time: string;
+    /** Persisted/available time — as_of filter key (not source time). */
+    created_at: string;
+    content_hash: string;
+    pool_status: string | null;
+    data_source: string;
+    sample_interval_s: number | null;
+    data: unknown;
+  };
+  const mapped: OutSnap[] = candidates.map((r) => ({
+    id: r.id,
+    snapshot_time: r.snapshot_time,
+    created_at: r.created_at,
+    content_hash: r.content_hash,
+    pool_status: r.pool_status,
+    data_source: r.data_source,
+    sample_interval_s: r.sample_interval_s,
+    data: enrichOddsDataRunners(JSON.parse(r.raw_json), codeByCloth),
+  }));
+
+  const packed = packItemsUnderBudget({
+    items: mapped,
+    maxBytes: max_bytes,
+    encodeOne: (item) => JSON.stringify(item),
+  });
+  const snapshots = packed.items;
+  const truncated_by_bytes = packed.truncated_by_bytes;
+  /** More rows exist after this page (cursor or byte budget stopped early). */
+  const has_more = overflow || truncated_by_bytes;
+  const next_since_id =
+    snapshots.length > 0 ? snapshots[snapshots.length - 1]!.id : null;
+
+  const body = {
+    date,
+    venue,
+    race_no: n,
+    as_of,
+    since_id,
+    limit,
+    max_bytes,
+    /**
+     * as_of filters on this field (D1 insert time), never snapshot_time /
+     * official lastUpdateTime — prevents leaking post-cutoff arrivals.
+     */
+    persisted_time_field: "created_at" as const,
+    snapshots,
+    next_since_id,
+    has_more,
+    truncated_by_bytes,
+    /** Wall-clock ms spent building this response (soft ≤10s target). */
+    query_ms: Date.now() - started,
+  };
+  return jsonOk(body);
+}
+
 /** Poll presence / coverage for one race (or all races when race_no omitted). */
 async function oddsCoverage(env: Env, url: URL): Promise<Response> {
   const date = url.searchParams.get("date");
@@ -981,19 +1114,55 @@ async function listPushEventsApi(env: Env, url: URL): Promise<Response> {
   if (!Number.isFinite(limit) || limit < 1) {
     return jsonError(400, "limit must be a positive number");
   }
+  const cappedLimit = Math.min(Math.max(limit, 1), 500);
+
+  const maxBytesRaw = url.searchParams.get("max_bytes");
+  if (
+    maxBytesRaw != null &&
+    maxBytesRaw !== "" &&
+    !Number.isFinite(Number(maxBytesRaw))
+  ) {
+    return jsonError(400, "max_bytes must be a positive number");
+  }
+  const max_bytes = clampMaxBytes(
+    maxBytesRaw != null && maxBytesRaw !== "" ? Number(maxBytesRaw) : null,
+  );
+
   const { listPushEvents } = await import("../push/ledger");
-  const events = await listPushEvents(env, {
+  // Fetch one extra to distinguish limit overflow from byte truncation.
+  const fetched = await listPushEvents(env, {
     meeting_date,
     venue,
     since_seq,
-    limit,
+    limit: cappedLimit + 1,
   });
+  const overflow = fetched.length > cappedLimit;
+  const candidates = overflow ? fetched.slice(0, cappedLimit) : fetched;
+
+  const packed = packItemsUnderBudget({
+    items: candidates,
+    maxBytes: max_bytes,
+    // Envelope overhead for meeting_date/venue/cursors around events[].
+    envelopeOverheadBytes: 256,
+    encodeOne: (ev) => JSON.stringify(ev),
+  });
+  const events = packed.items;
+  const truncated_by_bytes = packed.truncated_by_bytes;
+  const next_since_seq =
+    events.length > 0 ? (events[events.length - 1]!.seq as number) : null;
+  const has_more = overflow || truncated_by_bytes;
+
   return jsonOk({
     meeting_date,
     venue,
     since_seq,
-    limit: Math.min(Math.max(limit, 1), 500),
+    limit: cappedLimit,
+    max_bytes,
     events,
+    /** Cursor for next page (last seq in this page); null when empty. */
+    next_since_seq,
+    truncated_by_bytes,
+    has_more,
   });
 }
 

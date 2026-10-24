@@ -79,6 +79,22 @@ export async function loadRacePollTimes(
   };
 }
 
+/** Meeting-level max successful poll tick (no_update meta, #38 R4). */
+export async function loadMeetingLastSuccessfulPollAt(
+  db: D1Database,
+  meetingDate: string,
+  venue: string,
+): Promise<string | null> {
+  const row = await db
+    .prepare(
+      `SELECT MAX(tick_time) AS last_successful_poll_at
+       FROM poll_ticks WHERE meeting_date=? AND venue=?`,
+    )
+    .bind(meetingDate, venue)
+    .first<{ last_successful_poll_at: string | null }>();
+  return row?.last_successful_poll_at ?? null;
+}
+
 /** Batch poll-time summary for all races of a meeting (listRaces). */
 export async function loadMeetingPollTimes(
   db: D1Database,

@@ -46,6 +46,8 @@ Cloudflare Worker：从马会官方 GraphQL + 官网马匹页拉取赛马数据 
 | Fallback | `https://hkjc-data-worker.<account>.workers.dev`（部署后由 Cloudflare 分配） |
 | 本地 | `http://127.0.0.1:8787` |
 
+JSON 响应头：`Content-Type: application/json`，以及 **`Vary: Accept-Encoding`**（所有 `/v1/*` 成功／错误 JSON，含 `/health`）。
+
 除 **`GET /health`** 外，所有接口需要 Bearer：
 
 ```http
@@ -368,6 +370,15 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 另含 `coverage`：基于 `poll_ticks`（**每次轮询每场一行**，不压实）的区间分类——`STATIC`（有 tick、间隔 ≤10 分钟）与 `MISSING`（间隔 >10 分钟 = `COLLECTION_FAILURE`）。可选 `from`/`to`（ISO）对任意 `(race, time_range)` 直接回答 `coverage.range.kind` = `STATIC` | `MISSING`（issue #26 A2）。
 
+**`from` / `to` 现有语义（保持不变）：**
+
+| 参数 | 作用 |
+|---|---|
+| （省略） | `snapshots[]` = 该场全部内容变化快照；`coverage.range` = `null` |
+| `from` + `to`（须成对） | **只**计算 `coverage.range.kind` = `STATIC` \| `MISSING`；**不**裁剪 `snapshots[]` |
+
+截止时点 / 游标分页请用 §3.5.0 `/v1/odds/snapshots`（issue #38 P1），勿依赖 history 的 `from`/`to` 过滤快照。
+
 ```bash
 curl -s -H "Authorization: Bearer $TOKEN" \
   "$BASE/v1/odds/history?date=2026-10-07&venue=HV&race_no=1" | jq .
@@ -376,6 +387,32 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   "$BASE/v1/odds/history?date=2026-10-07&venue=HV&race_no=1&from=2026-10-07T12:00:00.000Z&to=2026-10-07T13:00:00.000Z" \
   | jq .coverage.range
 ```
+
+---
+
+### 3.5.0 `GET /v1/odds/snapshots`（增量 / as_of，issue #38 P1）
+
+按场分页读取 WIN/PLA 赔率快照；**截止时点用入库时间 `created_at`（persisted/available）**，不用官方 `snapshot_time` / `lastUpdateTime`，避免「源时间较早、但 t 之后才入库」的未来泄漏。
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `date` / `venue` / `race_no` | 是 | 场次 |
+| `since_id` | 否 | 游标，只返回 `id > since_id`（类似 `/v1/events?since_seq=`；默认 `0`） |
+| `as_of` | 否 | ISO 截止时点；只返回 `created_at <= as_of` 的行 |
+| `limit` | 否 | 默认 50，最大 200 |
+| `max_bytes` | 否 | 响应软上限，**默认与上限均为 1,200,000**；超额提前截断（至少 1 条）并设 `truncated_by_bytes`（issue #38 A2）。**按未压缩原始 JSON 的 UTF-8 字节计**（`TextEncoder`／响应体在任何 `Content-Encoding` 之前），不是 gzip 后大小，也不是 JS 字符串 `.length`。 |
+
+```bash
+# 截止时点 t 之前已入库的快照（第一页）
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "$BASE/v1/odds/snapshots?date=2026-10-07&venue=HV&race_no=1&as_of=2026-10-07T12:00:00.000Z&limit=50" | jq .
+
+# 游标翻页
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "$BASE/v1/odds/snapshots?date=2026-10-07&venue=HV&race_no=1&since_id=$NEXT&limit=50" | jq .
+```
+
+响应要点：`persisted_time_field` 恒为 `"created_at"`；`next_since_id` / `has_more` / `truncated_by_bytes` 供翻页；`query_ms` 为本次构建耗时（目标 ≤10s）。只读；不增加 D1 写入或 HKJC 请求。
 
 ---
 
@@ -459,10 +496,19 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 | `venue` | 是 | `ST` / `HV` |
 | `since_seq` | 否 | 只返回 `seq > since_seq`（默认 `0`） |
 | `limit` | 否 | 默认 100，最大 500 |
+| `max_bytes` | 否 | 响应软上限，**默认与上限均为 1,200,000**（issue #38 A2）。累计超过则提前停（**至少返回 1 条**），设 `truncated_by_bytes=true`，并用 `next_since_seq` 继续翻页。**按未压缩原始 JSON 的 UTF-8 字节计**（gzip／br 之前的原始 body），与 runner 的 1.5MB／1.2MB 上限对齐。 |
+
+**不改**事件正文、`seq` 语义与既有字段；仅新增 `max_bytes` / `next_since_seq` / `truncated_by_bytes` / `has_more`。
+
+所有 `/v1/*` JSON 响应（含错误体）带 `Vary: Accept-Encoding`，避免缓存混用压缩／未压缩表示。
 
 ```bash
 curl -s -H "Authorization: Bearer $TOKEN" \
-  "$BASE/v1/events?meeting_date=2026-10-07&venue=HV&since_seq=0&limit=50" | jq .
+  "$BASE/v1/events?meeting_date=2026-10-07&venue=HV&since_seq=0&limit=500" | jq '{n:(.events|length), next:.next_since_seq, trunc:.truncated_by_bytes}'
+
+# 下一页
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "$BASE/v1/events?meeting_date=2026-10-07&venue=HV&since_seq=$NEXT&limit=500" | jq .
 ```
 
 #### `GET /v1/events/:event_id`

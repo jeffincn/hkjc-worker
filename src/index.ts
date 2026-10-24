@@ -1,4 +1,5 @@
 import { handleApi } from "./api/router";
+import { JSON_RESPONSE_HEADERS } from "./api/auth";
 import type { Env } from "./env";
 import { runBackfillStep } from "./backfill/runner";
 import { ingestActiveMeeting } from "./services/ingest";
@@ -15,7 +16,7 @@ export default {
       const message = err instanceof Error ? err.message : String(err);
       return new Response(JSON.stringify({ error: message }), {
         status: 500,
-        headers: { "Content-Type": "application/json" },
+        headers: { ...JSON_RESPONSE_HEADERS },
       });
     }
   },
