@@ -412,6 +412,21 @@ export async function emitIdleKeepalive(args: {
       args.meeting_date,
       args.venue,
     );
+    // R4 (#38): additive observation clock on keepalive — D1 read only, no
+    // extra HKJC fetch / D1 write. Missing → null.
+    let last_successful_poll_at: string | null = null;
+    try {
+      const { loadMeetingLastSuccessfulPollAt } = await import(
+        "../api/observation"
+      );
+      last_successful_poll_at = await loadMeetingLastSuccessfulPollAt(
+        args.env.DB,
+        args.meeting_date,
+        args.venue,
+      );
+    } catch {
+      last_successful_poll_at = null;
+    }
     await emitPush(args.env, {
       event: "no_update",
       meeting_date: args.meeting_date,
@@ -426,6 +441,8 @@ export async function emitIdleKeepalive(args: {
         raceday_high_freq: args.inHighFreqWindow,
         heartbeat_interval_sec: Math.round(hbMs / 1000),
         skipped_duplicate_snapshot: kind === "odds_update",
+        /** Additive (#38 R4); existing 1.1 fields unchanged. */
+        last_successful_poll_at,
       },
     });
     return {

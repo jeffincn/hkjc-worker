@@ -48,7 +48,8 @@ export async function listPushEvents(
     limit?: number;
   },
 ): Promise<PushEnvelope[]> {
-  const limit = Math.min(Math.max(opts.limit ?? 100, 1), 500);
+  // Cap 501 so /v1/events can fetch limit+1 (max user limit 500) for has_more.
+  const limit = Math.min(Math.max(opts.limit ?? 100, 1), 501);
   const since = opts.since_seq ?? 0;
   const { results } = await env.DB.prepare(
     `SELECT payload_json FROM push_events
