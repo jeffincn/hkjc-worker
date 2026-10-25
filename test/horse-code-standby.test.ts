@@ -50,8 +50,8 @@ describe("horse_code Standby cloth collision", () => {
   it("does NOT assign Declared brand code to Standby row by horse_no alone", async () => {
     // DB has only one row per horse_no (PK). Standby FAMILY KNIGHT landed as #2.
     await env.DB.prepare(
-      `INSERT INTO runners (meeting_date, venue, race_no, horse_no, name_en, status, data_source, updated_at)
-       VALUES ('2026-10-11','ST',8,2,'FAMILY KNIGHT','Standby','graphql',?)`,
+      `INSERT INTO runners (meeting_date, venue, race_no, horse_no, is_standby, name_en, status, data_source, updated_at)
+       VALUES ('2026-10-11','ST',8,2,1,'FAMILY KNIGHT','Standby','graphql',?)`,
     )
       .bind(new Date().toISOString())
       .run();
@@ -100,14 +100,14 @@ describe("horse_code Standby cloth collision", () => {
   it("resetAmbiguousHorseCodes clears wrong Standby assignment then correct backfill restores", async () => {
     // Simulate bad v1 backfill: Standby SWEET BRIAR wrongly got Declared's L999
     await env.DB.prepare(
-      `INSERT INTO runners (meeting_date, venue, race_no, horse_no, horse_code, name_en, status, data_source, updated_at)
-       VALUES ('2026-10-11','ST',1,1,'L999','SWEET BRIAR','Standby','graphql',?)`,
+      `INSERT INTO runners (meeting_date, venue, race_no, horse_no, is_standby, horse_code, name_en, status, data_source, updated_at)
+       VALUES ('2026-10-11','ST',1,1,1,'L999','SWEET BRIAR','Standby','graphql',?)`,
     )
       .bind(new Date().toISOString())
       .run();
     await env.DB.prepare(
-      `INSERT INTO runners (meeting_date, venue, race_no, horse_no, horse_code, name_en, status, data_source, updated_at)
-       VALUES ('2026-10-11','ST',8,2,'K307','FAMILY KNIGHT','Standby','graphql',?)`,
+      `INSERT INTO runners (meeting_date, venue, race_no, horse_no, is_standby, horse_code, name_en, status, data_source, updated_at)
+       VALUES ('2026-10-11','ST',8,2,1,'K307','FAMILY KNIGHT','Standby','graphql',?)`,
     )
       .bind(new Date().toISOString())
       .run();
@@ -194,8 +194,8 @@ describe("horse_code Standby cloth collision", () => {
 
   it("admin reset_ambiguous + backfill via API", async () => {
     await env.DB.prepare(
-      `INSERT INTO runners (meeting_date, venue, race_no, horse_no, horse_code, name_en, status, data_source, updated_at)
-       VALUES ('2026-10-11','ST',9,2,'K514','GLITTERING LEGEND','Standby','graphql',?)`,
+      `INSERT INTO runners (meeting_date, venue, race_no, horse_no, is_standby, horse_code, name_en, status, data_source, updated_at)
+       VALUES ('2026-10-11','ST',9,2,1,'K514','GLITTERING LEGEND','Standby','graphql',?)`,
     )
       .bind(new Date().toISOString())
       .run();

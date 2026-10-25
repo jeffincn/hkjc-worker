@@ -75,6 +75,8 @@ describe("horse_code API + storage", () => {
           runners: [
             {
               horse_no: 7,
+              is_standby: false,
+              standby_no: null,
               horse_code: "H087",
               horse_id: "HK_2022_H087",
               name_en: "CAN'T GO WONG",

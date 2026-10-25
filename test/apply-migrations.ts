@@ -33,6 +33,8 @@ CREATE TABLE IF NOT EXISTS runners (
   venue TEXT NOT NULL,
   race_no INTEGER NOT NULL,
   horse_no INTEGER NOT NULL,
+  is_standby INTEGER NOT NULL DEFAULT 0,
+  standby_no INTEGER,
   horse_code TEXT,
   name_en TEXT,
   name_ch TEXT,
@@ -44,9 +46,11 @@ CREATE TABLE IF NOT EXISTS runners (
   last6run TEXT,
   data_source TEXT NOT NULL DEFAULT 'graphql',
   updated_at TEXT NOT NULL,
-  PRIMARY KEY (meeting_date, venue, race_no, horse_no)
+  PRIMARY KEY (meeting_date, venue, race_no, horse_no, is_standby)
 );
 CREATE INDEX IF NOT EXISTS idx_runners_horse_code ON runners (horse_code);
+CREATE INDEX IF NOT EXISTS idx_runners_lookup_code
+  ON runners (meeting_date, venue, race_no, horse_no, is_standby);
 CREATE TABLE IF NOT EXISTS odds_snapshots (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   meeting_date TEXT NOT NULL,

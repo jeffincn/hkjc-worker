@@ -140,11 +140,17 @@ export async function upsertRunner(
   runner: NormalizedRunner,
   dataSource: string,
 ): Promise<void> {
+  const is_standby = runner.is_standby ? 1 : 0;
   await db
     .prepare(
-      `INSERT INTO runners (meeting_date, venue, race_no, horse_no, horse_code, name_en, name_ch, status, barrier, handicap_weight, jockey_en, trainer_en, last6run, data_source, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(meeting_date, venue, race_no, horse_no) DO UPDATE SET
+      `INSERT INTO runners (
+         meeting_date, venue, race_no, horse_no, is_standby, standby_no,
+         horse_code, name_en, name_ch, status, barrier, handicap_weight,
+         jockey_en, trainer_en, last6run, data_source, updated_at
+       )
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(meeting_date, venue, race_no, horse_no, is_standby) DO UPDATE SET
+         standby_no=COALESCE(excluded.standby_no, runners.standby_no),
          horse_code=COALESCE(excluded.horse_code, runners.horse_code),
          name_en=COALESCE(excluded.name_en, runners.name_en),
          name_ch=COALESCE(excluded.name_ch, runners.name_ch),
@@ -156,7 +162,8 @@ export async function upsertRunner(
          last6run=COALESCE(excluded.last6run, runners.last6run),
          data_source=excluded.data_source,
          updated_at=excluded.updated_at
-       WHERE runners.horse_code IS DISTINCT FROM COALESCE(excluded.horse_code, runners.horse_code)
+       WHERE runners.standby_no IS DISTINCT FROM COALESCE(excluded.standby_no, runners.standby_no)
+          OR runners.horse_code IS DISTINCT FROM COALESCE(excluded.horse_code, runners.horse_code)
           OR runners.name_en IS DISTINCT FROM COALESCE(excluded.name_en, runners.name_en)
           OR runners.name_ch IS DISTINCT FROM COALESCE(excluded.name_ch, runners.name_ch)
           OR runners.status IS DISTINCT FROM COALESCE(excluded.status, runners.status)
@@ -172,6 +179,8 @@ export async function upsertRunner(
       venue,
       raceNo,
       runner.horse_no,
+      is_standby,
+      runner.standby_no,
       runner.horse_code,
       runner.name_en,
       runner.name_ch,
@@ -505,7 +514,11 @@ export async function persistMeetingTree(
         meeting.data_source,
       );
       await ensureHorseStub(db, runner);
-      if (runner.final_position != null || runner.win_odds != null) {
+      // Results are keyed by horse_no only — never let standby overwrite declared placings.
+      if (
+        !runner.is_standby &&
+        (runner.final_position != null || runner.win_odds != null)
+      ) {
         await upsertResult(
           db,
           meeting.meeting_date,

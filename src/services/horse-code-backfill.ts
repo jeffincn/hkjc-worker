@@ -151,12 +151,13 @@ async function applyHorseCodeByIdentity(args: {
   if (nameKey) {
     const { results } = await args.db
       .prepare(
-        `SELECT horse_no, name_en, status, horse_code FROM runners
+        `SELECT horse_no, is_standby, name_en, status, horse_code FROM runners
          WHERE meeting_date=? AND venue=? AND race_no=?`,
       )
       .bind(args.meeting_date, args.venue, args.race_no)
       .all<{
         horse_no: number;
+        is_standby: number;
         name_en: string | null;
         status: string | null;
         horse_code: string | null;
@@ -165,14 +166,14 @@ async function applyHorseCodeByIdentity(args: {
       (r) => normalizeHorseName(r.name_en) === nameKey,
     );
     if (matches.length === 1) {
-      const row = matches[0];
+      const row = matches[0]!;
       if (row.horse_code && row.horse_code !== "") {
         return row.horse_code === args.horse_code ? "skipped" : "skipped";
       }
       const upd = await args.db
         .prepare(
           `UPDATE runners SET horse_code=?, updated_at=?
-           WHERE meeting_date=? AND venue=? AND race_no=? AND horse_no=?
+           WHERE meeting_date=? AND venue=? AND race_no=? AND horse_no=? AND is_standby=?
              AND (horse_code IS NULL OR horse_code='')`,
         )
         .bind(
@@ -182,23 +183,27 @@ async function applyHorseCodeByIdentity(args: {
           args.venue,
           args.race_no,
           row.horse_no,
+          row.is_standby ?? 0,
         )
         .run();
       if ((upd.meta?.changes ?? 0) > 0) {
-        await args.db
-          .prepare(
-            `UPDATE results SET horse_code=?
-             WHERE meeting_date=? AND venue=? AND race_no=? AND horse_no=?
-               AND (horse_code IS NULL OR horse_code='')`,
-          )
-          .bind(
-            args.horse_code,
-            args.meeting_date,
-            args.venue,
-            args.race_no,
-            row.horse_no,
-          )
-          .run();
+        // results PK has no is_standby — only stamp declared placings
+        if ((row.is_standby ?? 0) === 0) {
+          await args.db
+            .prepare(
+              `UPDATE results SET horse_code=?
+               WHERE meeting_date=? AND venue=? AND race_no=? AND horse_no=?
+                 AND (horse_code IS NULL OR horse_code='')`,
+            )
+            .bind(
+              args.horse_code,
+              args.meeting_date,
+              args.venue,
+              args.race_no,
+              row.horse_no,
+            )
+            .run();
+        }
         await ensureHorseStub(args.db, {
           horse_code: args.horse_code,
           horse_id: args.horse_id ?? null,
@@ -229,24 +234,25 @@ async function applyHorseCodeByIdentity(args: {
 
   const target = await args.db
     .prepare(
-      `SELECT horse_no, name_en, status, horse_code FROM runners
-       WHERE meeting_date=? AND venue=? AND race_no=? AND horse_no=?`,
+      `SELECT horse_no, is_standby, name_en, status, horse_code FROM runners
+       WHERE meeting_date=? AND venue=? AND race_no=? AND horse_no=? AND is_standby=0`,
     )
     .bind(args.meeting_date, args.venue, args.race_no, args.horse_no)
     .first<{
       horse_no: number;
+      is_standby: number;
       name_en: string | null;
       status: string | null;
       horse_code: string | null;
     }>();
   if (!target) return "skipped";
-  if (isStandbyStatus(target.status)) return "skipped";
+  if (isStandbyStatus(target.status) || target.is_standby === 1) return "skipped";
   if (target.horse_code && target.horse_code !== "") return "skipped";
 
   const upd = await args.db
     .prepare(
       `UPDATE runners SET horse_code=?, updated_at=?
-       WHERE meeting_date=? AND venue=? AND race_no=? AND horse_no=?
+       WHERE meeting_date=? AND venue=? AND race_no=? AND horse_no=? AND is_standby=0
          AND (horse_code IS NULL OR horse_code='')
          AND upper(coalesce(status,'')) NOT LIKE '%STANDBY%'`,
     )
@@ -258,8 +264,7 @@ async function applyHorseCodeByIdentity(args: {
       args.race_no,
       args.horse_no,
     )
-    .run();
-  if ((upd.meta?.changes ?? 0) > 0) {
+    .run();  if ((upd.meta?.changes ?? 0) > 0) {
     await args.db
       .prepare(
         `UPDATE results SET horse_code=?
@@ -546,7 +551,7 @@ export async function resetAmbiguousHorseCodes(
 
   // 3) Name mismatch: runner.name_en vs odds entry for same brand code
   let cleared_name_mismatch = 0;
-  let codedSql = `SELECT meeting_date, venue, race_no, horse_no, horse_code, name_en
+  let codedSql = `SELECT meeting_date, venue, race_no, horse_no, is_standby, horse_code, name_en
                   FROM runners
                   WHERE horse_code IS NOT NULL AND horse_code!='' AND name_en IS NOT NULL`;
   const codedBinds: string[] = [];
@@ -566,6 +571,7 @@ export async function resetAmbiguousHorseCodes(
       venue: string;
       race_no: number;
       horse_no: number;
+      is_standby: number;
       horse_code: string;
       name_en: string;
     }>();
@@ -606,7 +612,7 @@ export async function resetAmbiguousHorseCodes(
       const upd = await db
         .prepare(
           `UPDATE runners SET horse_code=NULL, updated_at=?
-           WHERE meeting_date=? AND venue=? AND race_no=? AND horse_no=?`,
+           WHERE meeting_date=? AND venue=? AND race_no=? AND horse_no=? AND is_standby=?`,
         )
         .bind(
           now,
@@ -614,6 +620,7 @@ export async function resetAmbiguousHorseCodes(
           row.venue,
           row.race_no,
           row.horse_no,
+          row.is_standby ?? 0,
         )
         .run();
       cleared_name_mismatch += upd.meta?.changes ?? 0;
