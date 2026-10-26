@@ -89,6 +89,31 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
     return jsonOk(result);
   }
 
+  if (request.method === "POST" && path === "/v1/admin/backfill-sectionals") {
+    const authErr = requireWriteBearer(request, env);
+    if (authErr) return authErr;
+    const { runSectionalBackfillStep } = await import("../services/sectionals");
+    const body = (await request.json().catch(() => ({}))) as {
+      date?: string;
+      venue?: string;
+      from?: string;
+      to?: string;
+      limit_races?: number;
+      delay_ms?: number;
+      force?: boolean;
+    };
+    const result = await runSectionalBackfillStep(env, {
+      date: body.date,
+      venue: body.venue,
+      from: body.from,
+      to: body.to,
+      limit_races: body.limit_races,
+      delay_ms: body.delay_ms,
+      force: body.force === true,
+    });
+    return jsonOk(result);
+  }
+
   if (request.method === "POST" && path === "/v1/admin/test-push") {
     const authErr = requireWriteBearer(request, env);
     if (authErr) return authErr;
@@ -160,6 +185,8 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
       return oddsCoverage(env, url);
     case "/v1/results":
       return listResults(env, url);
+    case "/v1/sectionals":
+      return listSectionalsApi(env, url);
     case "/v1/changes":
       return listChanges(env, url);
     case "/v1/events":
@@ -215,6 +242,7 @@ async function handleHealth(env: Env): Promise<Response> {
     "horses",
     "runs",
     "injuries",
+    "sectionals",
     "pushes",
     "changes",
     "persist",
@@ -926,6 +954,63 @@ async function listResults(env: Env, url: URL): Promise<Response> {
       ...r,
       dividends: r.dividends_json ? JSON.parse(r.dividends_json as string) : null,
       dividends_json: undefined,
+    })),
+  });
+}
+
+function parseSecJson(raw: string | null): unknown {
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+/** GET /v1/sectionals?date=&venue=&race_no?= — per-horse sectional times (issue #46). */
+async function listSectionalsApi(env: Env, url: URL): Promise<Response> {
+  const date = url.searchParams.get("date");
+  const venue = url.searchParams.get("venue");
+  if (!date || !venue) return jsonError(400, "date and venue required");
+  const raceNoRaw = url.searchParams.get("race_no");
+  let race_no: number | null = null;
+  if (raceNoRaw != null && raceNoRaw !== "") {
+    race_no = Number(raceNoRaw);
+    if (!Number.isFinite(race_no) || race_no <= 0) {
+      return jsonError(400, "race_no must be a positive number");
+    }
+  }
+  const { listSectionals } = await import("../store/sectionals");
+  const rows = await listSectionals(env.DB, {
+    meeting_date: date,
+    venue,
+    race_no,
+  });
+  return jsonOk({
+    date,
+    venue,
+    race_no,
+    sectionals: rows.map((r) => ({
+      meeting_date: r.meeting_date,
+      venue: r.venue,
+      race_no: r.race_no,
+      horse_code: r.horse_code,
+      horse_name: r.horse_name,
+      horse_no: r.horse_no,
+      finishing_order: r.finishing_order,
+      finish_time: r.finish_time,
+      finish_time_sec: r.finish_time_sec,
+      race_info: r.race_info,
+      sec1: parseSecJson(r.sec1_json),
+      sec2: parseSecJson(r.sec2_json),
+      sec3: parseSecJson(r.sec3_json),
+      sec4: parseSecJson(r.sec4_json),
+      sec5: parseSecJson(r.sec5_json),
+      sec6: parseSecJson(r.sec6_json),
+      segments: parseSecJson(r.segments_json),
+      source_url: r.source_url,
+      content_hash: r.content_hash,
+      scraped_at: r.scraped_at,
     })),
   });
 }

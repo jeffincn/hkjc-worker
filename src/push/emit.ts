@@ -19,6 +19,7 @@ const CHANGE_EVENTS = new Set<PushEvent>([
   "result",
   "dividends",
   "changes",
+  "sectionals",
 ]);
 
 /**

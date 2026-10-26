@@ -20,6 +20,8 @@ export type PushEvent =
   | "runs_update"
   | "dividends"
   | "changes"
+  /** Per-meeting sectional times batch (hash-diff; issue #46). */
+  | "sectionals"
   /** Coalesced replay of a subscriber backlog (see docs/push-schema-1.1.md). */
   | "backlog_replay";
 
@@ -322,6 +324,7 @@ export function isLivePushEvent(event: PushEvent): boolean {
     event === "runs_update" ||
     event === "dividends" ||
     event === "changes" ||
+    event === "sectionals" ||
     event === "backlog_replay"
   );
 }
