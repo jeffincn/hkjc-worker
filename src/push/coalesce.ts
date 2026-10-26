@@ -119,6 +119,7 @@ export const MEETING_SNAPSHOT_EVENTS = new Set<PushEvent>([
   "horse_update",
   "injury_update",
   "runs_update",
+  "sectionals",
   "test",
   "backfill_progress",
   "whitelist_alert",

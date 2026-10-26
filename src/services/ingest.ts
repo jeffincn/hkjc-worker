@@ -71,6 +71,7 @@ import {
   type PollTickInput,
 } from "../store/poll-ticks";
 import { runHorseCodeBackfill } from "./horse-code-backfill";
+import { ingestMeetingSectionals } from "./sectionals";
 import { storeRawDocument } from "../store/horses";
 import { createSubrequestBudget, type SubrequestBudget } from "../util/budget";
 import { runStage } from "../util/stage";
@@ -636,6 +637,30 @@ export async function ingestOneMeeting(
         venue: meeting.venue,
         horse_codes: horseCodes,
         is_race_day: meeting.meeting_date === todayHk,
+        budget: sub,
+      });
+    });
+  }
+
+  // Post-race sectional times (HTML displaysectionaltime) — one request per race, ≥3s apart.
+  // Resumes across cron/ingest invocations via sectional_ingest_progress + subrequest budget.
+  const sectionalRaceNos = meeting.races
+    .filter((r) => resultsComplete(r))
+    .map((r) => r.race_no);
+  if (sectionalRaceNos.length > 0) {
+    await runStage(env, "sectionals", async () => {
+      if (sub.shouldDeferHeavy()) {
+        await setMeta(
+          env.DB,
+          "stage_error_sectionals",
+          `deferred: subrequest budget remaining=${sub.remaining()}`,
+        );
+        return;
+      }
+      await ingestMeetingSectionals(env, {
+        meeting_date: meeting.meeting_date,
+        venue: meeting.venue,
+        race_nos: sectionalRaceNos,
         budget: sub,
       });
     });

@@ -107,6 +107,7 @@ A full snapshot for a meeting includes all available races (live tick + D1 fill 
         "runs_update",
         "dividends",
         "changes",
+        "sectionals",
         "backlog_replay"
       ]
     },
@@ -373,7 +374,7 @@ When a subscriber accumulates a pending/retrying backlog (e.g. after circuit reo
 |---|---|
 | `odds_delta` | Concatenate every `changes[]` row **in seq order**. Each row keeps its own `prev_odds` / `new_odds` and is annotated with originating `seq` + `captured_at` (+ `source_event_id`). Chunked by `PUSH_BACKLOG_MAX_CHANGES` (default 200). |
 | `lock` / `result` / `scratch` / `dividends` | **Per-race incremental** (envelopes often carry only the races that changed that cycle). Keep the latest envelope per `(event, race_no)` so no race is dropped; an envelope covering multiple races is delivered once. If no `race_no` can be resolved from `races[]` / `meta.race_nos`, **resend one-by-one**. |
-| Meeting snapshots (`odds_update`, `no_update`, `schedule`, `changes`, horse pages, alerts, …) | Same `event` → keep **latest** only (highest seq). |
+| Meeting snapshots (`odds_update`, `no_update`, `schedule`, `changes`, `sectionals`, horse pages, alerts, …) | Same `event` → keep **latest** only (highest seq). |
 | Unknown types | Resend one-by-one. |
 
 The coalesced push uses:

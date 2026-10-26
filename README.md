@@ -471,6 +471,76 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 ---
 
+### 3.6b `GET /v1/sectionals`（段速，issue #46）
+
+| 参数 | 必填 |
+|---|---|
+| `date` / `venue` | 是 |
+| `race_no` | 否（省略则返回该会议全部场次） |
+
+来源：官网 `displaysectionaltime`（**非**已停用的 legacy `.aspx`）：
+
+`https://racing.hkjc.com/en-us/local/information/displaysectionaltime?racedate=DD/MM/YYYY&RaceNo=N`
+
+D1 表 `sectional_times`：PK `(meeting_date, venue, race_no, horse_code)`；`sec1`…`sec6` 为 `{pos,margin,time}`；`segments` 含后段可选 200m `splits`。
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "$BASE/v1/sectionals?date=2026-10-25&venue=ST&race_no=1" | jq .
+```
+
+```json
+{
+  "date": "2026-10-25",
+  "venue": "ST",
+  "race_no": 1,
+  "sectionals": [
+    {
+      "horse_code": "M046",
+      "horse_name": "HAPPY PEGASUS",
+      "horse_no": 6,
+      "finishing_order": 1,
+      "finish_time": "1:08.41",
+      "finish_time_sec": 68.41,
+      "race_info": "Class 4 (Restricted) - 1200M - …",
+      "sec1": { "pos": 4, "margin": "5", "time": 23.57 },
+      "sec2": { "pos": 4, "margin": "8-1/4", "time": 22.15 },
+      "sec3": { "pos": 1, "margin": "2", "time": 22.69 },
+      "sec4": null,
+      "sec5": null,
+      "sec6": null,
+      "segments": [
+        { "idx": 1, "pos": 4, "margin": "5", "time": 23.57, "splits": null },
+        { "idx": 2, "pos": 4, "margin": "8-1/4", "time": 22.15, "splits": [10.93, 11.22] },
+        { "idx": 3, "pos": 1, "margin": "2", "time": 22.69, "splits": [11.14, 11.55] }
+      ],
+      "source_url": "https://racing.hkjc.com/en-us/local/information/displaysectionaltime?…",
+      "content_hash": "…",
+      "scraped_at": "2026-10-26T00:00:00.000Z"
+    }
+  ]
+}
+```
+
+**采集触发**：赛后 `ingest`／hourly cron 在场次 `resultsComplete` 后挂鉤拉取（每场 1 请求，间隔 ≥3s，受 subrequest budget 与 `sectional_ingest_progress` 断点保护）。**不另建常驻爬虫**。
+
+**Webhook**：内容 hash 变化时按 **会议批次** 推送 `event:"sectionals"`（`LIVE_PUSH_ENABLED` 门闩；`meta.race_nos` / `meta.content_hash`）。hash 未变不推。
+
+**全量回填**（对齐 D1 已有 `races` 行，默认自 2015/16 季 `2015-09-01`）：
+
+```bash
+# 一步可续跑；limit_races 默认 20；delay_ms 下限 3000
+curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"from":"2015-09-01","limit_races":20,"delay_ms":3000}' \
+  "$BASE/v1/admin/backfill-sectionals" | jq .
+# 单日／单场
+curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"date":"2026-10-25","venue":"ST","force":false}' \
+  "$BASE/v1/admin/backfill-sectionals" | jq .
+```
+
+---
+
 ### 3.7 `GET /v1/changes`
 
 | 参数 | 必填 | 说明 |
@@ -682,6 +752,7 @@ curl -s -H "Authorization: Bearer $TOKEN" "$BASE/v1/horses/H087/injuries" | jq .
 | `POST` | `/v1/admin/backfill` | 回填一步；body 可选 `{"limit":5}` |
 | `POST` | `/v1/admin/backfill-horse-codes` | 回填 `runners.horse_code`：`{"source":"store"\|"hkjc"\|"both","reset_ambiguous?","date?","venue?","limit_meetings?"}` |
 | `POST` | `/v1/admin/reset-ambiguous-horse-codes` | 清除 Standby／布号碰撞／名称不符的错误 `horse_code`：`{"date?","venue?"}` |
+| `POST` | `/v1/admin/backfill-sectionals` | 回填段速：`{"date?","venue?","from?","to?","limit_races?","delay_ms?","force?"}`（≥3s／请求；可续跑） |
 | `POST` | `/v1/admin/test-push` | 推送 `event:"test"`（需有启用中的订阅者，或兜底 `PUSH_TARGET_URL`） |
 | `GET` | `/v1/admin/subscribers` | 列出订阅者（**不返回 secret**，仅 `has_secret`） |
 | `POST` | `/v1/admin/subscribers` | 新增：`{"url","secret?","enabled?","active_window?","window_before_sec?","quiet_start?","quiet_end?"}` |
@@ -1207,6 +1278,8 @@ app.post("/hook", express.raw({ type: "application/json" }), (req, res) => {
 | `horses` | 马匹档案（HTML） |
 | `horse_past_runs` | 往绩 |
 | `horse_injuries` | 伤患/兽医记录 |
+| `sectional_times` | 逐驹段速（migration **0013**；PK `meeting_date+venue+race_no+horse_code`；`sec1_json`…`sec6_json` + `segments_json`） |
+| `sectional_ingest_progress` | 段速按场次回填／赛后采集断点（`done`/`empty`/`error`） |
 | `raw_documents` | 任意 GraphQL/HTML 文档原文 + hash（能采尽采） |
 | `horse_fetch_state` | 马匹刷新去重（首见 / 赛日） |
 
@@ -1325,9 +1398,14 @@ GitHub Actions：
 ## 9. 回填 / 测试推送 / 实时开关
 
 ```bash
-# 可续跑回填
+# 可续跑回填（GraphQL rbc，~60 天窗）
 curl -X POST "$BASE/v1/admin/backfill" -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" -d '{"limit":5}'
+
+# 段速全量回填（对齐 D1 races；默认 from=2015-09-01；≥3s／场；可续跑）
+curl -X POST "$BASE/v1/admin/backfill-sectionals" -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"from":"2015-09-01","limit_races":20,"delay_ms":3000}'
 
 # 先 test，接收方确认 202 后再开实时
 curl -X POST "$BASE/v1/admin/test-push" -H "Authorization: Bearer $TOKEN"
@@ -1358,6 +1436,12 @@ npx wrangler secret put LIVE_PUSH_ENABLED   # 设为 true
 - 档案+往绩：`https://racing.hkjc.com/en-us/local/information/horse?HorseNo={code}&Option=1`
 - 伤患（赛日页）：`https://racing.hkjc.com/en-us/local/information/veterinaryrecord?RaceDate=YYYY/MM/DD&Racecourse=ST|HV`
 - 礼貌间隔约 500ms；只对出赛马；首见 + 赛日各刷新一次。
+
+### 段速 HTML（issue #46）
+
+- 逐驹段速：`https://racing.hkjc.com/en-us/local/information/displaysectionaltime?racedate=DD/MM/YYYY&RaceNo=N`（旧 `.aspx` 已停用；更早日期可能 302 → `/archive/…`）
+- 赛后由既有 ingest／cron 挂鉤采集；全量用 `POST /v1/admin/backfill-sectionals`
+- 限速 ≥3s／请求；断点表 `sectional_ingest_progress`
 
 ---
 
