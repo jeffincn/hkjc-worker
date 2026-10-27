@@ -72,7 +72,12 @@ import {
 } from "../store/poll-ticks";
 import { runHorseCodeBackfill } from "./horse-code-backfill";
 import { ingestMeetingSectionals } from "./sectionals";
+import {
+  ingestStarterGearPdf,
+  persistQuinellaPoolsFromMeeting,
+} from "./fundamentals";
 import { storeRawDocument } from "../store/horses";
+import { upsertRailFromMeeting } from "../store/fundamentals";
 import { createSubrequestBudget, type SubrequestBudget } from "../util/budget";
 import { runStage } from "../util/stage";
 import { rearmStalePollers } from "../poll/watchdog";
@@ -268,6 +273,23 @@ export async function ingestOneMeeting(
       meeting.venue,
       rawMeeting.changeHistories ?? [],
     );
+    // Meeting-level rail / course codes (issue #50).
+    await upsertRailFromMeeting(env.DB, {
+      meeting_date: meeting.meeting_date,
+      venue: meeting.venue,
+      races: meeting.races.map((r) => ({
+        course_code: r.course_code,
+        course_desc: r.course_desc,
+      })),
+      data_source: "graphql",
+      env,
+    });
+    // Q/QP pool size + turnover only (odds cells are JS-only on bet.hkjc.com).
+    await persistQuinellaPoolsFromMeeting(env, {
+      meeting_date: meeting.meeting_date,
+      venue: meeting.venue,
+      poolInvs: rawMeeting.poolInvs,
+    });
   });
 
   const captured_at = formatHkNow();
@@ -665,6 +687,30 @@ export async function ingestOneMeeting(
       });
     });
   }
+
+  // Starter PDF Gear Change Summary — race-day / card update only; never starve odds poll.
+  await runStage(env, "fundamentals", async () => {
+    if (sub.shouldDeferHeavy()) {
+      await setMeta(
+        env.DB,
+        "stage_error_fundamentals",
+        `deferred: subrequest budget remaining=${sub.remaining()}`,
+      );
+      return;
+    }
+    const isRaceDay = meeting.meeting_date === todayHk;
+    const cardFresh =
+      meeting.status === "DEFINED" ||
+      meeting.status === "DECLARED" ||
+      meeting.status === "STARTED" ||
+      isRaceDay;
+    if (!cardFresh) return;
+    await ingestStarterGearPdf(env, {
+      meeting_date: meeting.meeting_date,
+      venue: meeting.venue,
+      budget: sub,
+    });
+  });
 
   void fullData;
 

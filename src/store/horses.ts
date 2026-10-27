@@ -62,8 +62,8 @@ export async function upsertHorseProfile(
     .prepare(
       `INSERT INTO horses (
         horse_code, horse_id, name_en, name_ch, colour, sex, import_type, owner, sire, dam, dams_sire,
-        total_stakes, season_stakes, current_rating, data_source, source_url, content_hash, raw_json, fetched_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'html_horse', ?, ?, ?, ?, ?)
+        total_stakes, season_stakes, current_rating, last_rating, data_source, source_url, content_hash, raw_json, fetched_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'html_horse', ?, ?, ?, ?, ?)
       ON CONFLICT(horse_code) DO UPDATE SET
         horse_id=excluded.horse_id,
         name_en=excluded.name_en,
@@ -77,6 +77,7 @@ export async function upsertHorseProfile(
         total_stakes=excluded.total_stakes,
         season_stakes=excluded.season_stakes,
         current_rating=excluded.current_rating,
+        last_rating=excluded.last_rating,
         source_url=excluded.source_url,
         content_hash=excluded.content_hash,
         raw_json=CASE WHEN excluded.content_hash!=horses.content_hash THEN excluded.raw_json ELSE horses.raw_json END,
@@ -98,6 +99,7 @@ export async function upsertHorseProfile(
       profile.total_stakes,
       profile.season_stakes,
       profile.current_rating,
+      profile.last_rating,
       profile.source_url,
       hash,
       changed ? JSON.stringify(rawHtmlSnippet) : null,

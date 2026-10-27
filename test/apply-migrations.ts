@@ -161,6 +161,7 @@ CREATE TABLE IF NOT EXISTS horses (
   total_stakes TEXT,
   season_stakes TEXT,
   current_rating TEXT,
+  last_rating TEXT,
   data_source TEXT NOT NULL DEFAULT 'html_horse',
   source_url TEXT,
   content_hash TEXT,
@@ -312,6 +313,111 @@ CREATE TABLE IF NOT EXISTS sectional_ingest_progress (
 );
 CREATE INDEX IF NOT EXISTS idx_sectional_ingest_status
   ON sectional_ingest_progress (status, meeting_date);
+CREATE TABLE IF NOT EXISTS gear_changes (
+  horse_code TEXT NOT NULL,
+  race_date TEXT NOT NULL,
+  race_index TEXT NOT NULL DEFAULT '',
+  venue TEXT,
+  race_no INTEGER,
+  track TEXT,
+  course TEXT,
+  gear_raw TEXT,
+  gear_items_json TEXT,
+  data_source TEXT NOT NULL DEFAULT 'html_horse',
+  source_url TEXT,
+  content_hash TEXT,
+  scraped_at TEXT NOT NULL,
+  PRIMARY KEY (horse_code, race_date, race_index)
+);
+CREATE TABLE IF NOT EXISTS official_ratings (
+  horse_code TEXT NOT NULL,
+  race_date TEXT NOT NULL,
+  race_index TEXT NOT NULL DEFAULT '',
+  venue TEXT,
+  race_no INTEGER,
+  rating INTEGER,
+  rating_change INTEGER,
+  last_rating INTEGER,
+  data_source TEXT NOT NULL DEFAULT 'html_horse',
+  source_url TEXT,
+  content_hash TEXT,
+  scraped_at TEXT NOT NULL,
+  PRIMARY KEY (horse_code, race_date, race_index)
+);
+CREATE TABLE IF NOT EXISTS barrier_trials (
+  trial_date TEXT NOT NULL,
+  batch_no INTEGER NOT NULL,
+  horse_code TEXT NOT NULL,
+  horse_name TEXT,
+  venue TEXT,
+  track TEXT,
+  distance INTEGER,
+  going TEXT,
+  batch_time TEXT,
+  sectional_times TEXT,
+  jockey TEXT,
+  trainer TEXT,
+  draw INTEGER,
+  gear TEXT,
+  lbw TEXT,
+  running_position TEXT,
+  finish_time TEXT,
+  result TEXT,
+  comment TEXT,
+  data_source TEXT NOT NULL DEFAULT 'html_btresult',
+  source_url TEXT,
+  content_hash TEXT,
+  scraped_at TEXT NOT NULL,
+  PRIMARY KEY (trial_date, batch_no, horse_code)
+);
+CREATE TABLE IF NOT EXISTS barrier_trial_ingest_progress (
+  trial_date TEXT NOT NULL PRIMARY KEY,
+  status TEXT NOT NULL,
+  content_hash TEXT,
+  source_url TEXT,
+  scraped_at TEXT,
+  error_message TEXT
+);
+CREATE TABLE IF NOT EXISTS declared_horse_weights (
+  horse_code TEXT NOT NULL,
+  race_date TEXT NOT NULL,
+  race_index TEXT NOT NULL DEFAULT '',
+  venue TEXT,
+  race_no INTEGER,
+  declared_weight REAL,
+  weight_date TEXT,
+  data_source TEXT NOT NULL DEFAULT 'html_horse',
+  source_url TEXT,
+  content_hash TEXT,
+  scraped_at TEXT NOT NULL,
+  PRIMARY KEY (horse_code, race_date, race_index)
+);
+CREATE TABLE IF NOT EXISTS rail_positions (
+  meeting_date TEXT NOT NULL,
+  venue TEXT NOT NULL,
+  track TEXT NOT NULL DEFAULT '',
+  course_code TEXT,
+  course_desc TEXT,
+  data_source TEXT NOT NULL DEFAULT 'graphql',
+  source_url TEXT,
+  content_hash TEXT,
+  scraped_at TEXT NOT NULL,
+  PRIMARY KEY (meeting_date, venue, track)
+);
+CREATE TABLE IF NOT EXISTS quinella_pool_stats (
+  meeting_date TEXT NOT NULL,
+  venue TEXT NOT NULL,
+  race_no INTEGER NOT NULL,
+  pool_type TEXT NOT NULL,
+  investment REAL,
+  status TEXT,
+  sell_status TEXT,
+  last_update_time TEXT,
+  data_source TEXT NOT NULL DEFAULT 'graphql',
+  content_hash TEXT,
+  scraped_at TEXT NOT NULL,
+  PRIMARY KEY (meeting_date, venue, race_no, pool_type)
+);
 `;
 
 beforeAll(async () => {
