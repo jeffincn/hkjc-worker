@@ -807,10 +807,10 @@ curl -s -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/v1/admin/subscribers/
 {
   "subscribers": [
     {
-      "id": 1,
-      "url": "https://webhook.site/…",
+      "id": 2,
+      "url": "https://hkjc-agent.cf-connect.top/webhook",
       "enabled": true,
-      "has_secret": false,
+      "has_secret": true,
       "active_window": "always",
       "window_before_sec": 10800,
       "quiet_start": "00:00",
@@ -827,6 +827,16 @@ curl -s -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/v1/admin/subscribers/
       "window_before_sec": 10800,
       "quiet_start": "00:00",
       "quiet_end": "08:00"
+    },
+    {
+      "id": 5,
+      "url": "https://example.com/webhook",
+      "enabled": false,
+      "has_secret": false,
+      "active_window": "always",
+      "window_before_sec": 10800,
+      "quiet_start": null,
+      "quiet_end": null
     }
   ]
 }
@@ -865,9 +875,8 @@ curl -s -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/v1/admin/subscribers/
 - `User-Agent: hkjc-data-worker/1.0`（Cloudflare 对空 UA 会报 1010，必须带）
 - 若该订阅者配置了 secret：`X-Signature` = 对**原始 JSON body** 的 HMAC-SHA256 **小写 hex**（无 `sha256=` 前缀）
 - 期望响应：`202`（或 2xx），body 建议 `{"received":true}`
-- 迁移会 seed 两个接收方（仅 URL，密钥不进 git）：
-  - `https://webhook.site/902a6166-6336-452d-97c5-e64018d97919`（无 HMAC）
-  - `https://hkjc-agent.cf-connect.top/webhook`（若设置了 `PUSH_SECRET`，运行时写入该行 secret）
+- 迁移 `0003` 会 seed agent 接收方（仅 URL，密钥不进 git）：`https://hkjc-agent.cf-connect.top/webhook`（若设置了 `PUSH_SECRET`，运行时写入该行 secret）。可用 Admin API 增删其他接收方（如 Hookdeck、`https://example.com/webhook`）。
+- 迁移 `0014` 会删除任何仍残留的 `https://webhook.site/%` 订阅及其相关 `pending_pushes`（生产侧 webhook.site 行已手动清理；此迁移防本地／其他环境再残留）。
 - **兜底**：仅当 `push_subscribers` **没有任何行**时，才使用 `PUSH_TARGET_URL`（+ 可选全局 `PUSH_SECRET`）
 
 ### 4.2 公共信封字段
@@ -1239,7 +1248,7 @@ curl -s -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/v1/admin/subscribers/
 3. **无队列绑定**（本地 / 测试）：回退为进程内直推（行为与旧版一致）。  
 4. 直推或队列耗尽后仍失败：写入 `pending_pushes`（含 `subscriber_id` + `event_id`）；legacy 退避 **1 → 5 → 15 分钟**，并可 piggy-back。  
 5. **熔断**：连续失败 ≥ `CIRCUIT_BREAKER_THRESHOLD`（默认 10）或连续 429 ≥ `CIRCUIT_BREAKER_429_THRESHOLD`（默认 3）→ `open`（停发 HTTP，账本保留供 `/v1/events` 回放）；5 分钟后 `half_open` 探测，成功则 `closed`。**从不自动删除订阅者**。  
-6. **Per-subscriber 速率限制**：每个订阅者最多 `PUSH_RATE_PER_SUB_PER_SEC`（默认 **2**）次 HTTP/秒。超额投递用队列 `delaySeconds`（或直推写入 `pending_pushes` 短延迟）**延后，绝不丢弃**——避免 webhook.site 等接收方在约 30–40 次突发后回 429。  
+6. **Per-subscriber 速率限制**：每个订阅者最多 `PUSH_RATE_PER_SUB_PER_SEC`（默认 **2**）次 HTTP/秒。超额投递用队列 `delaySeconds`（或直推写入 `pending_pushes` 短延迟）**延后，绝不丢弃**——避免下游接收方在突发高峰时回 429。  
 7. **Backlog 合并回放**：当某订阅者 `pending_pushes` 积压 ≥ `PUSH_BACKLOG_COALESCE_MIN`（默认 2）时（熔断恢复、宕机、legacy 积压等），**不再逐条重放**。按会议合并：
    - `odds_delta`：`changes[]` 按序拼接（保留每条变更自己的 `seq` / `captured_at` / prev/new odds），过大按 `PUSH_BACKLOG_MAX_CHANGES`（默认 200）切块 → 事件类型 `backlog_replay`（新 `event_id` + 新 `seq`；`meta.covered_seq_from` / `covered_seq_to` / `coalesced_event_ids`）
    - **按场次增量**（`lock` / `result` / `scratch` / `dividends`）：按 `(event, race_no)` 保留每场最新信封，**不丢场次**（同场多次只留最新；无法解析 `race_no` 时退回逐条重发）
@@ -1358,7 +1367,7 @@ routes = [
 npm ci
 cp .dev.vars.example .dev.vars   # 设置 API_TOKEN；不要填真实 PUSH_TARGET_URL / PUSH_SECRET
 npx wrangler d1 migrations apply hkjc --local
-# 本地若不想打到 seed 的真实 URL：用 Admin API 删掉/禁用订阅者，或清空 push_subscribers
+# 本地若不想打到 seed 的 agent URL：用 Admin API 删掉/禁用订阅者，或清空 push_subscribers
 npx wrangler dev --local --persist-to .wrangler/state
 
 # 另一终端：真实 GraphQL ingest + 打全 API
