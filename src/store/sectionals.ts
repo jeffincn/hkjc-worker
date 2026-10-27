@@ -14,6 +14,26 @@ export interface SectionalUpsertResult {
   skipped_no_code: number;
 }
 
+/**
+ * Collapse duplicate horse_code rows in one race (last-wins).
+ * Parsed pages can occasionally emit the same brand code twice; PK is
+ * (meeting_date, venue, race_no, horse_code), so duplicates must not reach INSERT.
+ */
+export function dedupeSectionalHorses(
+  horses: SectionalHorseRow[],
+): { horses: SectionalHorseRow[]; skipped_no_code: number } {
+  let skipped_no_code = 0;
+  const byCode = new Map<string, SectionalHorseRow>();
+  for (const h of horses) {
+    if (!h.horse_code) {
+      skipped_no_code++;
+      continue;
+    }
+    byCode.set(h.horse_code, h);
+  }
+  return { horses: [...byCode.values()], skipped_no_code };
+}
+
 export async function replaceRaceSectionals(
   db: D1Database,
   args: {
@@ -46,6 +66,8 @@ export async function replaceRaceSectionals(
     };
   }
 
+  const { horses, skipped_no_code } = dedupeSectionalHorses(args.horses);
+
   await db
     .prepare(
       `DELETE FROM sectional_times WHERE meeting_date=? AND venue=? AND race_no=?`,
@@ -54,16 +76,12 @@ export async function replaceRaceSectionals(
     .run();
 
   let rows = 0;
-  let skipped_no_code = 0;
-  for (const h of args.horses) {
-    if (!h.horse_code) {
-      skipped_no_code++;
-      continue;
-    }
+  for (const h of horses) {
     const secs = h.sections;
+    // INSERT OR REPLACE: survive partial prior writes / residual PK collisions.
     const result = await db
       .prepare(
-        `INSERT INTO sectional_times (
+        `INSERT OR REPLACE INTO sectional_times (
           meeting_date, venue, race_no, horse_code, horse_name, horse_no,
           finishing_order, finish_time, finish_time_sec, race_info,
           sec1_json, sec2_json, sec3_json, sec4_json, sec5_json, sec6_json,
