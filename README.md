@@ -254,6 +254,8 @@ curl -s -H "Authorization: Bearer $TOKEN" \
       "runners": [
         {
           "horse_no": 1,
+          "is_standby": false,
+          "standby_no": null,
           "horse_code": "H087",
           "name_en": "CAN'T GO WONG",
           "name_ch": null,
@@ -271,6 +273,10 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 ```
 
 每场 `runners[]` 含 HKJC 品牌号 `horse_code`（如 `H087`；回填/rbc 缺口时可为 `null`）。
+
+**正式 vs 後備（`is_standby`）**：同布號可同時存在正式馬與後備馬。D1 主鍵為 `(meeting_date, venue, race_no, horse_no, is_standby)`，後備**不會**覆蓋正式馬的 `barrier`／`handicap_weight`／`horse_code`／騎練。`is_standby=true` 時 `horse_no` 一般為 GraphQL `standbyNo`，並另有 `standby_no`。`GET /v1/horses/resolve` 預設回正式馬（`is_standby=0`）；查後備加 `&is_standby=1`。
+
+歷史若曾被舊主鍵污染（同布號只剩一行且欄位已串），需對該會議 **re-ingest**（`POST /v1/admin/ingest` 或等賽日輪詢）從 GraphQL 重寫；單靠 migration 無法還原已覆蓋欄位。
 
 `observation` 为 **新增字段**（issue #38），不改动既有 `runners[]` / 赛程字段。列表路径通常不附带最新快照的 `pool_meta`，故 `pools.*.source_updated_at` / `sell_status` 常为 `null`；按场完整 WIN/PLA 源时间请用 §3.4 `odds/latest`。语义见下表。
 
@@ -637,13 +643,16 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 按会议位置解析品牌号（纯 D1 读，无额外 HKJC 请求）：
 
-| 参数 | 必填 |
-|---|---|
-| `date` / `venue` / `race_no` / `horse_no` | 是 |
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `date` / `venue` / `race_no` / `horse_no` | 是 | |
+| `is_standby` | 否 | `0`／`1`；省略時**優先正式馬**（`ORDER BY is_standby ASC`） |
 
 ```bash
 curl -s -H "Authorization: Bearer $TOKEN" \
   "$BASE/v1/horses/resolve?date=2026-10-07&venue=HV&race_no=1&horse_no=1" | jq .
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "$BASE/v1/horses/resolve?date=2026-10-07&venue=HV&race_no=1&horse_no=1&is_standby=1" | jq .
 ```
 
 ```json
@@ -652,6 +661,8 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   "venue": "HV",
   "race_no": 1,
   "horse_no": 1,
+  "is_standby": false,
+  "standby_no": null,
   "horse_code": "H087",
   "name_en": "CAN'T GO WONG",
   "name_ch": null

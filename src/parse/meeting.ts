@@ -8,7 +8,7 @@ import type {
   RunnerRaw,
 } from "../graphql/types";
 import { normalizeHorseCode } from "./horse-code";
-import { parseOddsValue } from "./odds";
+import { isStandbyRunner, parseOddsValue } from "./odds";
 
 export interface NormalizedMeeting {
   meeting_date: string;
@@ -35,7 +35,18 @@ export interface NormalizedRace {
 }
 
 export interface NormalizedRunner {
+  /**
+   * Saddle cloth for Declared, or standbyNo for Standby.
+   * Not unique alone — pair with `is_standby`.
+   */
   horse_no: number;
+  /**
+   * True for reserve / standby runners (GraphQL status or empty `no`+standbyNo).
+   * Part of runners PK so standby never overwrites declared on the same cloth.
+   */
+  is_standby: boolean;
+  /** GraphQL `standbyNo` when present; null for pure declared. */
+  standby_no: number | null;
   /** HKJC brand code (e.g. H087) from GraphQL horse.code; null when unknown. */
   horse_code: string | null;
   /** GraphQL horse.id when present (e.g. HK_2022_H087). */
@@ -70,19 +81,30 @@ function numOrNull(v: string | number | null | undefined): number | null {
 export function normalizeRunner(r: RunnerRaw): NormalizedRunner {
   const primary = numOrNull(r.no);
   const standby = numOrNull(r.standbyNo);
-  // Standby runners often have empty `no` and a standbyNo — never coerce "" → 0.
-  const horse_no = primary ?? standby ?? -1;
+  const is_standby = isStandbyRunner(r);
+  // Declared: prefer `no`; Standby: prefer `standbyNo` (often empty `no`).
+  // Never coerce "" → 0.
+  const horse_no = is_standby
+    ? standby != null && standby > 0
+      ? standby
+      : (primary ?? -1)
+    : primary != null && primary > 0
+      ? primary
+      : (standby ?? -1);
+  const standby_no = standby != null && standby > 0 ? standby : null;
   const horse_id =
     r.horse?.id != null && String(r.horse.id).trim() !== ""
       ? String(r.horse.id).trim()
       : null;
   return {
     horse_no,
+    is_standby,
+    standby_no,
     horse_code: normalizeHorseCode(r.horse?.code),
     horse_id,
     name_en: r.name_en ?? null,
     name_ch: r.name_ch ?? null,
-    status: r.status ?? null,
+    status: r.status ?? (is_standby ? "Standby" : null),
     barrier: numOrNull(r.barrierDrawNumber),
     handicap_weight: numOrNull(r.handicapWeight),
     jockey_en: r.jockey?.name_en ?? null,

@@ -40,6 +40,8 @@ function runner(
     name_en: `Horse ${horse_no}`,
     name_ch: null,
     status,
+    is_standby: status === "Standby",
+    standby_no: status === "Standby" ? horse_no : null,
     barrier,
     handicap_weight: 126,
     jockey_en: null,

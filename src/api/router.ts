@@ -451,6 +451,7 @@ async function horseCodeByCloth(
   const { results } = await env.DB.prepare(
     `SELECT horse_no, horse_code FROM runners
      WHERE meeting_date=? AND venue=? AND race_no=?
+       AND is_standby=0
        AND horse_code IS NOT NULL AND horse_code!=''
        AND upper(coalesce(status,'')) NOT LIKE '%STANDBY%'`,
   )
@@ -510,14 +511,17 @@ async function listRaces(env: Env, url: URL): Promise<Response> {
     .bind(date, venue)
     .all();
   const { results: runners } = await env.DB.prepare(
-    `SELECT race_no, horse_no, horse_code, name_en, name_ch, status, barrier, handicap_weight,
-            jockey_en, trainer_en, last6run, data_source, updated_at
-     FROM runners WHERE meeting_date=? AND venue=? ORDER BY race_no, horse_no`,
+    `SELECT race_no, horse_no, is_standby, standby_no, horse_code, name_en, name_ch, status,
+            barrier, handicap_weight, jockey_en, trainer_en, last6run, data_source, updated_at
+     FROM runners WHERE meeting_date=? AND venue=?
+     ORDER BY race_no, is_standby ASC, horse_no`,
   )
     .bind(date, venue)
     .all<{
       race_no: number;
       horse_no: number;
+      is_standby: number;
+      standby_no: number | null;
       horse_code: string | null;
       name_en: string | null;
       name_ch: string | null;
@@ -586,6 +590,9 @@ async function listRaces(env: Env, url: URL): Promise<Response> {
       }),
       runners: raceRunners.map((r) => ({
         horse_no: r.horse_no,
+        /** True when this row is a standby / reserve (same cloth as a declared possible). */
+        is_standby: r.is_standby === 1,
+        standby_no: r.standby_no,
         horse_code: r.horse_code,
         name_en: r.name_en,
         name_ch: r.name_ch,
@@ -941,7 +948,7 @@ async function listResults(env: Env, url: URL): Promise<Response> {
      FROM results r
      LEFT JOIN runners u
        ON u.meeting_date=r.meeting_date AND u.venue=r.venue
-      AND u.race_no=r.race_no AND u.horse_no=r.horse_no
+      AND u.race_no=r.race_no AND u.horse_no=r.horse_no AND u.is_standby=0
      WHERE r.meeting_date=? AND r.venue=?
      ORDER BY r.race_no, r.horse_no`,
   )
@@ -1015,7 +1022,10 @@ async function listSectionalsApi(env: Env, url: URL): Promise<Response> {
   });
 }
 
-/** Cheap D1 lookup: date+venue+race_no+horse_no → horse_code. */
+/**
+ * Cheap D1 lookup: date+venue+race_no+horse_no → horse_code.
+ * Optional `is_standby` (0|1); default prefers declared (`is_standby=0`).
+ */
 async function resolveHorseCode(env: Env, url: URL): Promise<Response> {
   const date = url.searchParams.get("date");
   const venue = url.searchParams.get("venue");
@@ -1024,18 +1034,51 @@ async function resolveHorseCode(env: Env, url: URL): Promise<Response> {
   if (!date || !venue || !raceNo || !horseNo) {
     return jsonError(400, "date, venue, race_no, horse_no required");
   }
-  const row = await env.DB.prepare(
-    `SELECT horse_code, name_en, name_ch FROM runners
-     WHERE meeting_date=? AND venue=? AND race_no=? AND horse_no=?`,
-  )
-    .bind(date, venue, Number(raceNo), Number(horseNo))
-    .first<{ horse_code: string | null; name_en: string | null; name_ch: string | null }>();
+  const standbyRaw = url.searchParams.get("is_standby");
+  let isStandbyFilter: number | null = null;
+  if (standbyRaw != null && standbyRaw !== "") {
+    if (standbyRaw !== "0" && standbyRaw !== "1") {
+      return jsonError(400, "is_standby must be 0 or 1");
+    }
+    isStandbyFilter = Number(standbyRaw);
+  }
+
+  const row =
+    isStandbyFilter != null
+      ? await env.DB.prepare(
+          `SELECT horse_code, name_en, name_ch, is_standby, standby_no FROM runners
+           WHERE meeting_date=? AND venue=? AND race_no=? AND horse_no=? AND is_standby=?`,
+        )
+          .bind(date, venue, Number(raceNo), Number(horseNo), isStandbyFilter)
+          .first<{
+            horse_code: string | null;
+            name_en: string | null;
+            name_ch: string | null;
+            is_standby: number;
+            standby_no: number | null;
+          }>()
+      : await env.DB.prepare(
+          `SELECT horse_code, name_en, name_ch, is_standby, standby_no FROM runners
+           WHERE meeting_date=? AND venue=? AND race_no=? AND horse_no=?
+           ORDER BY is_standby ASC
+           LIMIT 1`,
+        )
+          .bind(date, venue, Number(raceNo), Number(horseNo))
+          .first<{
+            horse_code: string | null;
+            name_en: string | null;
+            name_ch: string | null;
+            is_standby: number;
+            standby_no: number | null;
+          }>();
   if (!row) return jsonError(404, "Runner not found");
   return jsonOk({
     date,
     venue,
     race_no: Number(raceNo),
     horse_no: Number(horseNo),
+    is_standby: row.is_standby === 1,
+    standby_no: row.standby_no,
     horse_code: row.horse_code,
     name_en: row.name_en,
     name_ch: row.name_ch,
