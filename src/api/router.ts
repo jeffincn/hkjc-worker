@@ -114,6 +114,42 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
     return jsonOk(result);
   }
 
+  if (request.method === "POST" && path === "/v1/admin/ingest-barrier-trials") {
+    const authErr = requireWriteBearer(request, env);
+    if (authErr) return authErr;
+    const { ingestBarrierTrialDay } = await import("../services/fundamentals");
+    const body = (await request.json().catch(() => ({}))) as {
+      date?: string;
+      force?: boolean;
+      archive?: boolean;
+    };
+    if (!body.date) return jsonError(400, "date required (YYYY-MM-DD)");
+    const result = await ingestBarrierTrialDay(env, {
+      trial_date: body.date,
+      force: body.force === true,
+      archive: body.archive === true,
+    });
+    return jsonOk(result);
+  }
+
+  if (request.method === "POST" && path === "/v1/admin/ingest-starter-gear") {
+    const authErr = requireWriteBearer(request, env);
+    if (authErr) return authErr;
+    const { ingestStarterGearPdf } = await import("../services/fundamentals");
+    const body = (await request.json().catch(() => ({}))) as {
+      date?: string;
+      venue?: string;
+    };
+    if (!body.date || !body.venue) {
+      return jsonError(400, "date and venue required");
+    }
+    const result = await ingestStarterGearPdf(env, {
+      meeting_date: body.date,
+      venue: body.venue,
+    });
+    return jsonOk(result);
+  }
+
   if (request.method === "POST" && path === "/v1/admin/test-push") {
     const authErr = requireWriteBearer(request, env);
     if (authErr) return authErr;
@@ -187,6 +223,18 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
       return listResults(env, url);
     case "/v1/sectionals":
       return listSectionalsApi(env, url);
+    case "/v1/gear-changes":
+      return listGearChangesApi(env, url);
+    case "/v1/official-ratings":
+      return listOfficialRatingsApi(env, url);
+    case "/v1/barrier-trials":
+      return listBarrierTrialsApi(env, url);
+    case "/v1/declared-weights":
+      return listDeclaredWeightsApi(env, url);
+    case "/v1/rail-positions":
+      return listRailPositionsApi(env, url);
+    case "/v1/quinella-pools":
+      return listQuinellaPoolsApi(env, url);
     case "/v1/changes":
       return listChanges(env, url);
     case "/v1/events":
@@ -243,6 +291,7 @@ async function handleHealth(env: Env): Promise<Response> {
     "runs",
     "injuries",
     "sectionals",
+    "fundamentals",
     "pushes",
     "changes",
     "persist",
@@ -1019,6 +1068,130 @@ async function listSectionalsApi(env: Env, url: URL): Promise<Response> {
       content_hash: r.content_hash,
       scraped_at: r.scraped_at,
     })),
+  });
+}
+
+/** GET /v1/gear-changes?horse_code=|&date=&venue= — issue #50. */
+async function listGearChangesApi(env: Env, url: URL): Promise<Response> {
+  const horse_code = url.searchParams.get("horse_code")?.toUpperCase() || undefined;
+  const date = url.searchParams.get("date") || undefined;
+  const venue = url.searchParams.get("venue") || undefined;
+  if (!horse_code && !date) {
+    return jsonError(400, "horse_code or date required");
+  }
+  const { listGearChanges } = await import("../store/fundamentals");
+  const rows = await listGearChanges(env.DB, { horse_code, date, venue });
+  return jsonOk({
+    horse_code: horse_code ?? null,
+    date: date ?? null,
+    venue: venue ?? null,
+    gear_changes: rows.map((r) => ({
+      ...r,
+      gear_items: parseSecJson((r as { gear_items_json?: string | null }).gear_items_json ?? null),
+      gear_items_json: undefined,
+    })),
+  });
+}
+
+/** GET /v1/official-ratings?horse_code=|&date= — issue #50. */
+async function listOfficialRatingsApi(env: Env, url: URL): Promise<Response> {
+  const horse_code = url.searchParams.get("horse_code")?.toUpperCase() || undefined;
+  const date = url.searchParams.get("date") || undefined;
+  if (!horse_code && !date) {
+    return jsonError(400, "horse_code or date required");
+  }
+  const { listOfficialRatings } = await import("../store/fundamentals");
+  const rows = await listOfficialRatings(env.DB, { horse_code, date });
+  return jsonOk({
+    horse_code: horse_code ?? null,
+    date: date ?? null,
+    ratings: rows,
+  });
+}
+
+/** GET /v1/barrier-trials?date=|&horse_code=&batch_no= — issue #50. */
+async function listBarrierTrialsApi(env: Env, url: URL): Promise<Response> {
+  const date = url.searchParams.get("date") || undefined;
+  const horse_code = url.searchParams.get("horse_code")?.toUpperCase() || undefined;
+  const batchRaw = url.searchParams.get("batch_no");
+  let batch_no: number | null = null;
+  if (batchRaw != null && batchRaw !== "") {
+    batch_no = Number(batchRaw);
+    if (!Number.isFinite(batch_no) || batch_no <= 0) {
+      return jsonError(400, "batch_no must be a positive number");
+    }
+  }
+  if (!date && !horse_code) {
+    return jsonError(400, "date or horse_code required");
+  }
+  const { listBarrierTrials } = await import("../store/fundamentals");
+  const rows = await listBarrierTrials(env.DB, { date, horse_code, batch_no });
+  return jsonOk({
+    date: date ?? null,
+    horse_code: horse_code ?? null,
+    batch_no,
+    trials: rows,
+  });
+}
+
+/** GET /v1/declared-weights?horse_code=|&date=&venue= — issue #50. */
+async function listDeclaredWeightsApi(env: Env, url: URL): Promise<Response> {
+  const horse_code = url.searchParams.get("horse_code")?.toUpperCase() || undefined;
+  const date = url.searchParams.get("date") || undefined;
+  const venue = url.searchParams.get("venue") || undefined;
+  if (!horse_code && !date) {
+    return jsonError(400, "horse_code or date required");
+  }
+  const { listDeclaredWeights } = await import("../store/fundamentals");
+  const rows = await listDeclaredWeights(env.DB, { horse_code, date, venue });
+  return jsonOk({
+    horse_code: horse_code ?? null,
+    date: date ?? null,
+    venue: venue ?? null,
+    weights: rows,
+  });
+}
+
+/** GET /v1/rail-positions?date=&venue= — issue #50. */
+async function listRailPositionsApi(env: Env, url: URL): Promise<Response> {
+  const date = url.searchParams.get("date") || undefined;
+  const venue = url.searchParams.get("venue") || undefined;
+  if (!date && !venue) {
+    return jsonError(400, "date or venue required");
+  }
+  const { listRailPositions } = await import("../store/fundamentals");
+  const rows = await listRailPositions(env.DB, { date, venue });
+  return jsonOk({
+    date: date ?? null,
+    venue: venue ?? null,
+    rail_positions: rows,
+  });
+}
+
+/**
+ * GET /v1/quinella-pools?date=&venue=&race_no?=
+ * QIN/QPL pool size + turnover only — per-combination odds cells are JS-only (#50 TBD).
+ */
+async function listQuinellaPoolsApi(env: Env, url: URL): Promise<Response> {
+  const date = url.searchParams.get("date");
+  const venue = url.searchParams.get("venue");
+  if (!date || !venue) return jsonError(400, "date and venue required");
+  const raceNoRaw = url.searchParams.get("race_no");
+  let race_no: number | null = null;
+  if (raceNoRaw != null && raceNoRaw !== "") {
+    race_no = Number(raceNoRaw);
+    if (!Number.isFinite(race_no) || race_no <= 0) {
+      return jsonError(400, "race_no must be a positive number");
+    }
+  }
+  const { listQuinellaPools } = await import("../store/fundamentals");
+  const rows = await listQuinellaPools(env.DB, { date, venue, race_no });
+  return jsonOk({
+    date,
+    venue,
+    race_no,
+    note: "Pool size/turnover only; per-combination Q/QP odds cells are JS-driven on bet.hkjc.com and not scraped.",
+    pools: rows,
   });
 }
 

@@ -31,11 +31,15 @@ export interface HorseProfile {
   total_stakes: string | null;
   season_stakes: string | null;
   current_rating: string | null;
+  /** Horse page "Last Rating" (issue #50). */
+  last_rating: string | null;
   source_url: string;
 }
 
 export interface PastRun {
   race_index: string | null;
+  /** Race number within the meeting when present on results link. */
+  race_no: number | null;
   placing: string | null;
   race_date: string | null;
   venue: string | null;
@@ -143,6 +147,7 @@ export function parseHorseProfile(html: string, horseCode: string, sourceUrl: st
     total_stakes: fieldAfter(html, "Total Stakes\\*?"),
     season_stakes: fieldAfter(html, "Season Stakes\\*?"),
     current_rating: fieldAfter(html, "Current Rating"),
+    last_rating: fieldAfter(html, "Last Rating"),
     source_url: sourceUrl,
   };
 }
@@ -169,17 +174,24 @@ export function parsePastRuns(html: string): PastRun[] {
     const row = m[1];
     // Skip header / season-banner rows only (not trainer links with ?season=)
     if (/class="[^"]*hsubheader|htable_bold_text/i.test(row)) continue;
-    const cells = [...row.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)].map((c) => stripHtml(c[1]));
+    const rawCells = [...row.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)].map((c) => c[1]);
+    const cells = rawCells.map((c) => stripHtml(c));
     if (cells.length < 16) continue;
     if (!/^\d{2,4}$/.test(cells[0] ?? "")) continue;
-    const rcParts = (cells[3] ?? "").split("/").map((s) => s.trim());
+    const rcParts = (cells[3] ?? "")
+      .replace(/&quot;/g, '"')
+      .split("/")
+      .map((s) => s.trim());
+    const raceNoM = /RaceNo=(\d+)/i.exec(rawCells[0] ?? "");
+    const courseRaw = rcParts[2]?.replace(/^"+|"+$/g, "").replace(/^"|"$/g, "") || null;
     runs.push({
       race_index: cells[0] || null,
+      race_no: raceNoM ? Number(raceNoM[1]) : null,
       placing: cells[1] || null,
       race_date: normalizeHkDate(cells[2] || null),
       venue: rcParts[0] || null,
       track: rcParts[1] || null,
-      course: rcParts[2]?.replace(/^"|"$/g, "") || null,
+      course: courseRaw,
       distance: numOrNull(cells[4]),
       going: cells[5] || null,
       race_class: cells[6] || null,
@@ -197,6 +209,16 @@ export function parsePastRuns(html: string): PastRun[] {
     });
   }
   return runs;
+}
+
+/** Normalize RC/Track/Course course token (strip quotes). */
+export function normalizeCourseCode(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const s = String(raw)
+    .replace(/&quot;/g, '"')
+    .replace(/^["'\s]+|["'\s]+$/g, "")
+    .trim();
+  return s || null;
 }
 
 export function parseVetRecords(html: string): VetRecord[] {

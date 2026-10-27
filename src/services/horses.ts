@@ -15,6 +15,7 @@ import {
   upsertHorseProfile,
   upsertInjuries,
 } from "../store/horses";
+import { upsertFundamentalsFromHorseRuns } from "../store/fundamentals";
 import type { SubrequestBudget } from "../util/budget";
 import { runStage } from "../util/stage";
 
@@ -102,7 +103,16 @@ export async function refreshMeetingHorses(
 
     const runsResult = await runStage(env, "runs", async () => {
       const runs = parsePastRuns(html);
-      return replaceHorseRuns(env.DB, code, runs, url);
+      const replaced = await replaceHorseRuns(env.DB, code, runs, url);
+      // Project into gear / ratings / weights / rail tables (issue #50).
+      await upsertFundamentalsFromHorseRuns(env.DB, {
+        horse_code: code,
+        profile,
+        runs,
+        source_url: url,
+        env,
+      });
+      return replaced;
     });
     const runsHash =
       runsResult.ok && runsResult.value.changed

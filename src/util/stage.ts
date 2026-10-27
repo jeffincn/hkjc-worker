@@ -9,6 +9,7 @@ export type IngestStage =
   | "runs"
   | "injuries"
   | "sectionals"
+  | "fundamentals"
   | "pushes"
   | "changes"
   | "persist"

@@ -17,6 +17,7 @@ const SAMPLE_HORSE_HTML = `
 <tr><td>Dam</td><td>:</td><td>O'Really Baheeya</td></tr>
 <tr><td>Dam's Sire</td><td>:</td><td>O'Reilly</td></tr>
 <tr><td>Total Stakes*</td><td>:</td><td>$4,614,250</td></tr>
+<tr><td>Last Rating</td><td>:</td><td>40</td></tr>
 </table>
 <a href="/en-us/local/information/horse?horseid=HK_2022_H087&Option=1">all</a>
 <table class=bigborder>
@@ -97,15 +98,19 @@ describe("horse HTML parsers", () => {
     expect(profile.colour).toBe("Chestnut");
     expect(profile.sex).toBe("Gelding");
     expect(profile.horse_id).toBe("HK_2022_H087");
+    expect(profile.last_rating).toBe("40");
 
     const runs = parsePastRuns(SAMPLE_HORSE_HTML);
     expect(runs).toHaveLength(1);
     expect(runs[0].race_index).toBe("079");
     expect(runs[0].venue).toBe("HV");
+    expect(runs[0].course).toBe("C+3");
     expect(runs[0].distance).toBe(1800);
     expect(runs[0].win_odds).toBe(4);
     expect(runs[0].finish_time).toBe("1.50.42");
     expect(runs[0].race_date).toBe("2026-10-07");
+    expect(runs[0].declared_weight).toBe(1170);
+    expect(runs[0].gear).toBe("B/TT");
   });
 
   it("parses veterinary records", () => {
