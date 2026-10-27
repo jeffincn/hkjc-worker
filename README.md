@@ -876,7 +876,7 @@ curl -s -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/v1/admin/subscribers/
 - 若该订阅者配置了 secret：`X-Signature` = 对**原始 JSON body** 的 HMAC-SHA256 **小写 hex**（无 `sha256=` 前缀）
 - 期望响应：`202`（或 2xx），body 建议 `{"received":true}`
 - 迁移 `0003` 会 seed agent 接收方（仅 URL，密钥不进 git）：`https://hkjc-agent.cf-connect.top/webhook`（若设置了 `PUSH_SECRET`，运行时写入该行 secret）。可用 Admin API 增删其他接收方（如 Hookdeck、`https://example.com/webhook`）。
-- 迁移 `0014` 会删除任何仍残留的 `https://webhook.site/%` 订阅及其相关 `pending_pushes`（生产侧 webhook.site 行已手动清理；此迁移防本地／其他环境再残留）。
+- 迁移 `0015` 会删除任何仍残留的 `https://webhook.site/%` 订阅及其相关 `pending_pushes`（生产侧 webhook.site 行已手动清理；此迁移防本地／其他环境再残留）。
 - **兜底**：仅当 `push_subscribers` **没有任何行**时，才使用 `PUSH_TARGET_URL`（+ 可选全局 `PUSH_SECRET`）
 
 ### 4.2 公共信封字段
