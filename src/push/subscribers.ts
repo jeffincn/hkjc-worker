@@ -3,10 +3,6 @@ import type { Env } from "../env";
 /** Agent runner webhook — uses env PUSH_SECRET when the row has no secret. */
 export const AGENT_WEBHOOK_URL = "https://hkjc-agent.cf-connect.top/webhook";
 
-/** Public webhook.site receiver — no HMAC. */
-export const WEBHOOK_SITE_URL =
-  "https://webhook.site/902a6166-6336-452d-97c5-e64018d97919";
-
 /** Default: 3 hours before first race post. */
 export const DEFAULT_SUBSCRIBER_WINDOW_BEFORE_SEC = 10_800;
 
