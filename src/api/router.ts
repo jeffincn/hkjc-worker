@@ -94,6 +94,8 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
     if (authErr) return authErr;
     const { runSectionalBackfillStep } = await import("../services/sectionals");
     const body = (await request.json().catch(() => ({}))) as {
+      /** `races` (default): D1 races-aligned. `date`: calendar walk (issue #49). */
+      mode?: string;
       date?: string;
       venue?: string;
       from?: string;
@@ -103,6 +105,7 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
       force?: boolean;
     };
     const result = await runSectionalBackfillStep(env, {
+      mode: body.mode,
       date: body.date,
       venue: body.venue,
       from: body.from,

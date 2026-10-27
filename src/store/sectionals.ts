@@ -191,6 +191,43 @@ export async function isSectionalRaceDone(
   return row?.status === "done";
 }
 
+/** Settled = done or empty — resume must not rewrite either. */
+export async function isSectionalRaceSettled(
+  db: D1Database,
+  meeting_date: string,
+  venue: string,
+  race_no: number,
+): Promise<boolean> {
+  const row = await db
+    .prepare(
+      `SELECT status FROM sectional_ingest_progress
+       WHERE meeting_date=? AND venue=? AND race_no=?`,
+    )
+    .bind(meeting_date, venue, race_no)
+    .first<{ status: string }>();
+  return row?.status === "done" || row?.status === "empty";
+}
+
+/**
+ * Venue already known for a calendar date from prior date-mode progress
+ * (ST/HV). Ignores the empty-meeting sentinel venue.
+ */
+export async function lookupSectionalDayVenue(
+  db: D1Database,
+  meeting_date: string,
+  emptyVenue: string,
+): Promise<string | null> {
+  const row = await db
+    .prepare(
+      `SELECT venue FROM sectional_ingest_progress
+       WHERE meeting_date=? AND venue != ?
+       ORDER BY race_no ASC LIMIT 1`,
+    )
+    .bind(meeting_date, emptyVenue)
+    .first<{ venue: string }>();
+  return row?.venue ?? null;
+}
+
 export function pageToStoreArgs(
   page: ParsedSectionalPage,
   fallback: { meeting_date: string; venue: string; race_no: number },
